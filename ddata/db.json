@@ -1,0 +1,17 @@
+{
+  "orders": [],
+  "customers": [],
+  "broadcasts": [],
+  "conversations": {},
+  "settings": {
+    "fbToken": "",
+    "fbPageId": "",
+    "waToken": "",
+    "waPhoneNumberId": "",
+    "sheetLink": "",
+    "aiKey": "",
+    "aiProvider": "groq",
+    "connected": { "fb": false, "wa": false, "sheet": false, "ai": false }
+  },
+  "nextOrderSeq": 232
+}
