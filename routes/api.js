@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
+const axios = require('axios');
 
+const config = require('../config');
 const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
@@ -81,13 +83,16 @@ router.get('/broadcast', (req, res) => {
 });
 
 /* ---------- Settings ---------- */
+// টোকেন/কী কখনো ফেরত পাঠানো হয় না (শুধু connected true/false), নিরাপত্তার জন্য
 router.get('/settings', (req, res) => {
   const s = store.getSettings();
   res.json({
     fbPageId: s.fbPageId,
+    fbAppId: s.fbAppId,
     waPhoneNumberId: s.waPhoneNumberId,
     sheetLink: s.sheetLink,
     aiProvider: s.aiProvider,
+    aiAutoReply: s.aiAutoReply,
     connected: s.connected
   });
 });
@@ -97,6 +102,34 @@ router.post('/settings', (req, res) => {
   res.json({
     connected: updated.connected
   });
+});
+
+/* ---------- Facebook অটো-কানেক্ট (নতুন ফিচার) ---------- */
+router.post('/settings/fb-auto', async (req, res) => {
+  const { pageAccessToken, pageId, pageName, fbAppId } = req.body;
+  if (!pageAccessToken || !fbAppId) {
+    return res.status(400).json({ error: 'pageAccessToken ও fbAppId দুটোই দরকার' });
+  }
+  if (!config.fbAppSecret) {
+    return res.status(500).json({ error: 'সার্ভারে FB_APP_SECRET সেট করা নেই — Render Environment-এ যোগ করুন' });
+  }
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: 'fb_exchange_token',
+      client_id: fbAppId,
+      client_secret: config.fbAppSecret,
+      fb_exchange_token: pageAccessToken
+    });
+    const r = await axios.get(`https://graph.facebook.com/v19.0/oauth/access_token?${params}`);
+    const longLivedToken = r.data.access_token;
+
+    store.saveSettings({ fbToken: longLivedToken, fbPageId: pageId, fbAppId });
+    res.json({ ok: true, pageName });
+  } catch (err) {
+    console.error('fb-auto error:', err.response?.data || err.message);
+    res.status(400).json({ error: 'Facebook টোকেন এক্সচেঞ্জ ব্যর্থ হয়েছে' });
+  }
 });
 
 module.exports = router;
