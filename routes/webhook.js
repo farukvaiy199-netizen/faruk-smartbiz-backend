@@ -116,4 +116,50 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
   }
 }
 
+/* =============== BAZAAR ADMIN (ই-কমার্স ওয়েবসাইট) থেকে আসা ওয়েবহুক =============== */
+// এই দুটো লিংক SmartBiz অ্যাপের Settings ট্যাব থেকে কপি করে Bazaar Admin-এর
+// "অর্ডার Webhook URL" ও "AI অটোমেশন Webhook URL" ঘরে বসাতে হবে।
+
+router.post('/order', async (req, res) => {
+  try {
+    const order = store.createWebsiteOrder(req.body || {});
+    res.json({ ok: true, orderId: order.id });
+  } catch (err) {
+    console.error('Order webhook error:', err.message);
+    res.status(500).json({ error: 'অর্ডার সেভ করা যায়নি' });
+  }
+});
+
+router.post('/ai-reply', async (req, res) => {
+  try {
+    const settings = store.getSettings();
+    const message = (req.body?.message || req.body?.text || '').toString();
+
+    if (!settings.aiAutoReply) {
+      return res.json({ reply: '' });
+    }
+    if (!settings.aiKey) {
+      return res.status(400).json({ error: 'AI API key সংযুক্ত নেই — SmartBiz Settings-এ বসান' });
+    }
+    if (!message.trim()) {
+      return res.status(400).json({ error: 'message খালি' });
+    }
+
+    const sheetContext = settings.sheetLink ? await getSheetContext(settings.sheetLink) : '';
+    const { reply } = await getAIReply({
+      apiKey: settings.aiKey,
+      provider: settings.aiProvider,
+      customerMessage: message,
+      history: [],
+      sheetContext,
+      businessInfo
+    });
+
+    res.json({ reply });
+  } catch (err) {
+    console.error('AI-reply webhook error:', err.message);
+    res.status(500).json({ error: 'AI রিপ্লাই তৈরি করা যায়নি' });
+  }
+});
+
 module.exports = router;
