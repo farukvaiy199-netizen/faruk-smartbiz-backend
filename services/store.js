@@ -1,135 +1,254 @@
-const express = require('express');
-const router = express.Router();
-const axios = require('axios');
+// ছোট ব্যবসার জন্য সহজ JSON-ফাইল ভিত্তিক ডেটাবেস।
+// বড় স্কেলে গেলে এটাকে MongoDB/PostgreSQL দিয়ে বদলে দিন।
 
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const config = require('../config');
-const store = require('../services/store');
-const { sendFacebookMessage } = require('../services/facebook');
-const { sendWhatsAppMessage } = require('../services/whatsapp');
 
-/* ---------- Dashboard summary ---------- */
-router.get('/dashboard/summary', (req, res) => {
-  const orders = store.getOrders();
-  const customers = store.getCustomers();
-  const today = new Date().toDateString();
-  const todayOrders = orders.filter(o => new Date(o.createdAt).toDateString() === today);
-  res.json({
-    todayRevenue: todayOrders.reduce((sum, o) => sum + (o.price * o.qty), 0),
-    todayOrders: todayOrders.length,
-    pendingCount: orders.filter(o => o.status === 'Pending').length,
-    totalCustomers: customers.length
-  });
-});
+const DB_PATH = path.join(__dirname, '..', 'data', 'db.json');
 
-/* ---------- Orders ---------- */
-router.get('/orders', (req, res) => {
-  res.json(store.getOrders());
-});
+const ALGO = 'aes-256-cbc';
+const KEY = crypto.createHash('sha256').update(config.encryptionKey).digest(); // 32 bytes
 
-router.patch('/orders/:id', (req, res) => {
-  const { status } = req.body;
-  const valid = ['Pending', 'Processing', 'Delivered', 'Cancelled'];
-  if (!valid.includes(status)) return res.status(400).json({ error: 'অবৈধ status' });
-  const order = store.updateOrderStatus(req.params.id, status);
-  if (!order) return res.status(404).json({ error: 'অর্ডার পাওয়া যায়নি' });
-  res.json(order);
-});
+function encrypt(text) {
+  if (!text) return '';
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ALGO, KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  return iv.toString('hex') + ':' + encrypted.toString('hex');
+}
+
+function decrypt(payload) {
+  if (!payload) return '';
+  try {
+    const [ivHex, dataHex] = payload.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const decipher = crypto.createDecipheriv(ALGO, KEY, iv);
+    const decrypted = Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]);
+    return decrypted.toString('utf8');
+  } catch (e) {
+    return '';
+  }
+}
+
+function defaultDb() {
+  return {
+    orders: [],
+    customers: [],
+    broadcasts: [],
+    conversations: {}, // { customerId: [{role:'user'|'assistant', text, ts}] }
+    settings: {
+      fbToken: '',
+      fbPageId: '',
+      fbAppId: '',
+      waToken: '',
+      waPhoneNumberId: '',
+      sheetLink: '',
+      aiKey: '',
+      aiProvider: 'groq', // 'groq' or 'openai'
+      aiAutoReply: true,
+      connected: { fb: false, wa: false, sheet: false, ai: false }
+    },
+    nextOrderSeq: 232
+  };
+}
+
+function readDb() {
+  if (!fs.existsSync(DB_PATH)) {
+    writeDb(defaultDb());
+  }
+  const raw = fs.readFileSync(DB_PATH, 'utf8');
+  return JSON.parse(raw);
+}
+
+function writeDb(db) {
+  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf8');
+}
+
+/* ---------- Settings (tokens encrypted at rest) ---------- */
+function getSettings() {
+  const db = readDb();
+  const s = db.settings;
+  return {
+    fbToken: decrypt(s.fbToken),
+    fbPageId: s.fbPageId || '',
+    fbAppId: s.fbAppId || '',
+    waToken: decrypt(s.waToken),
+    waPhoneNumberId: s.waPhoneNumberId || '',
+    sheetLink: s.sheetLink || '',
+    aiKey: decrypt(s.aiKey),
+    aiProvider: s.aiProvider || 'groq',
+    aiAutoReply: s.aiAutoReply !== undefined ? s.aiAutoReply : true,
+    connected: s.connected || { fb: false, wa: false, sheet: false, ai: false }
+  };
+}
+
+function saveSettings(partial) {
+  const db = readDb();
+  const s = db.settings;
+  if (partial.fbToken !== undefined) { s.fbToken = encrypt(partial.fbToken); s.connected.fb = !!partial.fbToken; }
+  if (partial.fbPageId !== undefined) s.fbPageId = partial.fbPageId;
+  if (partial.fbAppId !== undefined) s.fbAppId = partial.fbAppId;
+  if (partial.waToken !== undefined) { s.waToken = encrypt(partial.waToken); s.connected.wa = !!partial.waToken; }
+  if (partial.waPhoneNumberId !== undefined) s.waPhoneNumberId = partial.waPhoneNumberId;
+  if (partial.sheetLink !== undefined) { s.sheetLink = partial.sheetLink; s.connected.sheet = !!partial.sheetLink; }
+  if (partial.aiKey !== undefined) { s.aiKey = encrypt(partial.aiKey); s.connected.ai = !!partial.aiKey; }
+  if (partial.aiProvider !== undefined) s.aiProvider = partial.aiProvider;
+  if (partial.aiAutoReply !== undefined) s.aiAutoReply = !!partial.aiAutoReply;
+  db.settings = s;
+  writeDb(db);
+  return getSettings();
+}
 
 /* ---------- Customers ---------- */
-router.get('/customers', (req, res) => {
-  res.json(store.getCustomers());
-});
+function findOrCreateCustomer({ platform, platformId, name, phone }) {
+  const db = readDb();
+  let customer = db.customers.find(c => c.platformId === platformId && c.platform === platform);
+  if (!customer) {
+    customer = {
+      id: 'C-' + (1000 + db.customers.length + 1),
+      platform,
+      platformId,
+      name: name || 'অজানা কাস্টমার',
+      phone: phone || '',
+      orders: 0,
+      ai: true,
+      createdAt: new Date().toISOString()
+    };
+    db.customers.push(customer);
+    writeDb(db);
+  }
+  return customer;
+}
 
-router.patch('/customers/:id/ai', (req, res) => {
-  const { ai } = req.body;
-  const customer = store.setCustomerAI(req.params.id, !!ai);
-  if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
-  res.json(customer);
-});
+function getCustomers() {
+  return readDb().customers;
+}
 
-/* ---------- Broadcast ---------- */
-router.post('/broadcast', async (req, res) => {
-  const { message } = req.body;
-  if (!message || !message.trim()) return res.status(400).json({ error: 'মেসেজ খালি' });
+function setCustomerAI(id, aiOn) {
+  const db = readDb();
+  const c = db.customers.find(x => x.id === id);
+  if (!c) return null;
+  c.ai = aiOn;
+  writeDb(db);
+  return c;
+}
 
-  const settings = store.getSettings();
-  const customers = store.getCustomers();
-  let success = 0, failed = 0;
+/* ---------- Conversations ---------- */
+function appendMessage(customerId, role, text) {
+  const db = readDb();
+  if (!db.conversations[customerId]) db.conversations[customerId] = [];
+  db.conversations[customerId].push({ role, text, ts: new Date().toISOString() });
+  // শুধু শেষ ২০টা মেসেজ রাখি (AI context এর জন্য যথেষ্ট)
+  db.conversations[customerId] = db.conversations[customerId].slice(-20);
+  writeDb(db);
+}
 
-  for (const c of customers) {
-    try {
-      if (c.platform === 'facebook' && settings.fbToken) {
-        await sendFacebookMessage(c.platformId, message, settings.fbToken);
-      } else if (c.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
-        await sendWhatsAppMessage(c.platformId, message, settings.waPhoneNumberId, settings.waToken);
-      } else {
-        throw new Error('platform not connected');
-      }
-      success++;
-    } catch (e) {
-      failed++;
+function getConversation(customerId) {
+  const db = readDb();
+  return db.conversations[customerId] || [];
+}
+
+/* ---------- Orders ---------- */
+function createOrder({ customerId, name, product, qty, price, source }) {
+  const db = readDb();
+  const id = 'ORD-' + String(db.nextOrderSeq).padStart(6, '0');
+  db.nextOrderSeq += 1;
+  const order = {
+    id, customerId, name, product,
+    qty: qty || 1, price: price || 0,
+    status: 'Pending', source,
+    createdAt: new Date().toISOString()
+  };
+  db.orders.unshift(order);
+  const cust = db.customers.find(c => c.id === customerId);
+  if (cust) cust.orders += 1;
+  writeDb(db);
+  return order;
+}
+
+function getOrders() {
+  return readDb().orders;
+}
+
+/* ---------- বাইরের ওয়েবসাইট (Bazaar Admin) থেকে ওয়েবহুকের মাধ্যমে আসা অর্ডার ---------- */
+function createWebsiteOrder(payload = {}) {
+  const db = readDb();
+  const id = payload.orderId ? String(payload.orderId) : ('ORD-' + String(db.nextOrderSeq).padStart(6, '0'));
+  if (!payload.orderId) db.nextOrderSeq += 1;
+
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const productSummary = items.length
+    ? items.map(it => `${it.name || it.product || 'পণ্য'}${it.qty ? ' x' + it.qty : ''}`).join(', ')
+    : (payload.product || 'ওয়েবসাইট অর্ডার');
+  const qty = items.length ? items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : (Number(payload.qty) || 1);
+  const price = Number(payload.total) || Number(payload.subtotal) || 0;
+
+  // ফোন নাম্বার দিয়ে আগের কাস্টমার খুঁজি, না পেলে নতুন বানাই — যাতে Customers ট্যাবেও দেখা যায়
+  let customer = null;
+  if (payload.phone) {
+    customer = db.customers.find(c => c.phone === payload.phone && c.platform === 'website');
+    if (!customer) {
+      customer = {
+        id: 'C-' + (1000 + db.customers.length + 1),
+        platform: 'website',
+        platformId: payload.phone,
+        name: payload.customer || 'ওয়েবসাইট কাস্টমার',
+        phone: payload.phone,
+        orders: 0,
+        ai: true,
+        createdAt: new Date().toISOString()
+      };
+      db.customers.push(customer);
     }
+    customer.orders += 1;
   }
 
-  const record = store.addBroadcast({
-    msg: message, total: customers.length, success, failed,
-    date: new Date().toLocaleDateString('bn-BD')
-  });
-  res.json(record);
-});
+  const order = {
+    id,
+    customerId: customer ? customer.id : null,
+    name: payload.customer || (customer ? customer.name : 'ওয়েবসাইট কাস্টমার'),
+    product: productSummary,
+    qty,
+    price,
+    status: 'Pending',
+    source: 'Bazaar Admin',
+    address: payload.address || '',
+    payment: payload.payment || '',
+    transactionId: payload.transactionId || '',
+    createdAt: payload.date ? new Date(payload.date).toISOString() : new Date().toISOString()
+  };
+  db.orders.unshift(order);
+  writeDb(db);
+  return order;
+}
 
-router.get('/broadcast', (req, res) => {
-  res.json(store.getBroadcasts());
-});
+function updateOrderStatus(id, status) {
+  const db = readDb();
+  const o = db.orders.find(x => x.id === id);
+  if (!o) return null;
+  o.status = status;
+  writeDb(db);
+  return o;
+}
 
-/* ---------- Settings ---------- */
-// টোকেন/কী কখনো ফেরত পাঠানো হয় না (শুধু connected true/false), নিরাপত্তার জন্য
-router.get('/settings', (req, res) => {
-  const s = store.getSettings();
-  res.json({
-    fbPageId: s.fbPageId,
-    fbAppId: s.fbAppId,
-    waPhoneNumberId: s.waPhoneNumberId,
-    sheetLink: s.sheetLink,
-    aiProvider: s.aiProvider,
-    aiAutoReply: s.aiAutoReply,
-    connected: s.connected
-  });
-});
+/* ---------- Broadcasts ---------- */
+function addBroadcast(record) {
+  const db = readDb();
+  db.broadcasts.unshift(record);
+  writeDb(db);
+  return record;
+}
 
-router.post('/settings', (req, res) => {
-  const updated = store.saveSettings(req.body);
-  res.json({
-    connected: updated.connected
-  });
-});
+function getBroadcasts() {
+  return readDb().broadcasts;
+}
 
-/* ---------- Facebook অটো-কানেক্ট (নতুন ফিচার) ---------- */
-router.post('/settings/fb-auto', async (req, res) => {
-  const { pageAccessToken, pageId, pageName, fbAppId } = req.body;
-  if (!pageAccessToken || !fbAppId) {
-    return res.status(400).json({ error: 'pageAccessToken ও fbAppId দুটোই দরকার' });
-  }
-  if (!config.fbAppSecret) {
-    return res.status(500).json({ error: 'সার্ভারে FB_APP_SECRET সেট করা নেই — Render Environment-এ যোগ করুন' });
-  }
-
-  try {
-    const params = new URLSearchParams({
-      grant_type: 'fb_exchange_token',
-      client_id: fbAppId,
-      client_secret: config.fbAppSecret,
-      fb_exchange_token: pageAccessToken
-    });
-    const r = await axios.get(`https://graph.facebook.com/v19.0/oauth/access_token?${params}`);
-    const longLivedToken = r.data.access_token;
-
-    store.saveSettings({ fbToken: longLivedToken, fbPageId: pageId, fbAppId });
-    res.json({ ok: true, pageName });
-  } catch (err) {
-    console.error('fb-auto error:', err.response?.data || err.message);
-    res.status(400).json({ error: 'Facebook টোকেন এক্সচেঞ্জ ব্যর্থ হয়েছে' });
-  }
-});
-
-module.exports = router;
+module.exports = {
+  getSettings, saveSettings,
+  findOrCreateCustomer, getCustomers, setCustomerAI,
+  appendMessage, getConversation,
+  createOrder, createWebsiteOrder, getOrders, updateOrderStatus,
+  addBroadcast, getBroadcasts
+};
