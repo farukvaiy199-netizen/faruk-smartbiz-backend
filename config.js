@@ -4,5 +4,10 @@ module.exports = {
   port: process.env.PORT || 3000,
   webhookVerifyToken: process.env.WEBHOOK_VERIFY_TOKEN || 'change_me',
   encryptionKey: process.env.SETTINGS_ENCRYPTION_KEY || 'change_this_to_a_long_random_string',
-  fbAppSecret: process.env.FB_APP_SECRET || ''
+  fbAppSecret: process.env.FB_APP_SECRET || '',
+  // Render-এর ফ্রি সার্ভিসে ডিস্ক অস্থায়ী (প্রতি ডিপ্লয়ে মুছে যায়),
+  // তাই সব সেটিংস (AI Key, Facebook Token ইত্যাদি) স্থায়ীভাবে Google Sheet-এ সেভ হয়।
+  // এই দুটো Render Environment ভ্যারিয়েবলে বসাতে হবে (একবারই, আর কখনো মুছবে না)।
+  sheetScriptUrl: process.env.SHEET_SCRIPT_URL || '',
+  sheetScriptToken: process.env.SHEET_SCRIPT_TOKEN || ''
 };
