@@ -52,7 +52,7 @@ router.post('/broadcast', async (req, res) => {
   const { message } = req.body;
   if (!message || !message.trim()) return res.status(400).json({ error: 'মেসেজ খালি' });
 
-  const settings = store.getSettings();
+  const settings = await store.getSettings();
   const customers = store.getCustomers();
   let success = 0, failed = 0;
 
@@ -83,9 +83,8 @@ router.get('/broadcast', (req, res) => {
 });
 
 /* ---------- Settings ---------- */
-// টোকেন/কী কখনো ফেরত পাঠানো হয় না (শুধু connected true/false), নিরাপত্তার জন্য
-router.get('/settings', (req, res) => {
-  const s = store.getSettings();
+router.get('/settings', async (req, res) => {
+  const s = await store.getSettings();
   res.json({
     fbPageId: s.fbPageId,
     fbAppId: s.fbAppId,
@@ -93,18 +92,19 @@ router.get('/settings', (req, res) => {
     sheetLink: s.sheetLink,
     aiProvider: s.aiProvider,
     aiAutoReply: s.aiAutoReply,
-    connected: s.connected
+    connected: s.connected,
+    sheetStorageConfigured: !!config.sheetScriptUrl
   });
 });
 
-router.post('/settings', (req, res) => {
-  const updated = store.saveSettings(req.body);
+router.post('/settings', async (req, res) => {
+  const updated = await store.saveSettings(req.body);
   res.json({
     connected: updated.connected
   });
 });
 
-/* ---------- Facebook অটো-কানেক্ট (নতুন ফিচার) ---------- */
+/* ---------- Facebook অটো-কানেক্ট ---------- */
 router.post('/settings/fb-auto', async (req, res) => {
   const { pageAccessToken, pageId, pageName, fbAppId } = req.body;
   if (!pageAccessToken || !fbAppId) {
@@ -124,7 +124,7 @@ router.post('/settings/fb-auto', async (req, res) => {
     const r = await axios.get(`https://graph.facebook.com/v19.0/oauth/access_token?${params}`);
     const longLivedToken = r.data.access_token;
 
-    store.saveSettings({ fbToken: longLivedToken, fbPageId: pageId, fbAppId });
+    await store.saveSettings({ fbToken: longLivedToken, fbPageId: pageId, fbAppId });
     res.json({ ok: true, pageName });
   } catch (err) {
     console.error('fb-auto error:', err.response?.data || err.message);
