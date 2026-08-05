@@ -45,6 +45,8 @@ function defaultDb() {
       waToken: '',
       waPhoneNumberId: '',
       sheetLink: '',
+      sheetScriptUrl: '',
+      sheetScriptToken: '',
       aiKey: '',
       aiProvider: 'groq', // 'groq' or 'openai'
       aiAutoReply: true,
@@ -77,6 +79,8 @@ function getSettings() {
     waToken: decrypt(s.waToken),
     waPhoneNumberId: s.waPhoneNumberId || '',
     sheetLink: s.sheetLink || '',
+    sheetScriptUrl: s.sheetScriptUrl || '',
+    sheetScriptToken: s.sheetScriptToken || '',
     aiKey: decrypt(s.aiKey),
     aiProvider: s.aiProvider || 'groq',
     aiAutoReply: s.aiAutoReply !== undefined ? s.aiAutoReply : true,
@@ -93,6 +97,8 @@ function saveSettings(partial) {
   if (partial.waToken !== undefined) { s.waToken = encrypt(partial.waToken); s.connected.wa = !!partial.waToken; }
   if (partial.waPhoneNumberId !== undefined) s.waPhoneNumberId = partial.waPhoneNumberId;
   if (partial.sheetLink !== undefined) { s.sheetLink = partial.sheetLink; s.connected.sheet = !!partial.sheetLink; }
+  if (partial.sheetScriptUrl !== undefined) s.sheetScriptUrl = partial.sheetScriptUrl;
+  if (partial.sheetScriptToken !== undefined) s.sheetScriptToken = partial.sheetScriptToken;
   if (partial.aiKey !== undefined) { s.aiKey = encrypt(partial.aiKey); s.connected.ai = !!partial.aiKey; }
   if (partial.aiProvider !== undefined) s.aiProvider = partial.aiProvider;
   if (partial.aiAutoReply !== undefined) s.aiAutoReply = !!partial.aiAutoReply;
@@ -135,6 +141,17 @@ function setCustomerAI(id, aiOn) {
   return c;
 }
 
+// AI-এর সাথে কথা বলার সময় কাস্টমার নাম/ফোন জানালে প্রোফাইল আপডেট করি
+function updateCustomerContact(id, { name, phone }) {
+  const db = readDb();
+  const c = db.customers.find(x => x.id === id);
+  if (!c) return null;
+  if (name && name.trim()) c.name = name.trim();
+  if (phone && phone.trim()) c.phone = phone.trim();
+  writeDb(db);
+  return c;
+}
+
 /* ---------- Conversations ---------- */
 function appendMessage(customerId, role, text) {
   const db = readDb();
@@ -151,12 +168,15 @@ function getConversation(customerId) {
 }
 
 /* ---------- Orders ---------- */
-function createOrder({ customerId, name, product, qty, price, source }) {
+function createOrder({ customerId, name, phone, address, product, qty, price, source }) {
   const db = readDb();
   const id = 'ORD-' + String(db.nextOrderSeq).padStart(6, '0');
   db.nextOrderSeq += 1;
   const order = {
-    id, customerId, name, product,
+    id, customerId, name,
+    phone: phone || '',
+    address: address || '',
+    product,
     qty: qty || 1, price: price || 0,
     status: 'Pending', source,
     createdAt: new Date().toISOString()
@@ -247,7 +267,7 @@ function getBroadcasts() {
 
 module.exports = {
   getSettings, saveSettings,
-  findOrCreateCustomer, getCustomers, setCustomerAI,
+  findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
   createOrder, createWebsiteOrder, getOrders, updateOrderStatus,
   addBroadcast, getBroadcasts
