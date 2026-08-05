@@ -1,36 +1,13 @@
-// ছোট ব্যবসার জন্য সহজ JSON-ফাইল ভিত্তিক ডেটাবেস।
-// বড় স্কেলে গেলে এটাকে MongoDB/PostgreSQL দিয়ে বদলে দিন।
+// ছোট ব্যবসার জন্য সহজ JSON-ফাইল ভিত্তিক ডেটাবেস (অর্ডার/কাস্টমার/মেসেজের জন্য)।
+// কিন্তু সেটিংস (AI Key, Facebook Token ইত্যাদি) আলাদাভাবে Google Sheet-এ স্থায়ীভাবে রাখা হয়,
+// কারণ Render Free সার্ভিসে লোকাল ফাইল প্রতি ডিপ্লয়ে মুছে যায় (ephemeral disk)।
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+const axios = require('axios');
 const config = require('../config');
 
 const DB_PATH = path.join(__dirname, '..', 'data', 'db.json');
-
-const ALGO = 'aes-256-cbc';
-const KEY = crypto.createHash('sha256').update(config.encryptionKey).digest(); // 32 bytes
-
-function encrypt(text) {
-  if (!text) return '';
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ALGO, KEY, iv);
-  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
-  return iv.toString('hex') + ':' + encrypted.toString('hex');
-}
-
-function decrypt(payload) {
-  if (!payload) return '';
-  try {
-    const [ivHex, dataHex] = payload.split(':');
-    const iv = Buffer.from(ivHex, 'hex');
-    const decipher = crypto.createDecipheriv(ALGO, KEY, iv);
-    const decrypted = Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]);
-    return decrypted.toString('utf8');
-  } catch (e) {
-    return '';
-  }
-}
 
 function defaultDb() {
   return {
@@ -38,20 +15,6 @@ function defaultDb() {
     customers: [],
     broadcasts: [],
     conversations: {}, // { customerId: [{role:'user'|'assistant', text, ts}] }
-    settings: {
-      fbToken: '',
-      fbPageId: '',
-      fbAppId: '',
-      waToken: '',
-      waPhoneNumberId: '',
-      sheetLink: '',
-      sheetScriptUrl: '',
-      sheetScriptToken: '',
-      aiKey: '',
-      aiProvider: 'groq', // 'groq' or 'openai'
-      aiAutoReply: true,
-      connected: { fb: false, wa: false, sheet: false, ai: false }
-    },
     nextOrderSeq: 232
   };
 }
@@ -68,43 +31,72 @@ function writeDb(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf8');
 }
 
-/* ---------- Settings (tokens encrypted at rest) ---------- */
-function getSettings() {
-  const db = readDb();
-  const s = db.settings;
+function defaultSettings() {
   return {
-    fbToken: decrypt(s.fbToken),
-    fbPageId: s.fbPageId || '',
-    fbAppId: s.fbAppId || '',
-    waToken: decrypt(s.waToken),
-    waPhoneNumberId: s.waPhoneNumberId || '',
-    sheetLink: s.sheetLink || '',
-    sheetScriptUrl: s.sheetScriptUrl || '',
-    sheetScriptToken: s.sheetScriptToken || '',
-    aiKey: decrypt(s.aiKey),
-    aiProvider: s.aiProvider || 'groq',
-    aiAutoReply: s.aiAutoReply !== undefined ? s.aiAutoReply : true,
-    connected: s.connected || { fb: false, wa: false, sheet: false, ai: false }
+    fbToken: '', fbPageId: '', fbAppId: '',
+    waToken: '', waPhoneNumberId: '',
+    sheetLink: '',
+    aiKey: '', aiProvider: 'groq', aiAutoReply: true
   };
 }
 
-function saveSettings(partial) {
+/* ---------- Settings — Google Sheet-এ স্থায়ীভাবে সেভ হয় (server redeploy হলেও হারায় না) ---------- */
+let cachedSettings = null; // এই সার্ভার ইনস্ট্যান্স চালু থাকা অবস্থায় বারবার শিটে না গিয়ে দ্রুত সাড়া দিতে
+
+function computeConnected(s) {
+  return {
+    fb: !!s.fbToken,
+    wa: !!(s.waToken && s.waPhoneNumberId),
+    sheet: !!s.sheetLink,
+    ai: !!s.aiKey
+  };
+}
+
+async function getSettings() {
+  if (cachedSettings) return { ...cachedSettings, connected: computeConnected(cachedSettings) };
+
+  if (config.sheetScriptUrl) {
+    try {
+      const res = await axios.post(config.sheetScriptUrl, {
+        token: config.sheetScriptToken,
+        type: 'settings_get'
+      }, { timeout: 10000 });
+      const remote = (res.data && res.data.settings) || {};
+      cachedSettings = { ...defaultSettings(), ...remote };
+      return { ...cachedSettings, connected: computeConnected(cachedSettings) };
+    } catch (err) {
+      console.error('Google Sheet থেকে সেটিংস আনতে ব্যর্থ:', err.message);
+    }
+  }
+
   const db = readDb();
-  const s = db.settings;
-  if (partial.fbToken !== undefined) { s.fbToken = encrypt(partial.fbToken); s.connected.fb = !!partial.fbToken; }
-  if (partial.fbPageId !== undefined) s.fbPageId = partial.fbPageId;
-  if (partial.fbAppId !== undefined) s.fbAppId = partial.fbAppId;
-  if (partial.waToken !== undefined) { s.waToken = encrypt(partial.waToken); s.connected.wa = !!partial.waToken; }
-  if (partial.waPhoneNumberId !== undefined) s.waPhoneNumberId = partial.waPhoneNumberId;
-  if (partial.sheetLink !== undefined) { s.sheetLink = partial.sheetLink; s.connected.sheet = !!partial.sheetLink; }
-  if (partial.sheetScriptUrl !== undefined) s.sheetScriptUrl = partial.sheetScriptUrl;
-  if (partial.sheetScriptToken !== undefined) s.sheetScriptToken = partial.sheetScriptToken;
-  if (partial.aiKey !== undefined) { s.aiKey = encrypt(partial.aiKey); s.connected.ai = !!partial.aiKey; }
-  if (partial.aiProvider !== undefined) s.aiProvider = partial.aiProvider;
-  if (partial.aiAutoReply !== undefined) s.aiAutoReply = !!partial.aiAutoReply;
-  db.settings = s;
+  cachedSettings = { ...defaultSettings(), ...(db.settings || {}) };
+  return { ...cachedSettings, connected: computeConnected(cachedSettings) };
+}
+
+async function saveSettings(partial) {
+  const current = cachedSettings || (await getSettings());
+  const merged = { ...current, ...partial };
+  delete merged.connected;
+  cachedSettings = merged;
+
+  if (config.sheetScriptUrl) {
+    try {
+      await axios.post(config.sheetScriptUrl, {
+        token: config.sheetScriptToken,
+        type: 'settings_save',
+        settings: merged
+      }, { timeout: 10000 });
+    } catch (err) {
+      console.error('Google Sheet-এ সেটিংস সেভ করতে ব্যর্থ:', err.message);
+    }
+  }
+
+  const db = readDb();
+  db.settings = merged;
   writeDb(db);
-  return getSettings();
+
+  return { ...merged, connected: computeConnected(merged) };
 }
 
 /* ---------- Customers ---------- */
@@ -141,7 +133,6 @@ function setCustomerAI(id, aiOn) {
   return c;
 }
 
-// AI-এর সাথে কথা বলার সময় কাস্টমার নাম/ফোন জানালে প্রোফাইল আপডেট করি
 function updateCustomerContact(id, { name, phone }) {
   const db = readDb();
   const c = db.customers.find(x => x.id === id);
@@ -157,7 +148,6 @@ function appendMessage(customerId, role, text) {
   const db = readDb();
   if (!db.conversations[customerId]) db.conversations[customerId] = [];
   db.conversations[customerId].push({ role, text, ts: new Date().toISOString() });
-  // শুধু শেষ ২০টা মেসেজ রাখি (AI context এর জন্য যথেষ্ট)
   db.conversations[customerId] = db.conversations[customerId].slice(-20);
   writeDb(db);
 }
@@ -205,7 +195,6 @@ function createWebsiteOrder(payload = {}) {
   const qty = items.length ? items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : (Number(payload.qty) || 1);
   const price = Number(payload.total) || Number(payload.subtotal) || 0;
 
-  // ফোন নাম্বার দিয়ে আগের কাস্টমার খুঁজি, না পেলে নতুন বানাই — যাতে Customers ট্যাবেও দেখা যায়
   let customer = null;
   if (payload.phone) {
     customer = db.customers.find(c => c.phone === payload.phone && c.platform === 'website');
