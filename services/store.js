@@ -1,5 +1,5 @@
 // ছোট ব্যবসার জন্য সহজ JSON-ফাইল ভিত্তিক ডেটাবেস (অর্ডার/কাস্টমার/মেসেজের জন্য)।
-// কিন্তু সেটিংস ও কথোপকথনের স্মৃতি Google Sheet-এ স্থায়ীভাবে রাখা হয়,
+// কিন্তু সেটিংস (AI Key, Facebook Token ইত্যাদি) আলাদাভাবে Google Sheet-এ স্থায়ীভাবে রাখা হয়,
 // কারণ Render Free সার্ভিসে লোকাল ফাইল প্রতি ডিপ্লয়ে মুছে যায় (ephemeral disk)।
 
 const fs = require('fs');
@@ -52,15 +52,22 @@ function computeConnected(s) {
   };
 }
 
+// শিটে POST করে (Apps Script কখনো কখনো ধীর, বিশেষ করে নতুন ট্যাব তৈরি করার সময়) —
+// একবার ব্যর্থ হলে একটু বড় টাইমআউট দিয়ে আরেকবার চেষ্টা করি
+async function postToScript(payload, timeout1 = 10000, timeout2 = 20000) {
+  try {
+    return await axios.post(config.sheetScriptUrl, payload, { timeout: timeout1 });
+  } catch (err) {
+    return await axios.post(config.sheetScriptUrl, payload, { timeout: timeout2 });
+  }
+}
+
 async function getSettings() {
   if (cachedSettings) return { ...cachedSettings, connected: computeConnected(cachedSettings) };
 
   if (config.sheetScriptUrl) {
     try {
-      const res = await axios.post(config.sheetScriptUrl, {
-        token: config.sheetScriptToken,
-        type: 'settings_get'
-      }, { timeout: 10000 });
+      const res = await postToScript({ token: config.sheetScriptToken, type: 'settings_get' });
       const remote = (res.data && res.data.settings) || {};
       cachedSettings = { ...defaultSettings(), ...remote };
       return { ...cachedSettings, connected: computeConnected(cachedSettings) };
@@ -82,11 +89,7 @@ async function saveSettings(partial) {
 
   if (config.sheetScriptUrl) {
     try {
-      await axios.post(config.sheetScriptUrl, {
-        token: config.sheetScriptToken,
-        type: 'settings_save',
-        settings: merged
-      }, { timeout: 10000 });
+      await postToScript({ token: config.sheetScriptToken, type: 'settings_save', settings: merged });
     } catch (err) {
       console.error('Google Sheet-এ সেটিংস সেভ করতে ব্যর্থ:', err.message);
     }
@@ -151,11 +154,7 @@ async function getConversation(customerId) {
 
   if (config.sheetScriptUrl) {
     try {
-      const res = await axios.post(config.sheetScriptUrl, {
-        token: config.sheetScriptToken,
-        type: 'conversation_get',
-        customerId
-      }, { timeout: 10000 });
+      const res = await postToScript({ token: config.sheetScriptToken, type: 'conversation_get', customerId });
       const msgs = (res.data && res.data.messages) || [];
       convCache[customerId] = msgs;
       return msgs;
@@ -173,17 +172,11 @@ async function appendMessage(customerId, role, text) {
   const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-20);
   convCache[customerId] = updated;
 
+  // শিটে সেভ করাটা ব্যাকগ্রাউন্ডে হবে (await করা হচ্ছে না) — এতে কাস্টমারের রিপ্লাই
+  // Apps Script ধীর হলেও আটকে থাকবে না। ব্যর্থ হলে শুধু লগে লেখা হবে।
   if (config.sheetScriptUrl) {
-    try {
-      await axios.post(config.sheetScriptUrl, {
-        token: config.sheetScriptToken,
-        type: 'conversation_save',
-        customerId,
-        messages: updated
-      }, { timeout: 10000 });
-    } catch (err) {
-      console.error('Google Sheet-এ কথোপকথন সেভ করতে ব্যর্থ:', err.message);
-    }
+    postToScript({ token: config.sheetScriptToken, type: 'conversation_save', customerId, messages: updated })
+      .catch(err => console.error('Google Sheet-এ কথোপকথন সেভ করতে ব্যর্থ:', err.message));
   }
 
   const db = readDb();
