@@ -10,6 +10,17 @@ const { sendWhatsAppMessage } = require('../services/whatsapp');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
+// সাময়িক এরর/রেট-লিমিট হলে সাথে সাথে হাল ছেড়ে না দিয়ে একবার আবার চেষ্টা করে
+async function withRetry(fn, retries = 1, delayMs = 1500) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (retries <= 0) throw err;
+    await new Promise(r => setTimeout(r, delayMs));
+    return withRetry(fn, retries - 1, delayMs);
+  }
+}
+
 /* =============== FACEBOOK MESSENGER =============== */
 
 router.get('/facebook', (req, res) => {
@@ -24,19 +35,19 @@ router.get('/facebook', (req, res) => {
 
 router.post('/facebook', async (req, res) => {
   res.sendStatus(200);
-  try {
-    const entries = req.body.entry || [];
-    for (const entry of entries) {
-      const events = entry.messaging || [];
-      for (const event of events) {
-        const senderId = event.sender?.id;
-        const text = event.message?.text;
-        if (!senderId || !text) continue;
+  const entries = req.body.entry || [];
+  for (const entry of entries) {
+    const events = entry.messaging || [];
+    for (const event of events) {
+      const senderId = event.sender?.id;
+      const text = event.message?.text;
+      if (!senderId || !text) continue;
+      try {
         await handleIncomingMessage({ platform: 'facebook', platformId: senderId, text });
+      } catch (err) {
+        console.error('Facebook webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.message);
       }
     }
-  } catch (err) {
-    console.error('Facebook webhook error:', err.message);
   }
 });
 
@@ -54,18 +65,18 @@ router.get('/whatsapp', (req, res) => {
 
 router.post('/whatsapp', async (req, res) => {
   res.sendStatus(200);
-  try {
-    const value = req.body.entry?.[0]?.changes?.[0]?.value;
-    const messages = value?.messages || [];
-    for (const msg of messages) {
-      const from = msg.from;
-      const text = msg.text?.body;
-      const name = value?.contacts?.[0]?.profile?.name;
-      if (!from || !text) continue;
+  const value = req.body.entry?.[0]?.changes?.[0]?.value;
+  const messages = value?.messages || [];
+  for (const msg of messages) {
+    const from = msg.from;
+    const text = msg.text?.body;
+    const name = value?.contacts?.[0]?.profile?.name;
+    if (!from || !text) continue;
+    try {
       await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from });
+    } catch (err) {
+      console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.message);
     }
-  } catch (err) {
-    console.error('WhatsApp webhook error:', err.message);
   }
 });
 
@@ -80,7 +91,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
     if (fbName) store.updateCustomerContact(customer.id, { name: fbName });
   }
 
-  store.appendMessage(customer.id, 'user', text);
+  await store.appendMessage(customer.id, 'user', text);
 
   if (!customer.ai) return;
 
@@ -90,23 +101,24 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
   }
 
   const sheetContext = settings.sheetLink ? await getSheetContext(settings.sheetLink) : '';
-  const history = store.getConversation(customer.id).slice(0, -1);
+  const fullHistory = await store.getConversation(customer.id);
+  const history = fullHistory.slice(0, -1);
 
-  const { reply, order } = await getAIReply({
+  const { reply, order } = await withRetry(() => getAIReply({
     apiKey: settings.aiKey,
     provider: settings.aiProvider,
     customerMessage: text,
     history,
     sheetContext,
     businessInfo
-  });
+  }));
 
-  store.appendMessage(customer.id, 'assistant', reply);
+  await store.appendMessage(customer.id, 'assistant', reply);
 
   if (platform === 'facebook' && settings.fbToken) {
-    await sendFacebookMessage(platformId, reply, settings.fbToken);
+    await withRetry(() => sendFacebookMessage(platformId, reply, settings.fbToken));
   } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
-    await sendWhatsAppMessage(platformId, reply, settings.waPhoneNumberId, settings.waToken);
+    await withRetry(() => sendWhatsAppMessage(platformId, reply, settings.waPhoneNumberId, settings.waToken));
   }
 
   if (order && order.product) {
