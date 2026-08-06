@@ -1,5 +1,5 @@
 // ছোট ব্যবসার জন্য সহজ JSON-ফাইল ভিত্তিক ডেটাবেস (অর্ডার/কাস্টমার/মেসেজের জন্য)।
-// কিন্তু সেটিংস (AI Key, Facebook Token ইত্যাদি) আলাদাভাবে Google Sheet-এ স্থায়ীভাবে রাখা হয়,
+// কিন্তু সেটিংস ও কথোপকথনের স্মৃতি Google Sheet-এ স্থায়ীভাবে রাখা হয়,
 // কারণ Render Free সার্ভিসে লোকাল ফাইল প্রতি ডিপ্লয়ে মুছে যায় (ephemeral disk)।
 
 const fs = require('fs');
@@ -14,7 +14,7 @@ function defaultDb() {
     orders: [],
     customers: [],
     broadcasts: [],
-    conversations: {}, // { customerId: [{role:'user'|'assistant', text, ts}] }
+    conversations: {},
     nextOrderSeq: 232
   };
 }
@@ -40,8 +40,8 @@ function defaultSettings() {
   };
 }
 
-/* ---------- Settings — Google Sheet-এ স্থায়ীভাবে সেভ হয় (server redeploy হলেও হারায় না) ---------- */
-let cachedSettings = null; // এই সার্ভার ইনস্ট্যান্স চালু থাকা অবস্থায় বারবার শিটে না গিয়ে দ্রুত সাড়া দিতে
+/* ---------- Settings — Google Sheet-এ স্থায়ীভাবে সেভ হয় ---------- */
+let cachedSettings = null;
 
 function computeConnected(s) {
   return {
@@ -143,18 +143,53 @@ function updateCustomerContact(id, { name, phone }) {
   return c;
 }
 
-/* ---------- Conversations ---------- */
-function appendMessage(customerId, role, text) {
+/* ---------- Conversations — Google Sheet-এ স্থায়ীভাবে সেভ হয় (স্মৃতি হারায় না) ---------- */
+let convCache = {};
+
+async function getConversation(customerId) {
+  if (convCache[customerId]) return convCache[customerId];
+
+  if (config.sheetScriptUrl) {
+    try {
+      const res = await axios.post(config.sheetScriptUrl, {
+        token: config.sheetScriptToken,
+        type: 'conversation_get',
+        customerId
+      }, { timeout: 10000 });
+      const msgs = (res.data && res.data.messages) || [];
+      convCache[customerId] = msgs;
+      return msgs;
+    } catch (err) {
+      console.error('Google Sheet থেকে কথোপকথন আনতে ব্যর্থ:', err.message);
+    }
+  }
+
   const db = readDb();
-  if (!db.conversations[customerId]) db.conversations[customerId] = [];
-  db.conversations[customerId].push({ role, text, ts: new Date().toISOString() });
-  db.conversations[customerId] = db.conversations[customerId].slice(-20);
-  writeDb(db);
+  return (db.conversations && db.conversations[customerId]) || [];
 }
 
-function getConversation(customerId) {
+async function appendMessage(customerId, role, text) {
+  const current = await getConversation(customerId);
+  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-20);
+  convCache[customerId] = updated;
+
+  if (config.sheetScriptUrl) {
+    try {
+      await axios.post(config.sheetScriptUrl, {
+        token: config.sheetScriptToken,
+        type: 'conversation_save',
+        customerId,
+        messages: updated
+      }, { timeout: 10000 });
+    } catch (err) {
+      console.error('Google Sheet-এ কথোপকথন সেভ করতে ব্যর্থ:', err.message);
+    }
+  }
+
   const db = readDb();
-  return db.conversations[customerId] || [];
+  if (!db.conversations) db.conversations = {};
+  db.conversations[customerId] = updated;
+  writeDb(db);
 }
 
 /* ---------- Orders ---------- */
