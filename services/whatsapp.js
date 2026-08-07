@@ -13,4 +13,18 @@ async function sendWhatsAppMessage(to, text, phoneNumberId, token) {
   });
 }
 
-module.exports = { sendWhatsAppMessage };
+// প্রোডাক্টের ছবি পাঠানোর জন্য (নতুন ফিচার)
+async function sendWhatsAppImage(to, imageUrl, phoneNumberId, token, caption) {
+  const url = `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`;
+  await axios.post(url, {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'image',
+    image: { link: imageUrl, caption: caption || '' }
+  }, {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 15000
+  });
+}
+
+module.exports = { sendWhatsAppMessage, sendWhatsAppImage };
