@@ -5,8 +5,8 @@ const config = require('../config');
 const store = require('../services/store');
 const { getAIReply } = require('../services/ai');
 const { getSheetContext, writeOrderToSheet, writeCustomerToSheet } = require('../services/sheets');
-const { sendFacebookMessage, getFacebookProfile } = require('../services/facebook');
-const { sendWhatsAppMessage } = require('../services/whatsapp');
+const { sendFacebookMessage, sendFacebookImage, getFacebookProfile } = require('../services/facebook');
+const { sendWhatsAppMessage, sendWhatsAppImage } = require('../services/whatsapp');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
@@ -104,7 +104,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
   const fullHistory = await store.getConversation(customer.id);
   const history = fullHistory.slice(0, -1);
 
-  const { reply, order } = await withRetry(() => getAIReply({
+  const { reply, imageUrl, order } = await withRetry(() => getAIReply({
     apiKey: settings.aiKey,
     provider: settings.aiProvider,
     customerMessage: text,
@@ -117,8 +117,22 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
 
   if (platform === 'facebook' && settings.fbToken) {
     await withRetry(() => sendFacebookMessage(platformId, reply, settings.fbToken));
+    if (imageUrl) {
+      try {
+        await withRetry(() => sendFacebookImage(platformId, imageUrl, settings.fbToken));
+      } catch (err) {
+        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (Facebook):', err.message);
+      }
+    }
   } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
     await withRetry(() => sendWhatsAppMessage(platformId, reply, settings.waPhoneNumberId, settings.waToken));
+    if (imageUrl) {
+      try {
+        await withRetry(() => sendWhatsAppImage(platformId, imageUrl, settings.waPhoneNumberId, settings.waToken));
+      } catch (err) {
+        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (WhatsApp):', err.message);
+      }
+    }
   }
 
   if (order && order.product) {
