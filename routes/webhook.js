@@ -121,7 +121,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
       try {
         await withRetry(() => sendFacebookImage(platformId, imageUrl, settings.fbToken));
       } catch (err) {
-        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (Facebook):', err.message);
+       console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (Facebook):', err.response ? JSON.stringify(err.response.data) : err.message);
       }
     }
   } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
@@ -130,7 +130,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
       try {
         await withRetry(() => sendWhatsAppImage(platformId, imageUrl, settings.waPhoneNumberId, settings.waToken));
       } catch (err) {
-        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (WhatsApp):', err.message);
+        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (WhatsApp):', err.response ? JSON.stringify(err.response.data) : err.message);
       }
     }
   }
