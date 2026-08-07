@@ -8,6 +8,20 @@ async function sendFacebookMessage(recipientId, text, pageAccessToken) {
   }, { timeout: 10000 });
 }
 
+// প্রোডাক্টের ছবি পাঠানোর জন্য (নতুন ফিচার)
+async function sendFacebookImage(recipientId, imageUrl, pageAccessToken) {
+  const url = `https://graph.facebook.com/v19.0/me/messages?access_token=${pageAccessToken}`;
+  await axios.post(url, {
+    recipient: { id: recipientId },
+    message: {
+      attachment: {
+        type: 'image',
+        payload: { url: imageUrl, is_reusable: true }
+      }
+    }
+  }, { timeout: 15000 });
+}
+
 // কাস্টমারের PSID দিয়ে তার নাম আনে (Messenger প্রোফাইল লিংক দেয় না, শুধু নাম/ছবি দেয়)
 async function getFacebookProfile(psid, pageAccessToken) {
   try {
@@ -21,4 +35,4 @@ async function getFacebookProfile(psid, pageAccessToken) {
   }
 }
 
-module.exports = { sendFacebookMessage, getFacebookProfile };
+module.exports = { sendFacebookMessage, sendFacebookImage, getFacebookProfile };
