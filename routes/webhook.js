@@ -10,7 +10,6 @@ const { sendWhatsAppMessage, sendWhatsAppImage } = require('../services/whatsapp
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
-// সাময়িক এরর/রেট-লিমিট হলে সাথে সাথে হাল ছেড়ে না দিয়ে একবার আবার চেষ্টা করে
 async function withRetry(fn, retries = 1, delayMs = 1500) {
   try {
     return await fn();
@@ -121,7 +120,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
       try {
         await withRetry(() => sendFacebookImage(platformId, imageUrl, settings.fbToken));
       } catch (err) {
-       console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (Facebook):', err.response ? JSON.stringify(err.response.data) : err.message);
+        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (Facebook):', err.response ? JSON.stringify(err.response.data) : err.message);
       }
     }
   } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
