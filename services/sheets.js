@@ -16,12 +16,15 @@ function toCsvExportUrl(sheetLink) {
 function parseCsv(csvText) {
   const lines = csvText.trim().split('\n').filter(Boolean);
   return lines.map(line =>
+    // সাধারণ CSV split (কমার ভেতরে quoted কমা থাকলে আরও ভালো parser লাগবে,
+    // কিন্তু প্রোডাক্ট শিটের জন্য এটা যথেষ্ট)
     line.split(',').map(cell => cell.trim().replace(/^"|"$/g, ''))
   );
 }
 
 // শিটের ডেটা টেক্সট আকারে ফেরত দেয়, যেটা AI কে prompt এর ভেতর context হিসেবে দেওয়া হবে
-async function getSheetContext(sheetLink) {
+// label দিয়ে বোঝানো হয় এটা কোন ধরনের শিট (প্রোডাক্ট নাকি সাধারণ প্রশ্ন-উত্তর)
+async function getSheetContext(sheetLink, label = 'দোকানের প্রোডাক্ট/অফার শিট') {
   if (!sheetLink) return '';
   const csvUrl = toCsvExportUrl(sheetLink);
   if (!csvUrl) return '';
@@ -34,12 +37,23 @@ async function getSheetContext(sheetLink) {
     const lines = dataRows.map(r =>
       header.map((h, i) => `${h}: ${r[i] || ''}`).join(', ')
     );
-    return 'নিচে দোকানের প্রোডাক্ট/অফার শিট থেকে নেওয়া তথ্য:\n' + lines.join('\n');
+    return `নিচে ${label} থেকে নেওয়া তথ্য:\n` + lines.join('\n');
   } catch (err) {
-    console.error('Google Sheet fetch failed:', err.message);
+    console.error(`Google Sheet fetch failed (${label}):`, err.message);
     return '';
   }
 }
+
+// দুটো শিট (প্রোডাক্ট + FAQ) একসাথে পড়ে একটাই কম্বাইন্ড context বানায়
+async function getCombinedSheetContext(inventoryLink, faqLink) {
+  const [inventoryText, faqText] = await Promise.all([
+    getSheetContext(inventoryLink, 'দোকানের প্রোডাক্ট/অফার শিট'),
+    getSheetContext(faqLink, 'দোকানের সাধারণ প্রশ্ন-উত্তর (FAQ) শিট')
+  ]);
+  return [inventoryText, faqText].filter(Boolean).join('\n\n');
+}
+
+module.exports = { getSheetContext, getCombinedSheetContext, writeOrderToSheet, writeCustomerToSheet };
 
 /* ---------- Apps Script দিয়ে শিটে লেখা (order/customer) ---------- */
 async function writeOrderToSheet({ scriptUrl, scriptToken, order }) {
@@ -83,5 +97,3 @@ async function writeCustomerToSheet({ scriptUrl, scriptToken, customer }) {
     console.error('Sheet-এ কাস্টমার লিখতে ব্যর্থ:', err.message);
   }
 }
-
-module.exports = { getSheetContext, writeOrderToSheet, writeCustomerToSheet };
