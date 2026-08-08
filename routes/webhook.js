@@ -54,12 +54,13 @@ router.post('/facebook', async (req, res) => {
 });
 
 /* =============== WHATSAPP CLOUD API =============== */
-
 router.get('/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+  console.log('WhatsApp verify রিকোয়েস্ট এসেছে:', JSON.stringify({ mode, token, expectedToken: config.webhookVerifyToken }));
   if (mode === 'subscribe' && token === config.webhookVerifyToken) {
+
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
