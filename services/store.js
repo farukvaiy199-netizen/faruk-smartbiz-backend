@@ -14,7 +14,7 @@ function defaultDb() {
     orders: [],
     customers: [],
     broadcasts: [],
-    conversations: {},
+    conversations: {}, // { customerId: [{role:'user'|'assistant', text, ts}] }
     nextOrderSeq: 232
   };
 }
@@ -34,14 +34,14 @@ function writeDb(db) {
 function defaultSettings() {
   return {
     fbToken: '', fbPageId: '', fbAppId: '',
-    waToken: '', waPhoneNumberId: '',
-    sheetLink: '',
+    waToken: '', waPhoneNumberId: '', waBusinessId: '', waConfigId: '',
+    sheetLink: '', faqSheetLink: '',
     aiKey: '', aiProvider: 'groq', aiAutoReply: true
   };
 }
 
-/* ---------- Settings — Google Sheet-এ স্থায়ীভাবে সেভ হয় ---------- */
-let cachedSettings = null;
+/* ---------- Settings — Google Sheet-এ স্থায়ীভাবে সেভ হয় (server redeploy হলেও হারায় না) ---------- */
+let cachedSettings = null; // এই সার্ভার ইনস্ট্যান্স চালু থাকা অবস্থায় বারবার শিটে না গিয়ে দ্রুত সাড়া দিতে
 
 function computeConnected(s) {
   return {
@@ -73,9 +73,11 @@ async function getSettings() {
       return { ...cachedSettings, connected: computeConnected(cachedSettings) };
     } catch (err) {
       console.error('Google Sheet থেকে সেটিংস আনতে ব্যর্থ:', err.message);
+      // শিট থেকে আনতে না পারলে স্থানীয় ফাইলে যা আছে (যদি থাকে) তাই ফেরত দিই
     }
   }
 
+  // fallback: Sheet Script এখনো কনফিগার না থাকলে বা এরর হলে লোকাল ফাইল ব্যবহার করি
   const db = readDb();
   cachedSettings = { ...defaultSettings(), ...(db.settings || {}) };
   return { ...cachedSettings, connected: computeConnected(cachedSettings) };
@@ -84,7 +86,7 @@ async function getSettings() {
 async function saveSettings(partial) {
   const current = cachedSettings || (await getSettings());
   const merged = { ...current, ...partial };
-  delete merged.connected;
+  delete merged.connected; // এটা সবসময় হিসেব করে বের করা হয়, সেভ করার দরকার নেই
   cachedSettings = merged;
 
   if (config.sheetScriptUrl) {
@@ -95,6 +97,7 @@ async function saveSettings(partial) {
     }
   }
 
+  // লোকাল ফাইলেও একটা কপি রাখি (Sheet Script কনফিগার করার আগে fallback হিসেবে)
   const db = readDb();
   db.settings = merged;
   writeDb(db);
@@ -136,6 +139,7 @@ function setCustomerAI(id, aiOn) {
   return c;
 }
 
+// AI-এর সাথে কথা বলার সময় কাস্টমার নাম/ফোন জানালে প্রোফাইল আপডেট করি
 function updateCustomerContact(id, { name, phone }) {
   const db = readDb();
   const c = db.customers.find(x => x.id === id);
@@ -147,7 +151,7 @@ function updateCustomerContact(id, { name, phone }) {
 }
 
 /* ---------- Conversations — Google Sheet-এ স্থায়ীভাবে সেভ হয় (স্মৃতি হারায় না) ---------- */
-let convCache = {};
+let convCache = {}; // { customerId: [{role, text, ts}] } — চলতি সার্ভার সেশনে দ্রুত অ্যাক্সেসের জন্য
 
 async function getConversation(customerId) {
   if (convCache[customerId]) return convCache[customerId];
@@ -169,7 +173,7 @@ async function getConversation(customerId) {
 
 async function appendMessage(customerId, role, text) {
   const current = await getConversation(customerId);
-  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-20);
+  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-20); // শেষ ২০টা যথেষ্ট
   convCache[customerId] = updated;
 
   // শিটে সেভ করাটা ব্যাকগ্রাউন্ডে হবে (await করা হচ্ছে না) — এতে কাস্টমারের রিপ্লাই
@@ -179,6 +183,7 @@ async function appendMessage(customerId, role, text) {
       .catch(err => console.error('Google Sheet-এ কথোপকথন সেভ করতে ব্যর্থ:', err.message));
   }
 
+  // লোকাল ফাইলেও ব্যাকআপ রাখি (Sheet কনফিগার করার আগে fallback)
   const db = readDb();
   if (!db.conversations) db.conversations = {};
   db.conversations[customerId] = updated;
@@ -223,6 +228,7 @@ function createWebsiteOrder(payload = {}) {
   const qty = items.length ? items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : (Number(payload.qty) || 1);
   const price = Number(payload.total) || Number(payload.subtotal) || 0;
 
+  // ফোন নাম্বার দিয়ে আগের কাস্টমার খুঁজি, না পেলে নতুন বানাই — যাতে Customers ট্যাবেও দেখা যায়
   let customer = null;
   if (payload.phone) {
     customer = db.customers.find(c => c.phone === payload.phone && c.platform === 'website');
