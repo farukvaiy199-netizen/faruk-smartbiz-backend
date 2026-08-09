@@ -1,5 +1,5 @@
 const express = require('express');
- router = express.Router();
+const router = express.Router();
 const axios = require('axios');
 
 const config = require('../config');
@@ -93,6 +93,7 @@ router.get('/settings', async (req, res) => {
     waPhoneNumberId: s.waPhoneNumberId,
     waBusinessId: s.waBusinessId,
     waConfigId: s.waConfigId,
+    waAppId: s.waAppId,
     sheetLink: s.sheetLink,
     faqSheetLink: s.faqSheetLink,
     aiProvider: s.aiProvider,
@@ -148,14 +149,14 @@ router.post('/settings/wa-auto', async (req, res) => {
   if (!code || !fbAppId) {
     return res.status(400).json({ error: 'code ও fbAppId দুটোই দরকার' });
   }
-  if (!config.fbAppSecret) {
-    return res.status(500).json({ error: 'সার্ভারে FB_APP_SECRET সেট করা নেই — Render Environment-এ যোগ করুন' });
+  if (!config.waAppSecret) {
+    return res.status(500).json({ error: 'সার্ভারে WA_APP_SECRET (বা FB_APP_SECRET) সেট করা নেই — Render Environment-এ যোগ করুন' });
   }
 
   try {
     const params = new URLSearchParams({
       client_id: fbAppId,
-      client_secret: config.fbAppSecret,
+      client_secret: config.waAppSecret,
       code
     });
     const r = await axios.get(`https://graph.facebook.com/v19.0/oauth/access_token?${params}`);
