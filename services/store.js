@@ -34,7 +34,7 @@ function writeDb(db) {
 function defaultSettings() {
   return {
     fbToken: '', fbPageId: '', fbAppId: '',
-    waToken: '', waPhoneNumberId: '', waBusinessId: '', waConfigId: '',
+    waToken: '', waPhoneNumberId: '', waBusinessId: '', waConfigId: '', waAppId: '',
     sheetLink: '', faqSheetLink: '',
     aiKey: '', aiProvider: 'groq', aiAutoReply: true
   };
