@@ -78,7 +78,7 @@ router.post('/whatsapp', async (req, res) => {
     try {
       await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from });
     } catch (err) {
-      console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.message);
+     console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response ? JSON.stringify(err.response.data) : err.message);
     }
   }
 });
