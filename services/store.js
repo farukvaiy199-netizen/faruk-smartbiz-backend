@@ -89,10 +89,15 @@ async function saveSettings(partial) {
   delete merged.connected; // এটা সবসময় হিসেব করে বের করা হয়, সেভ করার দরকার নেই
   cachedSettings = merged;
 
+  let sheetSaved = true;
+  let sheetError = null;
+
   if (config.sheetScriptUrl) {
     try {
       await postToScript({ token: config.sheetScriptToken, type: 'settings_save', settings: merged });
     } catch (err) {
+      sheetSaved = false;
+      sheetError = err.message;
       console.error('Google Sheet-এ সেটিংস সেভ করতে ব্যর্থ:', err.message);
     }
   }
@@ -102,7 +107,7 @@ async function saveSettings(partial) {
   db.settings = merged;
   writeDb(db);
 
-  return { ...merged, connected: computeConnected(merged) };
+  return { ...merged, connected: computeConnected(merged), sheetSaved, sheetError };
 }
 
 /* ---------- Customers ---------- */
