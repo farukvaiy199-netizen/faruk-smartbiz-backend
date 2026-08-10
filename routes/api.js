@@ -102,11 +102,13 @@ router.get('/settings', async (req, res) => {
     sheetStorageConfigured: !!config.sheetScriptUrl
   });
 });
-
 router.post('/settings', async (req, res) => {
   const updated = await store.saveSettings(req.body);
   res.json({
-    connected: updated.connected
+    connected: updated.connected,
+    sheetSaved: updated.sheetSaved,
+    sheetError: updated.sheetError || null
+  });
   });
 });
 
