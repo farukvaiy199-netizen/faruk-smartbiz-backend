@@ -12,5 +12,14 @@ module.exports = {
   // তাই সব সেটিংস (AI Key, Facebook Token ইত্যাদি) স্থায়ীভাবে Google Sheet-এ সেভ হয়।
   // এই দুটো Render Environment ভ্যারিয়েবলে বসাতে হবে (একবারই, আর কখনো মুছবে না)।
   sheetScriptUrl: process.env.SHEET_SCRIPT_URL || '',
-  sheetScriptToken: process.env.SHEET_SCRIPT_TOKEN || ''
+  sheetScriptToken: process.env.SHEET_SCRIPT_TOKEN || '',
+
+  // ============ অ্যাডমিন লগইন (নতুন) ============
+  // এই তিনটা অবশ্যই Render Dashboard → Environment-এ বসাতে হবে।
+  // ADMIN_EMAIL / ADMIN_PASSWORD আপনি নিজে যা খুশি বসাতে পারেন (Gmail হতে হবে এমন কোনো নিয়ম নেই,
+  // শুধু মনে রাখার মতো একটা ইমেইল-স্টাইল আইডি ও একটা শক্তিশালী পাসওয়ার্ড দিন)।
+  // JWT_SECRET একটা লম্বা এলোমেলো স্ট্রিং হওয়া উচিত — এটা দিয়েই লগইন টোকেন সই (sign) করা হয়।
+  adminEmail: process.env.ADMIN_EMAIL || '',
+  adminPassword: process.env.ADMIN_PASSWORD || '',
+  jwtSecret: process.env.JWT_SECRET || 'change_this_to_a_long_random_string_too'
 };
