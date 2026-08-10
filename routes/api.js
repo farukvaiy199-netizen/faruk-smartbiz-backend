@@ -110,8 +110,6 @@ router.post('/settings', async (req, res) => {
     sheetError: updated.sheetError || null
   });
   });
-});
-
 /* ---------- Facebook অটো-কানেক্ট (নতুন ফিচার) ---------- */
 // ড্যাশবোর্ডের "Facebook দিয়ে অটো-কানেক্ট করুন" বাটন এখানে শর্ট-লিভড পেজ টোকেন পাঠায়,
 // এখানে সেটাকে long-lived (~৬০ দিন) এ এক্সচেঞ্জ করে Google Sheet-এ সেভ করা হয়।
