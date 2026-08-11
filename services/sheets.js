@@ -22,22 +22,71 @@ function parseCsv(csvText) {
   );
 }
 
-// শিটের ডেটা টেক্সট আকারে ফেরত দেয়, যেটা AI কে prompt এর ভেতর context হিসেবে দেওয়া হবে
-// label দিয়ে বোঝানো হয় এটা কোন ধরনের শিট (প্রোডাক্ট নাকি সাধারণ প্রশ্ন-উত্তর)
-async function getSheetContext(sheetLink, label = 'দোকানের প্রোডাক্ট/অফার শিট') {
-  if (!sheetLink) return '';
+// শিট বারবার (প্রতিটা কাস্টমার মেসেজে) ফেচ না করে অল্প সময়ের জন্য ক্যাশে রাখি —
+// এতে টোকেন খরচ কমে না, কিন্তু রেসপন্স দ্রুত হয় আর শিটে বেশি রিকোয়েস্ট যায় না
+const sheetCache = {}; // { csvUrl: { rows, fetchedAt } }
+const CACHE_TTL_MS = 3 * 60 * 1000; // ৩ মিনিট
+
+async function fetchSheetRows(sheetLink) {
   const csvUrl = toCsvExportUrl(sheetLink);
-  if (!csvUrl) return '';
+  if (!csvUrl) return null;
+
+  const cached = sheetCache[csvUrl];
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
+    return cached.rows;
+  }
+
+  const res = await axios.get(csvUrl, { timeout: 8000 });
+  const rows = parseCsv(res.data);
+  sheetCache[csvUrl] = { rows, fetchedAt: Date.now() };
+  return rows;
+}
+
+// কাস্টমারের মেসেজের সাথে সবচেয়ে প্রাসঙ্গিক সারিগুলো বেছে নেয় —
+// পুরো শিট (হয়তো শত শত প্রোডাক্ট/লাইন) প্রতিটা মেসেজে AI-কে পাঠানোর বদলে
+// শুধু প্রাসঙ্গিক অংশ পাঠালে টোকেন খরচ অনেক কমে যায়, তাই রেট-লিমিটেও কম ধাক্কা লাগে।
+function pickRelevantRows(dataRows, query, maxRows) {
+  const words = (query || '')
+    .toLowerCase()
+    .split(/[\s,।.!?]+/)
+    .filter(w => w.length >= 2);
+
+  // মেসেজে বোঝার মতো শব্দ না থাকলে (যেমন শুধু ইমোজি) শুরুর কয়েকটা সারি দিয়ে দিই
+  if (!words.length) return dataRows.slice(0, Math.min(maxRows, 10));
+
+  const scored = dataRows.map(row => {
+    const rowText = row.join(' ').toLowerCase();
+    let score = 0;
+    words.forEach(w => { if (rowText.includes(w)) score++; });
+    return { row, score };
+  });
+
+  const matched = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+
+  if (matched.length) return matched.slice(0, maxRows).map(s => s.row);
+
+  // কাস্টমারের মেসেজে কোনো প্রোডাক্ট/কীওয়ার্ড না মিললে (যেমন শুধু "সালাম", "ধন্যবাদ")
+  // পুরো শিট না পাঠিয়ে শুরুর কয়েকটা সারি নমুনা হিসেবে পাঠাই, যাতে AI চাইলে
+  // "আমাদের কাছে এই ধরনের প্রোডাক্ট আছে" বলে কথোপকথন শুরু করতে পারে
+  return dataRows.slice(0, Math.min(maxRows, 10));
+}
+
+// শিটের ডেটা টেক্সট আকারে ফেরত দেয়, যেটা AI কে prompt এর ভেতর context হিসেবে দেওয়া হবে।
+// query দিলে (কাস্টমারের বর্তমান মেসেজ) শুধু প্রাসঙ্গিক সারিগুলোই পাঠানো হয়, পুরো শিট না।
+async function getSheetContext(sheetLink, label = 'দোকানের প্রোডাক্ট/অফার শিট', query = '', maxRows = 15) {
+  if (!sheetLink) return '';
   try {
-    const res = await axios.get(csvUrl, { timeout: 8000 });
-    const rows = parseCsv(res.data);
-    if (!rows.length) return '';
+    const rows = await fetchSheetRows(sheetLink);
+    if (!rows || !rows.length) return '';
+
     const header = rows[0];
-    const dataRows = rows.slice(1, 60); // বেশি বড় শিট হলে টোকেন বাঁচাতে প্রথম ৬০ সারি
-    const lines = dataRows.map(r =>
+    const dataRows = rows.slice(1, 300); // শিট থেকে সর্বোচ্চ ৩০০ সারি পর্যন্ত বিবেচনা করি
+    const relevant = pickRelevantRows(dataRows, query, maxRows);
+
+    const lines = relevant.map(r =>
       header.map((h, i) => `${h}: ${r[i] || ''}`).join(', ')
     );
-    return `নিচে ${label} থেকে নেওয়া তথ্য:\n` + lines.join('\n');
+    return `নিচে ${label} থেকে প্রাসঙ্গিক তথ্য (মোট ${dataRows.length}টার মধ্যে ${relevant.length}টা দেখানো হচ্ছে):\n` + lines.join('\n');
   } catch (err) {
     console.error(`Google Sheet fetch failed (${label}):`, err.message);
     return '';
@@ -45,10 +94,10 @@ async function getSheetContext(sheetLink, label = 'দোকানের প্�
 }
 
 // দুটো শিট (প্রোডাক্ট + FAQ) একসাথে পড়ে একটাই কম্বাইন্ড context বানায়
-async function getCombinedSheetContext(inventoryLink, faqLink) {
+async function getCombinedSheetContext(inventoryLink, faqLink, query = '') {
   const [inventoryText, faqText] = await Promise.all([
-    getSheetContext(inventoryLink, 'দোকানের প্রোডাক্ট/অফার শিট'),
-    getSheetContext(faqLink, 'দোকানের সাধারণ প্রশ্ন-উত্তর (FAQ) শিট')
+    getSheetContext(inventoryLink, 'দোকানের প্রোডাক্ট/অফার শিট', query, 15),
+    getSheetContext(faqLink, 'দোকানের সাধারণ প্রশ্ন-উত্তর (FAQ) শিট', query, 10)
   ]);
   return [inventoryText, faqText].filter(Boolean).join('\n\n');
 }
