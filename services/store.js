@@ -224,6 +224,10 @@ function getOrders() {
   return readDb().orders;
 }
 
+function getOrdersByCustomer(customerId) {
+  return readDb().orders.filter(o => o.customerId === customerId);
+}
+
 // অর্ডার কনফার্ম হয়ে যাওয়ার পরে কাস্টমার আলাদাভাবে ইমেইল পাঠালে, তার সবচেয়ে সাম্প্রতিক
 // (এখনো ইমেইল যোগ হয়নি এমন) অর্ডারে সেটা জুড়ে দেয়
 function attachEmailToLatestOrder(customerId, email) {
@@ -326,7 +330,7 @@ module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
-  createOrder, createWebsiteOrder, getOrders, updateOrderStatus, attachEmailToLatestOrder,
+  createOrder, createWebsiteOrder, getOrders, getOrdersByCustomer, updateOrderStatus, attachEmailToLatestOrder,
   addBroadcast, getBroadcasts,
   addEmailLog, getEmailLogs
 };
