@@ -74,7 +74,7 @@ router.post('/facebook', async (req, res) => {
 
         await handleIncomingMessage({ platform: 'facebook', platformId: senderId, text, imageBuffer, imageMime, audioBuffer });
       } catch (err) {
-        console.error('Facebook webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.message);
+        console.error('Facebook webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response?.data ? JSON.stringify(err.response.data) : err.message);
       }
     }
   }
@@ -119,7 +119,7 @@ router.post('/whatsapp', async (req, res) => {
 
       await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from, imageBuffer, imageMime, audioBuffer });
     } catch (err) {
-      console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.message);
+      console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response?.data ? JSON.stringify(err.response.data) : err.message);
     }
   }
 });
