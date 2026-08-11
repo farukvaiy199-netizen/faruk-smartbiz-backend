@@ -3,14 +3,15 @@ const router = express.Router();
 
 const config = require('../config');
 const store = require('../services/store');
-const { getAIReply } = require('../services/ai');
-const { getSheetContext, getCombinedSheetContext, writeOrderToSheet, writeCustomerToSheet } = require('../services/sheets');
-const { sendFacebookMessage, sendFacebookImage, getFacebookProfile } = require('../services/facebook');
-const { sendWhatsAppMessage, sendWhatsAppImage } = require('../services/whatsapp');
+const { getAIReplyWithFallback, getVisionReply, isVisionCapable } = require('../services/ai');
+const { transcribeAudio, isWhisperCapable } = require('../services/speech');
+const { getCombinedSheetContext, writeOrderToSheet, writeCustomerToSheet } = require('../services/sheets');
+const { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedia } = require('../services/facebook');
+const { sendWhatsAppMessage, sendWhatsAppImage, getWhatsAppMediaBuffer } = require('../services/whatsapp');
+const { sendOrderConfirmationEmail } = require('../services/email');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
-// সাময়িক এরর/রেট-লিমিট হলে সাথে সাথে হাল ছেড়ে না দিয়ে একবার আবার চেষ্টা করে
 async function withRetry(fn, retries = 1, delayMs = 1500) {
   try {
     return await fn();
@@ -21,9 +22,20 @@ async function withRetry(fn, retries = 1, delayMs = 1500) {
   }
 }
 
+// settings-এ প্রধান/ব্যাকআপ দুটো Key-এর মধ্যে যেটা নির্দিষ্ট কাজের (vision/voice) উপযোগী সেটা বেছে দেয়
+function pickCapableKey(settings, capableCheck) {
+  if (settings.aiKey && capableCheck(settings.aiProvider)) return { apiKey: settings.aiKey, provider: settings.aiProvider };
+  if (settings.aiKey2 && capableCheck(settings.aiProvider2)) return { apiKey: settings.aiKey2, provider: settings.aiProvider2 };
+  return null;
+}
+
+function buildConfirmationText(order) {
+  const total = (order.price || 0) * (order.qty || 1);
+  return `✅ আপনার অর্ডারটি কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: ${order.id}\nপ্রোডাক্ট: ${order.product} x${order.qty}\nমোট মূল্য: ৳${total}\nঠিকানা: ${order.address || ''}\n\nধন্যবাদ আমাদের সাথে থাকার জন্য! 🙏`;
+}
+
 /* =============== FACEBOOK MESSENGER =============== */
 
-// Meta webhook verification (Meta App Dashboard এ setup করার সময় একবার কল হয়)
 router.get('/facebook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -35,18 +47,33 @@ router.get('/facebook', (req, res) => {
 });
 
 router.post('/facebook', async (req, res) => {
-  res.sendStatus(200); // Meta কে সাথে সাথে 200 ফেরত দিতে হয়, তারপর প্রসেস করি
+  res.sendStatus(200);
   const entries = req.body.entry || [];
   for (const entry of entries) {
     const events = entry.messaging || [];
     for (const event of events) {
       const senderId = event.sender?.id;
-      const text = event.message?.text;
-      if (!senderId || !text) continue;
+      const msg = event.message;
+      if (!senderId || !msg) continue;
       try {
-        await handleIncomingMessage({ platform: 'facebook', platformId: senderId, text });
+        const text = msg.text;
+        const attachments = msg.attachments || [];
+        const imageAttachment = attachments.find(a => a.type === 'image');
+        const audioAttachment = attachments.find(a => a.type === 'audio');
+
+        let imageBuffer = null, imageMime = null, audioBuffer = null;
+        if (imageAttachment?.payload?.url) {
+          imageBuffer = await downloadMedia(imageAttachment.payload.url);
+          imageMime = 'image/jpeg';
+        }
+        if (audioAttachment?.payload?.url) {
+          audioBuffer = await downloadMedia(audioAttachment.payload.url);
+        }
+
+        if (!text && !imageBuffer && !audioBuffer) continue;
+
+        await handleIncomingMessage({ platform: 'facebook', platformId: senderId, text, imageBuffer, imageMime, audioBuffer });
       } catch (err) {
-        // একটা মেসেজে সমস্যা হলেও বাকি মেসেজগুলো যেন থেমে না যায়, তাই এখানেই ধরে ফেলি
         console.error('Facebook webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.message);
       }
     }
@@ -54,13 +81,12 @@ router.post('/facebook', async (req, res) => {
 });
 
 /* =============== WHATSAPP CLOUD API =============== */
+
 router.get('/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  console.log('WhatsApp verify রিকোয়েস্ট এসেছে:', JSON.stringify({ mode, token, expectedToken: config.webhookVerifyToken }));
   if (mode === 'subscribe' && token === config.webhookVerifyToken) {
-
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
@@ -70,79 +96,136 @@ router.post('/whatsapp', async (req, res) => {
   res.sendStatus(200);
   const value = req.body.entry?.[0]?.changes?.[0]?.value;
   const messages = value?.messages || [];
+  if (!messages.length) return;
+
+  const settings = await store.getSettings(); // মিডিয়া ডাউনলোডে token লাগবে
+
   for (const msg of messages) {
-    const from = msg.from; // ফোন নাম্বার
-    const text = msg.text?.body;
+    const from = msg.from;
     const name = value?.contacts?.[0]?.profile?.name;
-    if (!from || !text) continue;
+    let text = msg.text?.body;
+    let imageBuffer = null, imageMime = null, audioBuffer = null;
+
     try {
-      await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from });
+      if (msg.type === 'image' && msg.image?.id && settings.waToken) {
+        const media = await getWhatsAppMediaBuffer(msg.image.id, settings.waToken);
+        imageBuffer = media.buffer; imageMime = media.mimeType;
+      } else if (msg.type === 'audio' && msg.audio?.id && settings.waToken) {
+        const media = await getWhatsAppMediaBuffer(msg.audio.id, settings.waToken);
+        audioBuffer = media.buffer;
+      }
+
+      if (!from || (!text && !imageBuffer && !audioBuffer)) continue;
+
+      await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from, imageBuffer, imageMime, audioBuffer });
     } catch (err) {
-     console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response ? JSON.stringify(err.response.data) : err.message);
+      console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.message);
     }
   }
 });
 
 /* =============== SHARED HANDLER =============== */
 
-async function handleIncomingMessage({ platform, platformId, text, name, phone }) {
+async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer }) {
   const settings = await store.getSettings();
   const customer = store.findOrCreateCustomer({ platform, platformId, name, phone });
 
-  // Facebook Messenger নিজে থেকে নাম দেয় না, তাই প্রথমবার মেসেজ এলে Graph API দিয়ে নাম টেনে আনি
-  if (platform === 'facebook' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার')) {
-    const fbName = await getFacebookProfile(platformId, settings.fbToken);
-    if (fbName) store.updateCustomerContact(customer.id, { name: fbName });
+  // Facebook থেকে নাম ও প্রোফাইল ছবি টেনে আনি (WhatsApp-এ Meta প্রোফাইল ছবি দেয় না, এটা তাদের সীমাবদ্ধতা)
+  if (platform === 'facebook' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
+    const profile = await getFacebookProfile(platformId, settings.fbToken);
+    if (profile.name || profile.photoUrl) {
+      store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
+    }
   }
 
-  await store.appendMessage(customer.id, 'user', text);
-
-  // কাস্টমারের জন্য AI বন্ধ করা থাকলে (Customers ট্যাব থেকে) — মানুষ নিজে হাতে চ্যাট করছেন, AI চুপ থাকবে
-  if (!customer.ai) return;
-
+  if (!customer.ai) return; // মানুষ নিজে হাতে চ্যাট করছেন (Customers ট্যাব থেকে AI বন্ধ করা)
   if (!settings.aiKey) {
     console.warn('AI API key সেট করা নেই — Settings থেকে বসান।');
     return;
   }
 
-  const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink);
-  const fullHistory = await store.getConversation(customer.id);
-  const history = fullHistory.slice(0, -1); // শেষেরটা বাদ, ওইটাই এখনকার মেসেজ
-
-  const { reply, imageUrl, order } = await withRetry(() => getAIReply({
-    apiKey: settings.aiKey,
-    provider: settings.aiProvider,
-    customerMessage: text,
-    history,
-    sheetContext,
-    businessInfo
-  }));
-
-  await store.appendMessage(customer.id, 'assistant', reply);
-
-  if (platform === 'facebook' && settings.fbToken) {
-    await withRetry(() => sendFacebookMessage(platformId, reply, settings.fbToken));
-    if (imageUrl) {
-      try {
-        await withRetry(() => sendFacebookImage(platformId, imageUrl, settings.fbToken));
-      } catch (err) {
-        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (Facebook):', err.response ? JSON.stringify(err.response.data) : err.message);
+  const send = async (replyText, imgUrl) => {
+    if (platform === 'facebook' && settings.fbToken) {
+      await withRetry(() => sendFacebookMessage(platformId, replyText, settings.fbToken));
+      if (imgUrl) {
+        try { await withRetry(() => sendFacebookImage(platformId, imgUrl, settings.fbToken)); }
+        catch (err) { console.error('ছবি পাঠাতে ব্যর্থ (Facebook):', err.message); }
+      }
+    } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
+      await withRetry(() => sendWhatsAppMessage(platformId, replyText, settings.waPhoneNumberId, settings.waToken));
+      if (imgUrl) {
+        try { await withRetry(() => sendWhatsAppImage(platformId, imgUrl, settings.waPhoneNumberId, settings.waToken)); }
+        catch (err) { console.error('ছবি পাঠাতে ব্যর্থ (WhatsApp):', err.message); }
       }
     }
-  } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
-    await withRetry(() => sendWhatsAppMessage(platformId, reply, settings.waPhoneNumberId, settings.waToken));
-    if (imageUrl) {
-      try {
-        await withRetry(() => sendWhatsAppImage(platformId, imageUrl, settings.waPhoneNumberId, settings.waToken));
-      } catch (err) {
-        console.error('প্রোডাক্টের ছবি পাঠাতে ব্যর্থ (WhatsApp):', err.response ? JSON.stringify(err.response.data) : err.message);
-      }
+  };
+
+  /* ---- ভয়েস মেসেজ হলে আগে টেক্সটে রূপান্তর করি ---- */
+  if (!text && audioBuffer) {
+    const whisperKey = pickCapableKey(settings, isWhisperCapable);
+    if (!whisperKey) {
+      await send('দুঃখিত, এই মুহূর্তে ভয়েস মেসেজ শোনা সম্ভব হচ্ছে না। একটু কষ্ট করে লিখে জানাবেন 🙏');
+      return;
+    }
+    try {
+      text = await transcribeAudio({ apiKey: whisperKey.apiKey, provider: whisperKey.provider, audioBuffer });
+    } catch (err) {
+      console.error('ভয়েস মেসেজ শোনা যায়নি:', err.message);
+      await send('দুঃখিত, ভয়েস মেসেজটা বুঝতে সমস্যা হচ্ছে। একটু লিখে পাঠাবেন?');
+      return;
+    }
+    if (!text || !text.trim()) {
+      await send('দুঃখিত, ভয়েস মেসেজটা স্পষ্ট শোনা যায়নি। আরেকবার বলবেন বা লিখে পাঠাবেন?');
+      return;
     }
   }
 
+  /* ---- ছবি এলে (আর সাথে কোনো টেক্সট প্রশ্ন না থাকলে) প্রোডাক্ট মেলানোর চেষ্টা করি ---- */
+  if (imageBuffer && !text) {
+    await store.appendMessage(customer.id, 'user', '[ছবি পাঠিয়েছে]');
+
+    const visionKey = pickCapableKey(settings, isVisionCapable);
+    if (!visionKey) {
+      const msgTxt = 'দুঃখিত, এই মুহূর্তে ছবি দেখে বলা সম্ভব হচ্ছে না। প্রোডাক্টের নাম লিখে জানালে সাহায্য করতে পারব 🙏';
+      await store.appendMessage(customer.id, 'assistant', msgTxt);
+      await send(msgTxt);
+      return;
+    }
+
+    const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, '');
+    try {
+      const { reply } = await getVisionReply({
+        apiKey: visionKey.apiKey, provider: visionKey.provider,
+        imageBase64: imageBuffer.toString('base64'), mimeType: imageMime || 'image/jpeg',
+        sheetContext, businessInfo
+      });
+      await store.appendMessage(customer.id, 'assistant', reply);
+      await send(reply);
+    } catch (err) {
+      console.error('ছবি প্রসেস করতে ব্যর্থ:', err.message);
+      const msgTxt = 'দুঃখিত, ছবিটা এই মুহূর্তে দেখা যাচ্ছে না। প্রোডাক্টের নাম লিখে জানাবেন?';
+      await store.appendMessage(customer.id, 'assistant', msgTxt);
+      await send(msgTxt);
+    }
+    return;
+  }
+
+  if (!text) return;
+
+  await store.appendMessage(customer.id, 'user', text);
+
+  const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, text);
+  const fullHistory = await store.getConversation(customer.id);
+  const history = fullHistory.slice(0, -1);
+
+  const { reply, imageUrl, order } = await getAIReplyWithFallback({
+    settings, customerMessage: text, history, sheetContext, businessInfo
+  });
+
+  await store.appendMessage(customer.id, 'assistant', reply);
+  await send(reply, imageUrl);
+
   if (order && order.product) {
-    // AI-এর কাছ থেকে পাওয়া নাম/ফোন থাকলে কাস্টমারের প্রোফাইলও আপডেট করে দিই,
-    // যাতে Customers ট্যাবে আর "অজানা কাস্টমার" না দেখায়
     if (order.name || order.phone) {
       store.updateCustomerContact(customer.id, { name: order.name, phone: order.phone });
     }
@@ -151,13 +234,29 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
       name: order.name || customer.name,
       phone: order.phone || customer.phone || '',
       address: order.address || '',
+      email: order.email || '',
       product: order.product,
       qty: order.qty || 1,
       price: order.price || 0,
       source: platform === 'facebook' ? 'Messenger' : 'WhatsApp'
     });
 
-    // Google Sheet Script (Render Environment Variable থেকে) কনফিগার করা থাকলে অর্ডার ও কাস্টমার শিটে পাঠিয়ে দিই
+    // দেদিকেটেড অর্ডার কনফার্মেশন মেসেজ — AI-এর রিপ্লাই ছাড়াও আলাদাভাবে পাঠানো হয়
+    await send(buildConfirmationText(savedOrder));
+
+    // কাস্টমার ইমেইল দিয়ে থাকলে (এবং Render-এ EMAIL_USER/EMAIL_PASS সেট থাকলে) ইমেইলেও কনফার্মেশন
+    if (savedOrder.email) {
+      const result = await sendOrderConfirmationEmail({ to: savedOrder.email, order: savedOrder });
+      store.addEmailLog({
+        to: savedOrder.email,
+        orderId: savedOrder.id,
+        customerName: savedOrder.name,
+        sent: result.sent,
+        reason: result.reason || '',
+        date: new Date().toLocaleString('bn-BD')
+      });
+    }
+
     if (config.sheetScriptUrl) {
       const updatedCustomer = store.getCustomers().find(c => c.id === customer.id) || customer;
       writeOrderToSheet({ scriptUrl: config.sheetScriptUrl, scriptToken: config.sheetScriptToken, order: savedOrder });
@@ -167,10 +266,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone }
 }
 
 /* =============== BAZAAR ADMIN (ই-কমার্স ওয়েবসাইট) থেকে আসা ওয়েবহুক =============== */
-// এই দুটো লিংক SmartBiz অ্যাপের Settings ট্যাব থেকে কপি করে Bazaar Admin-এর
-// "অর্ডার Webhook URL" ও "AI অটোমেশন Webhook URL" ঘরে বসাতে হবে।
 
-// নতুন অর্ডার — Bazaar Admin প্রতিটা নতুন অর্ডারে এখানে POST করবে
 router.post('/order', async (req, res) => {
   try {
     const order = store.createWebsiteOrder(req.body || {});
@@ -181,20 +277,15 @@ router.post('/order', async (req, res) => {
   }
 });
 
-// AI অটো-রিপ্লাই — কাস্টমার Bazaar Admin-এর চ্যাটে মেসেজ পাঠালে এখানে POST হবে,
-// আমরা সিঙ্ক্রোনাসভাবে { "reply": "..." } ফেরত পাঠাই যাতে Bazaar Admin সাথে সাথে দেখাতে পারে।
 router.post('/ai-reply', async (req, res) => {
   try {
     const settings = await store.getSettings();
     const body = req.body || {};
     const message = (body.message || body.text || '').toString();
 
-    // Bazaar Admin ঠিক কোন নামে নাম/নাম্বার পাঠায় তা নিশ্চিত না জানায়,
-    // সাধারণ কয়েকটা সম্ভাব্য field name একসাথে চেক করছি — যেটা পাওয়া যায় সেটাই নেব
     const visitorName = body.name || body.customerName || body.visitorName || body.userName || '';
     const visitorPhone = body.phone || body.customerPhone || body.visitorPhone || body.mobile || body.number || '';
 
-    // এখনো ডিবাগ করার প্রয়োজন হলে Render Logs-এ পুরো payload দেখা যাবে
     console.log('ai-reply থেকে পাওয়া ডেটা:', JSON.stringify(body));
 
     if (visitorPhone) {
@@ -212,7 +303,7 @@ router.post('/ai-reply', async (req, res) => {
     }
 
     if (!settings.aiAutoReply) {
-      return res.json({ reply: '' }); // ড্যাশবোর্ডে AI টগল বন্ধ থাকলে চুপ থাকি, মানুষ নিজে রিপ্লাই দেবে
+      return res.json({ reply: '' });
     }
     if (!settings.aiKey) {
       return res.status(400).json({ error: 'AI API key সংযুক্ত নেই — SmartBiz Settings-এ বসান' });
@@ -221,14 +312,9 @@ router.post('/ai-reply', async (req, res) => {
       return res.status(400).json({ error: 'message খালি' });
     }
 
-    const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink);
-    const { reply } = await getAIReply({
-      apiKey: settings.aiKey,
-      provider: settings.aiProvider,
-      customerMessage: message,
-      history: [],
-      sheetContext,
-      businessInfo
+    const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, message);
+    const { reply } = await getAIReplyWithFallback({
+      settings, customerMessage: message, history: [], sheetContext, businessInfo
     });
 
     res.json({ reply });
