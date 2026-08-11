@@ -7,12 +7,18 @@ const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
 
+// বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে — Render সার্ভার UTC-তে চলে বলে
+// আগে "আজকের" হিসেব রাতের দিকে ভুল হয়ে রেভিনিউ/অর্ডার সংখ্যা মিলত না, এখন ঠিক থাকবে
+function bdDateString(d) {
+  return new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Dhaka' });
+}
+
 /* ---------- Dashboard summary ---------- */
 router.get('/dashboard/summary', (req, res) => {
   const orders = store.getOrders();
   const customers = store.getCustomers();
-  const today = new Date().toDateString();
-  const todayOrders = orders.filter(o => new Date(o.createdAt).toDateString() === today);
+  const today = bdDateString(new Date());
+  const todayOrders = orders.filter(o => bdDateString(o.createdAt) === today);
   res.json({
     todayRevenue: todayOrders.reduce((sum, o) => sum + (o.price * o.qty), 0),
     todayOrders: todayOrders.length,
@@ -82,9 +88,12 @@ router.get('/broadcast', (req, res) => {
   res.json(store.getBroadcasts());
 });
 
+/* ---------- Email Logs (নতুন) ---------- */
+router.get('/email-logs', (req, res) => {
+  res.json(store.getEmailLogs());
+});
+
 /* ---------- Settings ---------- */
-// টোকেন/কী কখনো ফেরত পাঠানো হয় না (শুধু connected true/false), নিরাপত্তার জন্য
-// সব সেটিংস Google Sheet-এ স্থায়ীভাবে সেভ থাকে (Render redeploy হলেও হারায় না)
 router.get('/settings', async (req, res) => {
   const s = await store.getSettings();
   res.json({
@@ -97,11 +106,14 @@ router.get('/settings', async (req, res) => {
     sheetLink: s.sheetLink,
     faqSheetLink: s.faqSheetLink,
     aiProvider: s.aiProvider,
+    aiProvider2: s.aiProvider2,
     aiAutoReply: s.aiAutoReply,
-    connected: s.connected,
-    sheetStorageConfigured: !!config.sheetScriptUrl
+    connected: s.connected, // { fb, wa, sheet, ai, ai2 }
+    sheetStorageConfigured: !!config.sheetScriptUrl,
+    emailConfigured: !!(config.emailUser && config.emailPass)
   });
 });
+
 router.post('/settings', async (req, res) => {
   const updated = await store.saveSettings(req.body);
   res.json({
@@ -109,10 +121,9 @@ router.post('/settings', async (req, res) => {
     sheetSaved: updated.sheetSaved,
     sheetError: updated.sheetError || null
   });
-  });
-/* ---------- Facebook অটো-কানেক্ট (নতুন ফিচার) ---------- */
-// ড্যাশবোর্ডের "Facebook দিয়ে অটো-কানেক্ট করুন" বাটন এখানে শর্ট-লিভড পেজ টোকেন পাঠায়,
-// এখানে সেটাকে long-lived (~৬০ দিন) এ এক্সচেঞ্জ করে Google Sheet-এ সেভ করা হয়।
+});
+
+/* ---------- Facebook অটো-কানেক্ট ---------- */
 router.post('/settings/fb-auto', async (req, res) => {
   const { pageAccessToken, pageId, pageName, fbAppId } = req.body;
   if (!pageAccessToken || !fbAppId) {
@@ -140,10 +151,7 @@ router.post('/settings/fb-auto', async (req, res) => {
   }
 });
 
-/* ---------- WhatsApp Embedded Signup অটো-কানেক্ট (নতুন ফিচার) ---------- */
-// ড্যাশবোর্ডের "WhatsApp দিয়ে অটো-কানেক্ট করুন" বাটন Meta-র Embedded Signup পপআপ থেকে
-// একটা "code" ও ফোন নাম্বার/WABA আইডি পাঠায়, এখানে সেটাকে অ্যাক্সেস টোকেনে এক্সচেঞ্জ করে
-// Google Sheet-এ স্থায়ীভাবে সেভ করা হয়।
+/* ---------- WhatsApp Embedded Signup অটো-কানেক্ট ---------- */
 router.post('/settings/wa-auto', async (req, res) => {
   const { code, phoneNumberId, wabaId, fbAppId } = req.body;
   if (!code || !fbAppId) {
