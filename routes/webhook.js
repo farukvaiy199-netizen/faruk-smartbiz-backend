@@ -225,6 +225,24 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   await store.appendMessage(customer.id, 'assistant', reply);
   await send(reply, imageUrl);
 
+  // কাস্টমার আগে অর্ডার কনফার্ম করে ফেলার পর, এখন শুধু একটা ইমেইল ঠিকানা পাঠিয়েছে —
+  // সেটা সবচেয়ে সাম্প্রতিক (এখনো ইমেইলবিহীন) অর্ডারে জুড়ে দিয়ে কনফার্মেশন মেইল পাঠাই
+  if (order && order.emailOnly && order.email) {
+    const updatedOrder = store.attachEmailToLatestOrder(customer.id, order.email);
+    if (updatedOrder) {
+      const result = await sendOrderConfirmationEmail({ to: order.email, order: updatedOrder });
+      store.addEmailLog({
+        to: order.email,
+        orderId: updatedOrder.id,
+        customerName: updatedOrder.name,
+        sent: result.sent,
+        reason: result.reason || '',
+        date: new Date().toLocaleString('bn-BD')
+      });
+    }
+    return;
+  }
+
   if (order && order.product) {
     if (order.name || order.phone) {
       store.updateCustomerContact(customer.id, { name: order.name, phone: order.phone });
