@@ -15,6 +15,7 @@ function defaultDb() {
     customers: [],
     broadcasts: [],
     conversations: {}, // { customerId: [{role:'user'|'assistant', text, ts}] }
+    emailLogs: [], // অর্ডার কনফার্মেশন ইমেইল পাঠানোর হিস্টোরি (নতুন)
     nextOrderSeq: 232
   };
 }
@@ -24,7 +25,9 @@ function readDb() {
     writeDb(defaultDb());
   }
   const raw = fs.readFileSync(DB_PATH, 'utf8');
-  return JSON.parse(raw);
+  const db = JSON.parse(raw);
+  if (!db.emailLogs) db.emailLogs = []; // পুরনো db.json ফাইলে এই ফিল্ড নাও থাকতে পারে
+  return db;
 }
 
 function writeDb(db) {
@@ -36,24 +39,25 @@ function defaultSettings() {
     fbToken: '', fbPageId: '', fbAppId: '',
     waToken: '', waPhoneNumberId: '', waBusinessId: '', waConfigId: '', waAppId: '',
     sheetLink: '', faqSheetLink: '',
-    aiKey: '', aiProvider: 'groq', aiAutoReply: true
+    aiKey: '', aiProvider: 'groq', aiAutoReply: true,
+    // ============ ব্যাকআপ AI Key (নতুন) — প্রধানটা কোটা/রেট-লিমিটে আটকে গেলে এটা ব্যবহার হবে ============
+    aiKey2: '', aiProvider2: 'groq'
   };
 }
 
 /* ---------- Settings — Google Sheet-এ স্থায়ীভাবে সেভ হয় (server redeploy হলেও হারায় না) ---------- */
-let cachedSettings = null; // এই সার্ভার ইনস্ট্যান্স চালু থাকা অবস্থায় বারবার শিটে না গিয়ে দ্রুত সাড়া দিতে
+let cachedSettings = null;
 
 function computeConnected(s) {
   return {
     fb: !!s.fbToken,
     wa: !!(s.waToken && s.waPhoneNumberId),
     sheet: !!s.sheetLink,
-    ai: !!s.aiKey
+    ai: !!s.aiKey,
+    ai2: !!s.aiKey2
   };
 }
 
-// শিটে POST করে (Apps Script কখনো কখনো ধীর, বিশেষ করে নতুন ট্যাব তৈরি করার সময়) —
-// একবার ব্যর্থ হলে একটু বড় টাইমআউট দিয়ে আরেকবার চেষ্টা করি
 async function postToScript(payload, timeout1 = 10000, timeout2 = 20000) {
   try {
     return await axios.post(config.sheetScriptUrl, payload, { timeout: timeout1 });
@@ -73,11 +77,9 @@ async function getSettings() {
       return { ...cachedSettings, connected: computeConnected(cachedSettings) };
     } catch (err) {
       console.error('Google Sheet থেকে সেটিংস আনতে ব্যর্থ:', err.message);
-      // শিট থেকে আনতে না পারলে স্থানীয় ফাইলে যা আছে (যদি থাকে) তাই ফেরত দিই
     }
   }
 
-  // fallback: Sheet Script এখনো কনফিগার না থাকলে বা এরর হলে লোকাল ফাইল ব্যবহার করি
   const db = readDb();
   cachedSettings = { ...defaultSettings(), ...(db.settings || {}) };
   return { ...cachedSettings, connected: computeConnected(cachedSettings) };
@@ -86,7 +88,7 @@ async function getSettings() {
 async function saveSettings(partial) {
   const current = cachedSettings || (await getSettings());
   const merged = { ...current, ...partial };
-  delete merged.connected; // এটা সবসময় হিসেব করে বের করা হয়, সেভ করার দরকার নেই
+  delete merged.connected;
   cachedSettings = merged;
 
   let sheetSaved = true;
@@ -102,7 +104,6 @@ async function saveSettings(partial) {
     }
   }
 
-  // লোকাল ফাইলেও একটা কপি রাখি (Sheet Script কনফিগার করার আগে fallback হিসেবে)
   const db = readDb();
   db.settings = merged;
   writeDb(db);
@@ -111,7 +112,7 @@ async function saveSettings(partial) {
 }
 
 /* ---------- Customers ---------- */
-function findOrCreateCustomer({ platform, platformId, name, phone }) {
+function findOrCreateCustomer({ platform, platformId, name, phone, photoUrl }) {
   const db = readDb();
   let customer = db.customers.find(c => c.platformId === platformId && c.platform === platform);
   if (!customer) {
@@ -121,6 +122,7 @@ function findOrCreateCustomer({ platform, platformId, name, phone }) {
       platformId,
       name: name || 'অজানা কাস্টমার',
       phone: phone || '',
+      photoUrl: photoUrl || '', // কাস্টমারের প্রোফাইল ছবি (এখন পর্যন্ত শুধু Facebook থেকে পাওয়া যায়)
       orders: 0,
       ai: true,
       createdAt: new Date().toISOString()
@@ -144,19 +146,21 @@ function setCustomerAI(id, aiOn) {
   return c;
 }
 
-// AI-এর সাথে কথা বলার সময় কাস্টমার নাম/ফোন জানালে প্রোফাইল আপডেট করি
-function updateCustomerContact(id, { name, phone }) {
+// AI-এর সাথে কথা বলার সময় কাস্টমার নাম/ফোন জানালে, অথবা Facebook থেকে প্রোফাইল ছবি পেলে
+// প্রোফাইল আপডেট করি
+function updateCustomerContact(id, { name, phone, photoUrl }) {
   const db = readDb();
   const c = db.customers.find(x => x.id === id);
   if (!c) return null;
   if (name && name.trim()) c.name = name.trim();
   if (phone && phone.trim()) c.phone = phone.trim();
+  if (photoUrl) c.photoUrl = photoUrl;
   writeDb(db);
   return c;
 }
 
 /* ---------- Conversations — Google Sheet-এ স্থায়ীভাবে সেভ হয় (স্মৃতি হারায় না) ---------- */
-let convCache = {}; // { customerId: [{role, text, ts}] } — চলতি সার্ভার সেশনে দ্রুত অ্যাক্সেসের জন্য
+let convCache = {};
 
 async function getConversation(customerId) {
   if (convCache[customerId]) return convCache[customerId];
@@ -178,17 +182,16 @@ async function getConversation(customerId) {
 
 async function appendMessage(customerId, role, text) {
   const current = await getConversation(customerId);
-  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-20); // শেষ ২০টা যথেষ্ট
+  // আগে শেষ ২০টা রাখা হতো, এখন ১৬টা — এতে প্রতিটা AI রিকোয়েস্টে কম টোকেন লাগে,
+  // রেট-লিমিটে ধাক্কা লাগার সম্ভাবনা কমে (কথোপকথনের সাম্প্রতিক প্রসঙ্গ ঠিকই থাকে)
+  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-16);
   convCache[customerId] = updated;
 
-  // শিটে সেভ করাটা ব্যাকগ্রাউন্ডে হবে (await করা হচ্ছে না) — এতে কাস্টমারের রিপ্লাই
-  // Apps Script ধীর হলেও আটকে থাকবে না। ব্যর্থ হলে শুধু লগে লেখা হবে।
   if (config.sheetScriptUrl) {
     postToScript({ token: config.sheetScriptToken, type: 'conversation_save', customerId, messages: updated })
       .catch(err => console.error('Google Sheet-এ কথোপকথন সেভ করতে ব্যর্থ:', err.message));
   }
 
-  // লোকাল ফাইলেও ব্যাকআপ রাখি (Sheet কনফিগার করার আগে fallback)
   const db = readDb();
   if (!db.conversations) db.conversations = {};
   db.conversations[customerId] = updated;
@@ -196,7 +199,7 @@ async function appendMessage(customerId, role, text) {
 }
 
 /* ---------- Orders ---------- */
-function createOrder({ customerId, name, phone, address, product, qty, price, source }) {
+function createOrder({ customerId, name, phone, address, product, qty, price, email, source }) {
   const db = readDb();
   const id = 'ORD-' + String(db.nextOrderSeq).padStart(6, '0');
   db.nextOrderSeq += 1;
@@ -204,6 +207,7 @@ function createOrder({ customerId, name, phone, address, product, qty, price, so
     id, customerId, name,
     phone: phone || '',
     address: address || '',
+    email: email || '', // ঐচ্ছিক — কাস্টমার নিজে থেকে দিলে তবেই থাকবে
     product,
     qty: qty || 1, price: price || 0,
     status: 'Pending', source,
@@ -233,7 +237,6 @@ function createWebsiteOrder(payload = {}) {
   const qty = items.length ? items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : (Number(payload.qty) || 1);
   const price = Number(payload.total) || Number(payload.subtotal) || 0;
 
-  // ফোন নাম্বার দিয়ে আগের কাস্টমার খুঁজি, না পেলে নতুন বানাই — যাতে Customers ট্যাবেও দেখা যায়
   let customer = null;
   if (payload.phone) {
     customer = db.customers.find(c => c.phone === payload.phone && c.platform === 'website');
@@ -244,6 +247,7 @@ function createWebsiteOrder(payload = {}) {
         platformId: payload.phone,
         name: payload.customer || 'ওয়েবসাইট কাস্টমার',
         phone: payload.phone,
+        photoUrl: '',
         orders: 0,
         ai: true,
         createdAt: new Date().toISOString()
@@ -263,6 +267,7 @@ function createWebsiteOrder(payload = {}) {
     status: 'Pending',
     source: 'Bazaar Admin',
     address: payload.address || '',
+    email: payload.email || '',
     payment: payload.payment || '',
     transactionId: payload.transactionId || '',
     createdAt: payload.date ? new Date(payload.date).toISOString() : new Date().toISOString()
@@ -293,10 +298,24 @@ function getBroadcasts() {
   return readDb().broadcasts;
 }
 
+/* ---------- Email Logs (নতুন) — অর্ডার কনফার্মেশন ইমেইল কাকে পাঠানো হয়েছে তার হিস্টোরি ---------- */
+function addEmailLog(entry) {
+  const db = readDb();
+  db.emailLogs.unshift(entry);
+  db.emailLogs = db.emailLogs.slice(0, 200); // বেশি বড় না হয়ে যায়
+  writeDb(db);
+  return entry;
+}
+
+function getEmailLogs() {
+  return readDb().emailLogs;
+}
+
 module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
   createOrder, createWebsiteOrder, getOrders, updateOrderStatus,
-  addBroadcast, getBroadcasts
+  addBroadcast, getBroadcasts,
+  addEmailLog, getEmailLogs
 };
