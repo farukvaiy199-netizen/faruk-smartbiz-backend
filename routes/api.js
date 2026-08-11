@@ -41,6 +41,21 @@ router.patch('/orders/:id', (req, res) => {
   res.json(order);
 });
 
+// অর্ডার CSV আকারে ডাউনলোড (Excel-এ খোলা যায়)
+router.get('/orders/export', (req, res) => {
+  const orders = store.getOrders();
+  const header = ['Order ID', 'Name', 'Phone', 'Address', 'Email', 'Product', 'Qty', 'Price', 'Total', 'Status', 'Source', 'Date'];
+  const rows = orders.map(o => [
+    o.id, o.name, o.phone, o.address, o.email || '', o.product, o.qty, o.price,
+    (o.price || 0) * (o.qty || 1), o.status, o.source, o.createdAt
+  ]);
+  const csvEscape = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const csv = [header, ...rows].map(r => r.map(csvEscape).join(',')).join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="orders.csv"');
+  res.send('\uFEFF' + csv); // BOM — এটা না দিলে Excel-এ বাংলা টেক্সট ভাঙাচোরা দেখায়
+});
+
 /* ---------- Customers ---------- */
 router.get('/customers', (req, res) => {
   res.json(store.getCustomers());
@@ -51,6 +66,52 @@ router.patch('/customers/:id/ai', (req, res) => {
   const customer = store.setCustomerAI(req.params.id, !!ai);
   if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
   res.json(customer);
+});
+
+// কারো নামে ট্যাপ করলে তার সম্পূর্ণ অর্ডার + কথোপকথন হিস্টোরি
+router.get('/customers/:id', async (req, res) => {
+  const customer = store.getCustomers().find(c => c.id === req.params.id);
+  if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
+  const orders = store.getOrdersByCustomer(customer.id);
+  const conversation = await store.getConversation(customer.id);
+  res.json({ customer, orders, conversation });
+});
+
+// সাপ্তাহিক/মাসিক রিপোর্ট — বেস্ট-সেলিং প্রোডাক্ট ও প্ল্যাটফর্ম ব্রেকডাউন
+router.get('/reports', (req, res) => {
+  const rangeDays = req.query.range === 'month' ? 30 : 7;
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - rangeDays);
+
+  const filtered = store.getOrders().filter(o => new Date(o.createdAt) >= cutoff);
+
+  const productMap = {};
+  const platformMap = {};
+  let totalRevenue = 0;
+
+  filtered.forEach(o => {
+    const qty = o.qty || 1;
+    productMap[o.product] = (productMap[o.product] || 0) + qty;
+    platformMap[o.source] = (platformMap[o.source] || 0) + 1;
+    totalRevenue += (o.price || 0) * qty;
+  });
+
+  const topProducts = Object.entries(productMap)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([product, qty]) => ({ product, qty }));
+
+  const platformBreakdown = Object.entries(platformMap)
+    .sort((a, b) => b[1] - a[1])
+    .map(([platform, count]) => ({ platform, count }));
+
+  res.json({
+    range: rangeDays === 30 ? 'month' : 'week',
+    totalOrders: filtered.length,
+    totalRevenue,
+    topProducts,
+    platformBreakdown
+  });
 });
 
 /* ---------- Broadcast ---------- */
