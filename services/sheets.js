@@ -102,7 +102,36 @@ async function getCombinedSheetContext(inventoryLink, faqLink, query = '') {
   return [inventoryText, faqText].filter(Boolean).join('\n\n');
 }
 
-module.exports = { getSheetContext, getCombinedSheetContext, writeOrderToSheet, writeCustomerToSheet };
+// শিটে "Stock"/"স্টক"/"Quantity" নামের কলাম থাকলে, প্রোডাক্টের নাম দিয়ে বর্তমান স্টক খুঁজে বের করে।
+// এমন কলাম না থাকলে (বা শিট সংযুক্ত না থাকলে) null রিটার্ন করে — তখন স্টক চেক স্কিপ হয়ে যায়,
+// অর্ডার নেওয়া আটকায় না।
+async function getProductStock(sheetLink, productName) {
+  if (!sheetLink || !productName) return null;
+  try {
+    const rows = await fetchSheetRows(sheetLink);
+    if (!rows || rows.length < 2) return null;
+
+    const header = rows[0].map(h => (h || '').toLowerCase());
+    const stockIdx = header.findIndex(h => h.includes('stock') || h.includes('স্টক') || h.includes('quantity'));
+    const nameIdx = header.findIndex(h => h.includes('name') || h.includes('নাম') || h.includes('product') || h.includes('প্রোডাক্ট'));
+    if (stockIdx === -1 || nameIdx === -1) return null;
+
+    const target = productName.toLowerCase();
+    const dataRows = rows.slice(1);
+    const match = dataRows.find(r =>
+      (r[nameIdx] || '').toLowerCase().includes(target) || target.includes((r[nameIdx] || '').toLowerCase())
+    );
+    if (!match) return null;
+
+    const stockVal = parseInt(match[stockIdx], 10);
+    return isNaN(stockVal) ? null : stockVal;
+  } catch (err) {
+    console.error('স্টক চেক করতে ব্যর্থ:', err.message);
+    return null;
+  }
+}
+
+module.exports = { getSheetContext, getCombinedSheetContext, getProductStock, writeOrderToSheet, writeCustomerToSheet };
 
 /* ---------- Apps Script দিয়ে শিটে লেখা (order/customer) ---------- */
 async function writeOrderToSheet({ scriptUrl, scriptToken, order }) {
