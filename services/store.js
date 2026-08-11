@@ -224,6 +224,17 @@ function getOrders() {
   return readDb().orders;
 }
 
+// অর্ডার কনফার্ম হয়ে যাওয়ার পরে কাস্টমার আলাদাভাবে ইমেইল পাঠালে, তার সবচেয়ে সাম্প্রতিক
+// (এখনো ইমেইল যোগ হয়নি এমন) অর্ডারে সেটা জুড়ে দেয়
+function attachEmailToLatestOrder(customerId, email) {
+  const db = readDb();
+  const order = db.orders.find(o => o.customerId === customerId && !o.email);
+  if (!order) return null;
+  order.email = email;
+  writeDb(db);
+  return order;
+}
+
 /* ---------- বাইরের ওয়েবসাইট (Bazaar Admin) থেকে ওয়েবহুকের মাধ্যমে আসা অর্ডার ---------- */
 function createWebsiteOrder(payload = {}) {
   const db = readDb();
@@ -315,7 +326,7 @@ module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
-  createOrder, createWebsiteOrder, getOrders, updateOrderStatus,
+  createOrder, createWebsiteOrder, getOrders, updateOrderStatus, attachEmailToLatestOrder,
   addBroadcast, getBroadcasts,
   addEmailLog, getEmailLogs
 };
