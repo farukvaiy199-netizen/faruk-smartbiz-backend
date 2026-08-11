@@ -5,7 +5,7 @@ const config = require('../config');
 const store = require('../services/store');
 const { getAIReplyWithFallback, getVisionReply, isVisionCapable } = require('../services/ai');
 const { transcribeAudio, isWhisperCapable } = require('../services/speech');
-const { getCombinedSheetContext, writeOrderToSheet, writeCustomerToSheet } = require('../services/sheets');
+const { getCombinedSheetContext, getProductStock, writeOrderToSheet, writeCustomerToSheet } = require('../services/sheets');
 const { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedia } = require('../services/facebook');
 const { sendWhatsAppMessage, sendWhatsAppImage, getWhatsAppMediaBuffer } = require('../services/whatsapp');
 const { sendOrderConfirmationEmail } = require('../services/email');
@@ -244,6 +244,16 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   }
 
   if (order && order.product) {
+    // শিটে "Stock" কলাম থাকলে চেক করি — স্টক ০ বা কম হলে অর্ডার নেওয়া বন্ধ রাখি।
+    // কলাম না থাকলে (getProductStock null রিটার্ন করবে) চেক স্কিপ হয়ে যায়।
+    const stock = await getProductStock(settings.sheetLink, order.product);
+    if (stock !== null && stock <= 0) {
+      const outOfStockMsg = `দুঃখিত, "${order.product}" এই মুহূর্তে স্টকে নেই। অন্য কোনো প্রোডাক্ট দেখতে চান?`;
+      await store.appendMessage(customer.id, 'assistant', outOfStockMsg);
+      await send(outOfStockMsg);
+      return;
+    }
+
     if (order.name || order.phone) {
       store.updateCustomerContact(customer.id, { name: order.name, phone: order.phone });
     }
