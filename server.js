@@ -9,6 +9,9 @@ const webhookRoutes = require('./routes/webhook');
 const apiRoutes = require('./routes/api');
 
 const app = express();
+// Render একটা প্রক্সির পেছনে চলে (X-Forwarded-For হেডার আসে) — এটা বলে না দিলে
+// express-rate-limit সব রিকোয়েস্টকে ভুল করে একই ব্যবহারকারীর ধরে নিয়ে সবাইকে ব্লক করে দেয়।
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
