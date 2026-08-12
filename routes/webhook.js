@@ -244,6 +244,19 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   }
 
   if (order && order.product) {
+    // সুরক্ষা: AI ভুল করে একই প্রোডাক্টের অর্ডার বারবার পাঠালেও (যেমন শুধু "সালাম" দিলে
+    // আগের কথোপকথন দেখে আবার অর্ডার বানিয়ে ফেলা), শেষ ১৫ মিনিটের মধ্যে এই কাস্টমারের
+    // একই প্রোডাক্টের অর্ডার আগে থেকে থাকলে নতুন করে ডুপ্লিকেট অর্ডার তৈরি করি না।
+    const recentOrders = store.getOrdersByCustomer(customer.id);
+    const fifteenMinAgo = Date.now() - 15 * 60 * 1000;
+    const duplicate = recentOrders.find(o =>
+      o.product === order.product && new Date(o.createdAt).getTime() > fifteenMinAgo
+    );
+    if (duplicate) {
+      console.warn(`ডুপ্লিকেট অর্ডার ঠেকানো হলো: ${customer.id} — ${order.product}`);
+      return;
+    }
+
     // শিটে "Stock" কলাম থাকলে চেক করি — স্টক ০ বা কম হলে অর্ডার নেওয়া বন্ধ রাখি।
     // কলাম না থাকলে (getProductStock null রিটার্ন করবে) চেক স্কিপ হয়ে যায়।
     const stock = await getProductStock(settings.sheetLink, order.product);
@@ -269,8 +282,12 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       source: platform === 'facebook' ? 'Messenger' : 'WhatsApp'
     });
 
-    // দেদিকেটেড অর্ডার কনফার্মেশন মেসেজ — AI-এর রিপ্লাই ছাড়াও আলাদাভাবে পাঠানো হয়
-    await send(buildConfirmationText(savedOrder));
+    // দেদিকেটেড অর্ডার কনফার্মেশন মেসেজ — AI-এর রিপ্লাই ছাড়াও আলাদাভাবে পাঠানো হয়।
+    // এটা conversation history-তেও যোগ করি, যাতে AI নিজের "কনফার্ম করেছি" এই তথ্য
+    // পরবর্তী মেসেজগুলোতে মনে রাখে এবং আবার নতুন অর্ডার বানিয়ে না ফেলে।
+    const confirmationText = buildConfirmationText(savedOrder);
+    await store.appendMessage(customer.id, 'assistant', confirmationText);
+    await send(confirmationText);
 
     // কাস্টমার ইমেইল দিয়ে থাকলে (এবং Render-এ EMAIL_USER/EMAIL_PASS সেট থাকলে) ইমেইলেও কনফার্মেশন
     if (savedOrder.email) {
