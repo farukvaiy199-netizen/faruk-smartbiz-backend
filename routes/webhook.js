@@ -377,7 +377,7 @@ router.post('/ai-reply', async (req, res) => {
 
     res.json({ reply });
   } catch (err) {
-    console.error('AI-reply webhook error:', err.message);
+    console.error('AI-reply webhook error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
     res.status(500).json({ error: 'AI রিপ্লাই তৈরি করা যায়নি' });
   }
 });
