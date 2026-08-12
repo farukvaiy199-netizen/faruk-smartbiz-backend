@@ -8,9 +8,16 @@ function isEmailConfigured() {
 let transporter = null;
 function getTransporter() {
   if (!transporter) {
+    // 'service: gmail' শর্টকাট ডিফল্টভাবে পোর্ট 465 ব্যবহার করে, যেটা Render-এর মতো
+    // কিছু ফ্রি হোস্টিং প্ল্যাটফর্মে ব্লক থাকতে পারে (Connection timeout এরর দেয়)।
+    // পোর্ট 587 (STARTTLS) সাধারণত বেশি জায়গায় খোলা থাকে, তাই এটা স্পষ্টভাবে বসানো হলো।
     transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: config.emailUser, pass: config.emailPass }
+      host: 'smtp.gmail.com',
+      port: 587,
+      secure: false, // STARTTLS ব্যবহার হবে, পোর্ট 587-এর জন্য এটাই সঠিক
+      requireTLS: true,
+      auth: { user: config.emailUser, pass: config.emailPass },
+      connectionTimeout: 15000
     });
   }
   return transporter;
