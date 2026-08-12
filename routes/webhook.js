@@ -330,8 +330,7 @@ router.post('/ai-reply', async (req, res) => {
 
     const visitorName = body.name || body.customerName || body.visitorName || body.userName || '';
     const visitorPhone = body.phone || body.customerPhone || body.visitorPhone || body.mobile || body.number || '';
-
-    console.log('ai-reply থেকে পাওয়া ডেটা:', JSON.stringify(body));
+    const visitorEmail = body.customerEmail || body.email || '';
 
     if (visitorPhone) {
       const customer = store.findOrCreateCustomer({
@@ -357,9 +356,23 @@ router.post('/ai-reply', async (req, res) => {
       return res.status(400).json({ error: 'message খালি' });
     }
 
+    // Bazaar Admin (ওয়েবসাইট চ্যাট) প্রতিবার পুরো কথোপকথনের হিস্টোরি পাঠায় (from: customer/admin/ai/system),
+    // যেটা আগে সম্পূর্ণ উপেক্ষা করা হতো — ফলে AI প্রতিটা মেসেজে আগের কথা ভুলে যেত।
+    // এখন সেটা আমাদের নিজস্ব ফরম্যাটে (role: user/assistant) রূপান্তর করে প্রসঙ্গ হিসেবে ব্যবহার করছি।
+    const rawHistory = Array.isArray(body.history) ? body.history : [];
+    let history = rawHistory
+      .filter(m => m && (m.from === 'customer' || m.from === 'ai' || m.from === 'admin') && m.text)
+      .map(m => ({ role: m.from === 'customer' ? 'user' : 'assistant', text: m.text }))
+      .slice(-16);
+    // Bazaar সাধারণত বর্তমান মেসেজটাও history-এর শেষে যোগ করে রাখে — সেটা ডুপ্লিকেট হয়ে
+    // যাওয়া ঠেকাতে বাদ দিচ্ছি (আসল মেসেজটা এমনিতেই customerMessage হিসেবে যাচ্ছে)
+    if (history.length && history[history.length - 1].role === 'user' && history[history.length - 1].text === message) {
+      history = history.slice(0, -1);
+    }
+
     const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, message);
     const { reply } = await getAIReplyWithFallback({
-      settings, customerMessage: message, history: [], sheetContext, businessInfo
+      settings, customerMessage: message, history, sheetContext, businessInfo
     });
 
     res.json({ reply });
