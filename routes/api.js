@@ -7,16 +7,15 @@ const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
 
-// বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে — Render সার্ভার UTC-তে চলে বলে
-// আগে "আজকের" হিসেব রাতের দিকে ভুল হয়ে রেভিনিউ/অর্ডার সংখ্যা মিলত না, এখন ঠিক থাকবে
+// বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে
 function bdDateString(d) {
   return new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Dhaka' });
 }
 
 /* ---------- Dashboard summary ---------- */
-router.get('/dashboard/summary', (req, res) => {
-  const orders = store.getOrders();
-  const customers = store.getCustomers();
+router.get('/dashboard/summary', async (req, res) => {
+  const orders = await store.getOrders();
+  const customers = await store.getCustomers();
   const today = bdDateString(new Date());
   const todayOrders = orders.filter(o => bdDateString(o.createdAt) === today);
   res.json({
@@ -28,22 +27,22 @@ router.get('/dashboard/summary', (req, res) => {
 });
 
 /* ---------- Orders ---------- */
-router.get('/orders', (req, res) => {
-  res.json(store.getOrders());
+router.get('/orders', async (req, res) => {
+  res.json(await store.getOrders());
 });
 
-router.patch('/orders/:id', (req, res) => {
+router.patch('/orders/:id', async (req, res) => {
   const { status } = req.body;
   const valid = ['Pending', 'Processing', 'Delivered', 'Cancelled'];
   if (!valid.includes(status)) return res.status(400).json({ error: 'অবৈধ status' });
-  const order = store.updateOrderStatus(req.params.id, status);
+  const order = await store.updateOrderStatus(req.params.id, status);
   if (!order) return res.status(404).json({ error: 'অর্ডার পাওয়া যায়নি' });
   res.json(order);
 });
 
 // অর্ডার CSV আকারে ডাউনলোড (Excel-এ খোলা যায়)
-router.get('/orders/export', (req, res) => {
-  const orders = store.getOrders();
+router.get('/orders/export', async (req, res) => {
+  const orders = await store.getOrders();
   const header = ['Order ID', 'Name', 'Phone', 'Address', 'Email', 'Product', 'Qty', 'Price', 'Total', 'Status', 'Source', 'Date'];
   const rows = orders.map(o => [
     o.id, o.name, o.phone, o.address, o.email || '', o.product, o.qty, o.price,
@@ -53,37 +52,39 @@ router.get('/orders/export', (req, res) => {
   const csv = [header, ...rows].map(r => r.map(csvEscape).join(',')).join('\n');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="orders.csv"');
-  res.send('\uFEFF' + csv); // BOM — এটা না দিলে Excel-এ বাংলা টেক্সট ভাঙাচোরা দেখায়
+  res.send('\uFEFF' + csv);
 });
 
 /* ---------- Customers ---------- */
-router.get('/customers', (req, res) => {
-  res.json(store.getCustomers());
+router.get('/customers', async (req, res) => {
+  res.json(await store.getCustomers());
 });
 
-router.patch('/customers/:id/ai', (req, res) => {
+router.patch('/customers/:id/ai', async (req, res) => {
   const { ai } = req.body;
-  const customer = store.setCustomerAI(req.params.id, !!ai);
+  const customer = await store.setCustomerAI(req.params.id, !!ai);
   if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
   res.json(customer);
 });
 
 // কারো নামে ট্যাপ করলে তার সম্পূর্ণ অর্ডার + কথোপকথন হিস্টোরি
 router.get('/customers/:id', async (req, res) => {
-  const customer = store.getCustomers().find(c => c.id === req.params.id);
+  const customers = await store.getCustomers();
+  const customer = customers.find(c => c.id === req.params.id);
   if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
-  const orders = store.getOrdersByCustomer(customer.id);
+  const orders = await store.getOrdersByCustomer(customer.id);
   const conversation = await store.getConversation(customer.id);
   res.json({ customer, orders, conversation });
 });
 
-// সাপ্তাহিক/মাসিক রিপোর্ট — বেস্ট-সেলিং প্রোডাক্ট ও প্ল্যাটফর্ম ব্রেকডাউন
-router.get('/reports', (req, res) => {
+// সাপ্তাহিক/মাসিক রিপোর্ট
+router.get('/reports', async (req, res) => {
   const rangeDays = req.query.range === 'month' ? 30 : 7;
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - rangeDays);
 
-  const filtered = store.getOrders().filter(o => new Date(o.createdAt) >= cutoff);
+  const allOrders = await store.getOrders();
+  const filtered = allOrders.filter(o => new Date(o.createdAt) >= cutoff);
 
   const productMap = {};
   const platformMap = {};
@@ -120,7 +121,7 @@ router.post('/broadcast', async (req, res) => {
   if (!message || !message.trim()) return res.status(400).json({ error: 'মেসেজ খালি' });
 
   const settings = await store.getSettings();
-  const customers = store.getCustomers();
+  const customers = await store.getCustomers();
   let success = 0, failed = 0;
 
   for (const c of customers) {
@@ -138,20 +139,20 @@ router.post('/broadcast', async (req, res) => {
     }
   }
 
-  const record = store.addBroadcast({
+  const record = await store.addBroadcast({
     msg: message, total: customers.length, success, failed,
     date: new Date().toLocaleDateString('bn-BD')
   });
   res.json(record);
 });
 
-router.get('/broadcast', (req, res) => {
-  res.json(store.getBroadcasts());
+router.get('/broadcast', async (req, res) => {
+  res.json(await store.getBroadcasts());
 });
 
-/* ---------- Email Logs (নতুন) ---------- */
-router.get('/email-logs', (req, res) => {
-  res.json(store.getEmailLogs());
+/* ---------- Email Logs ---------- */
+router.get('/email-logs', async (req, res) => {
+  res.json(await store.getEmailLogs());
 });
 
 /* ---------- Settings ---------- */
@@ -169,9 +170,9 @@ router.get('/settings', async (req, res) => {
     aiProvider: s.aiProvider,
     aiProvider2: s.aiProvider2,
     aiAutoReply: s.aiAutoReply,
-    connected: s.connected, // { fb, wa, sheet, ai, ai2 }
+    connected: s.connected,
     sheetStorageConfigured: !!config.sheetScriptUrl,
-    emailConfigured: !!(config.emailUser && config.emailPass)
+    emailConfigured: !!config.resendApiKey
   });
 });
 
