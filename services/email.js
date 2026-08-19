@@ -1,33 +1,15 @@
-const nodemailer = require('nodemailer');
+const axios = require('axios');
 const config = require('../config');
 
+// আগে SMTP (nodemailer) ব্যবহার হতো, কিন্তু Render ফ্রি প্ল্যানে outbound SMTP পোর্ট
+// (৪৬৫ ও ৫৮৭ দুটোই) ব্লক থাকায় সবসময় "Connection timeout" হচ্ছিল।
+// Resend একটা সাধারণ HTTPS API (পোর্ট ৪৪৩), তাই ব্লক হওয়ার কথা না।
 function isEmailConfigured() {
-  return !!(config.emailUser && config.emailPass);
+  return !!config.resendApiKey;
 }
 
-let transporter = null;
-function getTransporter() {
-  if (!transporter) {
-    // 'service: gmail' শর্টকাট ডিফল্টভাবে পোর্ট 465 ব্যবহার করে, যেটা Render-এর মতো
-    // কিছু ফ্রি হোস্টিং প্ল্যাটফর্মে ব্লক থাকতে পারে (Connection timeout এরর দেয়)।
-    // পোর্ট 587 (STARTTLS) সাধারণত বেশি জায়গায় খোলা থাকে, তাই এটা স্পষ্টভাবে বসানো হলো।
-    transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false, // STARTTLS ব্যবহার হবে, পোর্ট 587-এর জন্য এটাই সঠিক
-      requireTLS: true,
-      auth: { user: config.emailUser, pass: config.emailPass },
-      connectionTimeout: 15000
-    });
-  }
-  return transporter;
-}
-
-// অর্ডার কনফার্ম হলে কাস্টমারের ইমেইলে (দিলে) একটা সুন্দর কনফার্মেশন পাঠায়।
-// EMAIL_USER/EMAIL_PASS Render Environment-এ সেট না থাকলে চুপচাপ কিছুই করবে না —
-// মেসেজ (Messenger/WhatsApp) কনফার্মেশন এর উপর নির্ভর করে না, সেটা সবসময় কাজ করবে।
 async function sendOrderConfirmationEmail({ to, order }) {
-  if (!isEmailConfigured()) return { sent: false, reason: 'সার্ভারে EMAIL_USER/EMAIL_PASS সেট করা নেই' };
+  if (!isEmailConfigured()) return { sent: false, reason: 'সার্ভারে RESEND_API_KEY সেট করা নেই' };
   if (!to) return { sent: false, reason: 'কাস্টমারের ইমেইল পাওয়া যায়নি' };
 
   const subject = `আপনার অর্ডার কনফার্ম হয়েছে — ${order.id}`;
@@ -47,11 +29,23 @@ async function sendOrderConfirmationEmail({ to, order }) {
   `;
 
   try {
-    await getTransporter().sendMail({ from: config.emailFrom, to, subject, html });
+    await axios.post('https://api.resend.com/emails', {
+      from: 'Faruk\'s SmartBiz <onboarding@resend.dev>',
+      to: [to],
+      subject,
+      html
+    }, {
+      headers: {
+        Authorization: `Bearer ${config.resendApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    });
     return { sent: true };
   } catch (err) {
-    console.error('অর্ডার কনফার্মেশন ইমেইল পাঠাতে ব্যর্থ:', err.message);
-    return { sent: false, reason: err.message };
+    const reason = err.response?.data?.message || err.message;
+    console.error('অর্ডার কনফার্মেশন ইমেইল পাঠাতে ব্যর্থ:', reason);
+    return { sent: false, reason };
   }
 }
 
