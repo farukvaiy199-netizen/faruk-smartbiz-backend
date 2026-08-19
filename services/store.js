@@ -1,37 +1,26 @@
-// ছোট ব্যবসার জন্য সহজ JSON-ফাইল ভিত্তিক ডেটাবেস (অর্ডার/কাস্টমার/মেসেজের জন্য)।
-// কিন্তু সেটিংস (AI Key, Facebook Token ইত্যাদি) আলাদাভাবে Google Sheet-এ স্থায়ীভাবে রাখা হয়,
-// কারণ Render Free সার্ভিসে লোকাল ফাইল প্রতি ডিপ্লয়ে মুছে যায় (ephemeral disk)।
+// আগে অর্ডার/কাস্টমার/কথোপকথন লোকাল db.json ফাইলে রাখা হতো — কিন্তু Render ফ্রি প্ল্যানে
+// প্রতিটা নতুন deploy-তে সেই ফাইল মুছে যায় (ephemeral disk), ফলে ডেটা হারিয়ে যাচ্ছিল।
+// এখন সবকিছু MongoDB-তে স্থায়ীভাবে সেভ হয় — redeploy হলেও আর হারাবে না।
 
-const fs = require('fs');
-const path = require('path');
-const axios = require('axios');
+const { MongoClient } = require('mongodb');
 const config = require('../config');
 
-const DB_PATH = path.join(__dirname, '..', 'data', 'db.json');
-
-function defaultDb() {
-  return {
-    orders: [],
-    customers: [],
-    broadcasts: [],
-    conversations: {}, // { customerId: [{role:'user'|'assistant', text, ts}] }
-    emailLogs: [], // অর্ডার কনফার্মেশন ইমেইল পাঠানোর হিস্টোরি (নতুন)
-    nextOrderSeq: 232
-  };
-}
-
-function readDb() {
-  if (!fs.existsSync(DB_PATH)) {
-    writeDb(defaultDb());
+let clientPromise = null;
+async function getDb() {
+  if (!config.mongoUri) {
+    throw new Error('সার্ভারে MONGO_URI সেট করা নেই — Render Environment-এ যোগ করুন');
   }
-  const raw = fs.readFileSync(DB_PATH, 'utf8');
-  const db = JSON.parse(raw);
-  if (!db.emailLogs) db.emailLogs = []; // পুরনো db.json ফাইলে এই ফিল্ড নাও থাকতে পারে
-  return db;
+  if (!clientPromise) {
+    const client = new MongoClient(config.mongoUri);
+    clientPromise = client.connect().then(c => c.db());
+  }
+  return clientPromise;
 }
 
-function writeDb(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf8');
+function stripId(doc) {
+  if (!doc) return doc;
+  const { _id, ...rest } = doc;
+  return rest;
 }
 
 function defaultSettings() {
@@ -40,13 +29,10 @@ function defaultSettings() {
     waToken: '', waPhoneNumberId: '', waBusinessId: '', waConfigId: '', waAppId: '',
     sheetLink: '', faqSheetLink: '',
     aiKey: '', aiProvider: 'groq', aiAutoReply: true,
-    // ============ ব্যাকআপ AI Key (নতুন) — প্রধানটা কোটা/রেট-লিমিটে আটকে গেলে এটা ব্যবহার হবে ============
+    // ব্যাকআপ AI Key — প্রধানটা কোটা/রেট-লিমিটে আটকে গেলে এটা ব্যবহার হবে
     aiKey2: '', aiProvider2: 'groq'
   };
 }
-
-/* ---------- Settings — Google Sheet-এ স্থায়ীভাবে সেভ হয় (server redeploy হলেও হারায় না) ---------- */
-let cachedSettings = null;
 
 function computeConnected(s) {
   return {
@@ -58,192 +44,143 @@ function computeConnected(s) {
   };
 }
 
-async function postToScript(payload, timeout1 = 10000, timeout2 = 20000) {
-  try {
-    return await axios.post(config.sheetScriptUrl, payload, { timeout: timeout1 });
-  } catch (err) {
-    return await axios.post(config.sheetScriptUrl, payload, { timeout: timeout2 });
-  }
-}
-
+/* ---------- Settings ---------- */
 async function getSettings() {
-  if (cachedSettings) return { ...cachedSettings, connected: computeConnected(cachedSettings) };
-
-  if (config.sheetScriptUrl) {
-    try {
-      const res = await postToScript({ token: config.sheetScriptToken, type: 'settings_get' });
-      const remote = (res.data && res.data.settings) || {};
-      cachedSettings = { ...defaultSettings(), ...remote };
-      return { ...cachedSettings, connected: computeConnected(cachedSettings) };
-    } catch (err) {
-      console.error('Google Sheet থেকে সেটিংস আনতে ব্যর্থ:', err.message);
-    }
-  }
-
-  const db = readDb();
-  cachedSettings = { ...defaultSettings(), ...(db.settings || {}) };
-  return { ...cachedSettings, connected: computeConnected(cachedSettings) };
+  const db = await getDb();
+  const doc = await db.collection('meta').findOne({ _id: 'settings' });
+  const merged = { ...defaultSettings(), ...stripId(doc) };
+  return { ...merged, connected: computeConnected(merged) };
 }
 
 async function saveSettings(partial) {
-  const current = cachedSettings || (await getSettings());
+  const db = await getDb();
+  const current = await getSettings();
+  delete current.connected;
   const merged = { ...current, ...partial };
-  delete merged.connected;
-  cachedSettings = merged;
-
-  let sheetSaved = true;
-  let sheetError = null;
-
-  if (config.sheetScriptUrl) {
-    try {
-      await postToScript({ token: config.sheetScriptToken, type: 'settings_save', settings: merged });
-    } catch (err) {
-      sheetSaved = false;
-      sheetError = err.message;
-      console.error('Google Sheet-এ সেটিংস সেভ করতে ব্যর্থ:', err.message);
-    }
-  }
-
-  const db = readDb();
-  db.settings = merged;
-  writeDb(db);
-
-  return { ...merged, connected: computeConnected(merged), sheetSaved, sheetError };
+  await db.collection('meta').updateOne({ _id: 'settings' }, { $set: merged }, { upsert: true });
+  return { ...merged, connected: computeConnected(merged), sheetSaved: true, sheetError: null };
 }
 
 /* ---------- Customers ---------- */
-function findOrCreateCustomer({ platform, platformId, name, phone, photoUrl }) {
-  const db = readDb();
-  let customer = db.customers.find(c => c.platformId === platformId && c.platform === platform);
+async function findOrCreateCustomer({ platform, platformId, name, phone, photoUrl }) {
+  const db = await getDb();
+  const col = db.collection('customers');
+  let customer = await col.findOne({ platform, platformId });
   if (!customer) {
+    const count = await col.countDocuments();
     customer = {
-      id: 'C-' + (1000 + db.customers.length + 1),
-      platform,
-      platformId,
+      id: 'C-' + (1000 + count + 1),
+      platform, platformId,
       name: name || 'অজানা কাস্টমার',
       phone: phone || '',
-      photoUrl: photoUrl || '', // কাস্টমারের প্রোফাইল ছবি (এখন পর্যন্ত শুধু Facebook থেকে পাওয়া যায়)
+      photoUrl: photoUrl || '',
       orders: 0,
       ai: true,
       createdAt: new Date().toISOString()
     };
-    db.customers.push(customer);
-    writeDb(db);
+    await col.insertOne(customer);
   }
-  return customer;
+  return stripId(customer);
 }
 
-function getCustomers() {
-  return readDb().customers;
+async function getCustomers() {
+  const db = await getDb();
+  const list = await db.collection('customers').find().sort({ createdAt: -1 }).toArray();
+  return list.map(stripId);
 }
 
-function setCustomerAI(id, aiOn) {
-  const db = readDb();
-  const c = db.customers.find(x => x.id === id);
-  if (!c) return null;
-  c.ai = aiOn;
-  writeDb(db);
-  return c;
+async function setCustomerAI(id, aiOn) {
+  const db = await getDb();
+  const col = db.collection('customers');
+  await col.updateOne({ id }, { $set: { ai: aiOn } });
+  return stripId(await col.findOne({ id }));
 }
 
-// AI-এর সাথে কথা বলার সময় কাস্টমার নাম/ফোন জানালে, অথবা Facebook থেকে প্রোফাইল ছবি পেলে
-// প্রোফাইল আপডেট করি
-function updateCustomerContact(id, { name, phone, photoUrl }) {
-  const db = readDb();
-  const c = db.customers.find(x => x.id === id);
-  if (!c) return null;
-  if (name && name.trim()) c.name = name.trim();
-  if (phone && phone.trim()) c.phone = phone.trim();
-  if (photoUrl) c.photoUrl = photoUrl;
-  writeDb(db);
-  return c;
+async function updateCustomerContact(id, { name, phone, photoUrl }) {
+  const db = await getDb();
+  const col = db.collection('customers');
+  const set = {};
+  if (name && name.trim()) set.name = name.trim();
+  if (phone && phone.trim()) set.phone = phone.trim();
+  if (photoUrl) set.photoUrl = photoUrl;
+  if (Object.keys(set).length) await col.updateOne({ id }, { $set: set });
+  return stripId(await col.findOne({ id }));
 }
 
-/* ---------- Conversations — Google Sheet-এ স্থায়ীভাবে সেভ হয় (স্মৃতি হারায় না) ---------- */
-let convCache = {};
-
+/* ---------- Conversations ---------- */
 async function getConversation(customerId) {
-  if (convCache[customerId]) return convCache[customerId];
-
-  if (config.sheetScriptUrl) {
-    try {
-      const res = await postToScript({ token: config.sheetScriptToken, type: 'conversation_get', customerId });
-      const msgs = (res.data && res.data.messages) || [];
-      convCache[customerId] = msgs;
-      return msgs;
-    } catch (err) {
-      console.error('Google Sheet থেকে কথোপকথন আনতে ব্যর্থ:', err.message);
-    }
-  }
-
-  const db = readDb();
-  return (db.conversations && db.conversations[customerId]) || [];
+  const db = await getDb();
+  const doc = await db.collection('conversations').findOne({ customerId });
+  return (doc && doc.messages) || [];
 }
 
 async function appendMessage(customerId, role, text) {
+  const db = await getDb();
   const current = await getConversation(customerId);
-  // আগে শেষ ২০টা রাখা হতো, এখন ১৬টা — এতে প্রতিটা AI রিকোয়েস্টে কম টোকেন লাগে,
-  // রেট-লিমিটে ধাক্কা লাগার সম্ভাবনা কমে (কথোপকথনের সাম্প্রতিক প্রসঙ্গ ঠিকই থাকে)
+  // সাম্প্রতিক ১৬টা মেসেজ রাখি — এতে প্রতিটা AI রিকোয়েস্টে কম টোকেন লাগে
   const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-16);
-  convCache[customerId] = updated;
-
-  if (config.sheetScriptUrl) {
-    postToScript({ token: config.sheetScriptToken, type: 'conversation_save', customerId, messages: updated })
-      .catch(err => console.error('Google Sheet-এ কথোপকথন সেভ করতে ব্যর্থ:', err.message));
-  }
-
-  const db = readDb();
-  if (!db.conversations) db.conversations = {};
-  db.conversations[customerId] = updated;
-  writeDb(db);
+  await db.collection('conversations').updateOne(
+    { customerId },
+    { $set: { messages: updated } },
+    { upsert: true }
+  );
 }
 
 /* ---------- Orders ---------- */
-function createOrder({ customerId, name, phone, address, product, qty, price, email, source }) {
-  const db = readDb();
-  const id = 'ORD-' + String(db.nextOrderSeq).padStart(6, '0');
-  db.nextOrderSeq += 1;
+async function nextOrderId() {
+  const db = await getDb();
+  const result = await db.collection('counters').findOneAndUpdate(
+    { _id: 'orderSeq' },
+    { $inc: { value: 1 } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  const seq = (result && result.value && result.value.value) || 1;
+  return 'ORD-' + String(1000 + seq).padStart(6, '0');
+}
+
+async function createOrder({ customerId, name, phone, address, product, qty, price, email, source }) {
+  const db = await getDb();
+  const id = await nextOrderId();
   const order = {
     id, customerId, name,
     phone: phone || '',
     address: address || '',
-    email: email || '', // ঐচ্ছিক — কাস্টমার নিজে থেকে দিলে তবেই থাকবে
-    product,
-    qty: qty || 1, price: price || 0,
+    email: email || '',
+    product, qty: qty || 1, price: price || 0,
     status: 'Pending', source,
     createdAt: new Date().toISOString()
   };
-  db.orders.unshift(order);
-  const cust = db.customers.find(c => c.id === customerId);
-  if (cust) cust.orders += 1;
-  writeDb(db);
-  return order;
+  await db.collection('orders').insertOne(order);
+  await db.collection('customers').updateOne({ id: customerId }, { $inc: { orders: 1 } });
+  return stripId(order);
 }
 
-function getOrders() {
-  return readDb().orders;
+async function getOrders() {
+  const db = await getDb();
+  const list = await db.collection('orders').find().sort({ createdAt: -1 }).toArray();
+  return list.map(stripId);
 }
 
-function getOrdersByCustomer(customerId) {
-  return readDb().orders.filter(o => o.customerId === customerId);
+async function getOrdersByCustomer(customerId) {
+  const db = await getDb();
+  const list = await db.collection('orders').find({ customerId }).sort({ createdAt: -1 }).toArray();
+  return list.map(stripId);
 }
 
-// অর্ডার কনফার্ম হয়ে যাওয়ার পরে কাস্টমার আলাদাভাবে ইমেইল পাঠালে, তার সবচেয়ে সাম্প্রতিক
-// (এখনো ইমেইল যোগ হয়নি এমন) অর্ডারে সেটা জুড়ে দেয়
-function attachEmailToLatestOrder(customerId, email) {
-  const db = readDb();
-  const order = db.orders.find(o => o.customerId === customerId && !o.email);
+async function attachEmailToLatestOrder(customerId, email) {
+  const db = await getDb();
+  const col = db.collection('orders');
+  const order = await col.find({ customerId, $or: [{ email: '' }, { email: { $exists: false } }] })
+    .sort({ createdAt: -1 }).limit(1).next();
   if (!order) return null;
-  order.email = email;
-  writeDb(db);
-  return order;
+  await col.updateOne({ id: order.id }, { $set: { email } });
+  return stripId(await col.findOne({ id: order.id }));
 }
 
 /* ---------- বাইরের ওয়েবসাইট (Bazaar Admin) থেকে ওয়েবহুকের মাধ্যমে আসা অর্ডার ---------- */
-function createWebsiteOrder(payload = {}) {
-  const db = readDb();
-  const id = payload.orderId ? String(payload.orderId) : ('ORD-' + String(db.nextOrderSeq).padStart(6, '0'));
-  if (!payload.orderId) db.nextOrderSeq += 1;
+async function createWebsiteOrder(payload = {}) {
+  const db = await getDb();
+  const id = payload.orderId ? String(payload.orderId) : await nextOrderId();
 
   const items = Array.isArray(payload.items) ? payload.items : [];
   const productSummary = items.length
@@ -254,76 +191,72 @@ function createWebsiteOrder(payload = {}) {
 
   let customer = null;
   if (payload.phone) {
-    customer = db.customers.find(c => c.phone === payload.phone && c.platform === 'website');
+    const col = db.collection('customers');
+    customer = await col.findOne({ phone: payload.phone, platform: 'website' });
     if (!customer) {
+      const count = await col.countDocuments();
       customer = {
-        id: 'C-' + (1000 + db.customers.length + 1),
+        id: 'C-' + (1000 + count + 1),
         platform: 'website',
         platformId: payload.phone,
         name: payload.customer || 'ওয়েবসাইট কাস্টমার',
         phone: payload.phone,
         photoUrl: '',
-        orders: 0,
-        ai: true,
+        orders: 0, ai: true,
         createdAt: new Date().toISOString()
       };
-      db.customers.push(customer);
+      await col.insertOne(customer);
     }
-    customer.orders += 1;
+    await col.updateOne({ id: customer.id }, { $inc: { orders: 1 } });
   }
 
   const order = {
     id,
     customerId: customer ? customer.id : null,
     name: payload.customer || (customer ? customer.name : 'ওয়েবসাইট কাস্টমার'),
-    product: productSummary,
-    qty,
-    price,
-    status: 'Pending',
-    source: 'Bazaar Admin',
-    address: payload.address || '',
-    email: payload.email || '',
-    payment: payload.payment || '',
-    transactionId: payload.transactionId || '',
+    product: productSummary, qty, price,
+    status: 'Pending', source: 'Bazaar Admin',
+    address: payload.address || '', email: payload.email || '',
+    payment: payload.payment || '', transactionId: payload.transactionId || '',
     createdAt: payload.date ? new Date(payload.date).toISOString() : new Date().toISOString()
   };
-  db.orders.unshift(order);
-  writeDb(db);
-  return order;
+  await db.collection('orders').insertOne(order);
+  return stripId(order);
 }
 
-function updateOrderStatus(id, status) {
-  const db = readDb();
-  const o = db.orders.find(x => x.id === id);
-  if (!o) return null;
-  o.status = status;
-  writeDb(db);
-  return o;
+async function updateOrderStatus(id, status) {
+  const db = await getDb();
+  const col = db.collection('orders');
+  await col.updateOne({ id }, { $set: { status } });
+  return stripId(await col.findOne({ id }));
 }
 
 /* ---------- Broadcasts ---------- */
-function addBroadcast(record) {
-  const db = readDb();
-  db.broadcasts.unshift(record);
-  writeDb(db);
-  return record;
+async function addBroadcast(record) {
+  const db = await getDb();
+  const withDate = { ...record, createdAt: new Date().toISOString() };
+  await db.collection('broadcasts').insertOne(withDate);
+  return stripId(withDate);
 }
 
-function getBroadcasts() {
-  return readDb().broadcasts;
+async function getBroadcasts() {
+  const db = await getDb();
+  const list = await db.collection('broadcasts').find().sort({ createdAt: -1 }).toArray();
+  return list.map(stripId);
 }
 
-/* ---------- Email Logs (নতুন) — অর্ডার কনফার্মেশন ইমেইল কাকে পাঠানো হয়েছে তার হিস্টোরি ---------- */
-function addEmailLog(entry) {
-  const db = readDb();
-  db.emailLogs.unshift(entry);
-  db.emailLogs = db.emailLogs.slice(0, 200); // বেশি বড় না হয়ে যায়
-  writeDb(db);
-  return entry;
+/* ---------- Email Logs ---------- */
+async function addEmailLog(entry) {
+  const db = await getDb();
+  const withDate = { ...entry, createdAt: new Date().toISOString() };
+  await db.collection('emailLogs').insertOne(withDate);
+  return stripId(withDate);
 }
 
-function getEmailLogs() {
-  return readDb().emailLogs;
+async function getEmailLogs() {
+  const db = await getDb();
+  const list = await db.collection('emailLogs').find().sort({ createdAt: -1 }).limit(200).toArray();
+  return list.map(stripId);
 }
 
 module.exports = {
