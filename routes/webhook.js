@@ -22,7 +22,6 @@ async function withRetry(fn, retries = 1, delayMs = 1500) {
   }
 }
 
-// settings-এ প্রধান/ব্যাকআপ দুটো Key-এর মধ্যে যেটা নির্দিষ্ট কাজের (vision/voice) উপযোগী সেটা বেছে দেয়
 function pickCapableKey(settings, capableCheck) {
   if (settings.aiKey && capableCheck(settings.aiProvider)) return { apiKey: settings.aiKey, provider: settings.aiProvider };
   if (settings.aiKey2 && capableCheck(settings.aiProvider2)) return { apiKey: settings.aiKey2, provider: settings.aiProvider2 };
@@ -98,7 +97,7 @@ router.post('/whatsapp', async (req, res) => {
   const messages = value?.messages || [];
   if (!messages.length) return;
 
-  const settings = await store.getSettings(); // মিডিয়া ডাউনলোডে token লাগবে
+  const settings = await store.getSettings();
 
   for (const msg of messages) {
     const from = msg.from;
@@ -128,17 +127,16 @@ router.post('/whatsapp', async (req, res) => {
 
 async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer }) {
   const settings = await store.getSettings();
-  const customer = store.findOrCreateCustomer({ platform, platformId, name, phone });
+  const customer = await store.findOrCreateCustomer({ platform, platformId, name, phone });
 
-  // Facebook থেকে নাম ও প্রোফাইল ছবি টেনে আনি (WhatsApp-এ Meta প্রোফাইল ছবি দেয় না, এটা তাদের সীমাবদ্ধতা)
   if (platform === 'facebook' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
     const profile = await getFacebookProfile(platformId, settings.fbToken);
     if (profile.name || profile.photoUrl) {
-      store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
+      await store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
     }
   }
 
-  if (!customer.ai) return; // মানুষ নিজে হাতে চ্যাট করছেন (Customers ট্যাব থেকে AI বন্ধ করা)
+  if (!customer.ai) return;
   if (!settings.aiKey) {
     console.warn('AI API key সেট করা নেই — Settings থেকে বসান।');
     return;
@@ -160,7 +158,6 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     }
   };
 
-  /* ---- ভয়েস মেসেজ হলে আগে টেক্সটে রূপান্তর করি ---- */
   if (!text && audioBuffer) {
     const whisperKey = pickCapableKey(settings, isWhisperCapable);
     if (!whisperKey) {
@@ -180,7 +177,6 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     }
   }
 
-  /* ---- ছবি এলে (আর সাথে কোনো টেক্সট প্রশ্ন না থাকলে) প্রোডাক্ট মেলানোর চেষ্টা করি ---- */
   if (imageBuffer && !text) {
     await store.appendMessage(customer.id, 'user', '[ছবি পাঠিয়েছে]');
 
@@ -225,13 +221,11 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   await store.appendMessage(customer.id, 'assistant', reply);
   await send(reply, imageUrl);
 
-  // কাস্টমার আগে অর্ডার কনফার্ম করে ফেলার পর, এখন শুধু একটা ইমেইল ঠিকানা পাঠিয়েছে —
-  // সেটা সবচেয়ে সাম্প্রতিক (এখনো ইমেইলবিহীন) অর্ডারে জুড়ে দিয়ে কনফার্মেশন মেইল পাঠাই
   if (order && order.emailOnly && order.email) {
-    const updatedOrder = store.attachEmailToLatestOrder(customer.id, order.email);
+    const updatedOrder = await store.attachEmailToLatestOrder(customer.id, order.email);
     if (updatedOrder) {
       const result = await sendOrderConfirmationEmail({ to: order.email, order: updatedOrder });
-      store.addEmailLog({
+      await store.addEmailLog({
         to: order.email,
         orderId: updatedOrder.id,
         customerName: updatedOrder.name,
@@ -244,10 +238,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   }
 
   if (order && order.product) {
-    // সুরক্ষা: AI ভুল করে একই প্রোডাক্টের অর্ডার বারবার পাঠালেও (যেমন শুধু "সালাম" দিলে
-    // আগের কথোপকথন দেখে আবার অর্ডার বানিয়ে ফেলা), শেষ ১৫ মিনিটের মধ্যে এই কাস্টমারের
-    // একই প্রোডাক্টের অর্ডার আগে থেকে থাকলে নতুন করে ডুপ্লিকেট অর্ডার তৈরি করি না।
-    const recentOrders = store.getOrdersByCustomer(customer.id);
+    const recentOrders = await store.getOrdersByCustomer(customer.id);
     const fifteenMinAgo = Date.now() - 15 * 60 * 1000;
     const duplicate = recentOrders.find(o =>
       o.product === order.product && new Date(o.createdAt).getTime() > fifteenMinAgo
@@ -257,8 +248,6 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       return;
     }
 
-    // শিটে "Stock" কলাম থাকলে চেক করি — স্টক ০ বা কম হলে অর্ডার নেওয়া বন্ধ রাখি।
-    // কলাম না থাকলে (getProductStock null রিটার্ন করবে) চেক স্কিপ হয়ে যায়।
     const stock = await getProductStock(settings.sheetLink, order.product);
     if (stock !== null && stock <= 0) {
       const outOfStockMsg = `দুঃখিত, "${order.product}" এই মুহূর্তে স্টকে নেই। অন্য কোনো প্রোডাক্ট দেখতে চান?`;
@@ -268,9 +257,9 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     }
 
     if (order.name || order.phone) {
-      store.updateCustomerContact(customer.id, { name: order.name, phone: order.phone });
+      await store.updateCustomerContact(customer.id, { name: order.name, phone: order.phone });
     }
-    const savedOrder = store.createOrder({
+    const savedOrder = await store.createOrder({
       customerId: customer.id,
       name: order.name || customer.name,
       phone: order.phone || customer.phone || '',
@@ -282,17 +271,13 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       source: platform === 'facebook' ? 'Messenger' : 'WhatsApp'
     });
 
-    // দেদিকেটেড অর্ডার কনফার্মেশন মেসেজ — AI-এর রিপ্লাই ছাড়াও আলাদাভাবে পাঠানো হয়।
-    // এটা conversation history-তেও যোগ করি, যাতে AI নিজের "কনফার্ম করেছি" এই তথ্য
-    // পরবর্তী মেসেজগুলোতে মনে রাখে এবং আবার নতুন অর্ডার বানিয়ে না ফেলে।
     const confirmationText = buildConfirmationText(savedOrder);
     await store.appendMessage(customer.id, 'assistant', confirmationText);
     await send(confirmationText);
 
-    // কাস্টমার ইমেইল দিয়ে থাকলে (এবং Render-এ EMAIL_USER/EMAIL_PASS সেট থাকলে) ইমেইলেও কনফার্মেশন
     if (savedOrder.email) {
       const result = await sendOrderConfirmationEmail({ to: savedOrder.email, order: savedOrder });
-      store.addEmailLog({
+      await store.addEmailLog({
         to: savedOrder.email,
         orderId: savedOrder.id,
         customerName: savedOrder.name,
@@ -303,7 +288,8 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     }
 
     if (config.sheetScriptUrl) {
-      const updatedCustomer = store.getCustomers().find(c => c.id === customer.id) || customer;
+      const customers = await store.getCustomers();
+      const updatedCustomer = customers.find(c => c.id === customer.id) || customer;
       writeOrderToSheet({ scriptUrl: config.sheetScriptUrl, scriptToken: config.sheetScriptToken, order: savedOrder });
       writeCustomerToSheet({ scriptUrl: config.sheetScriptUrl, scriptToken: config.sheetScriptToken, customer: updatedCustomer });
     }
@@ -314,7 +300,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
 
 router.post('/order', async (req, res) => {
   try {
-    const order = store.createWebsiteOrder(req.body || {});
+    const order = await store.createWebsiteOrder(req.body || {});
     res.json({ ok: true, orderId: order.id });
   } catch (err) {
     console.error('Order webhook error:', err.message);
@@ -330,18 +316,18 @@ router.post('/ai-reply', async (req, res) => {
 
     const visitorName = body.name || body.customerName || body.visitorName || body.userName || '';
     const visitorPhone = body.phone || body.customerPhone || body.visitorPhone || body.mobile || body.number || '';
-    const visitorEmail = body.customerEmail || body.email || '';
 
     if (visitorPhone) {
-      const customer = store.findOrCreateCustomer({
+      const customer = await store.findOrCreateCustomer({
         platform: 'website',
         platformId: visitorPhone,
         name: visitorName || 'ওয়েবসাইট কাস্টমার',
         phone: visitorPhone
       });
-      if (visitorName) store.updateCustomerContact(customer.id, { name: visitorName, phone: visitorPhone });
+      if (visitorName) await store.updateCustomerContact(customer.id, { name: visitorName, phone: visitorPhone });
       if (config.sheetScriptUrl) {
-        const updatedCustomer = store.getCustomers().find(c => c.id === customer.id) || customer;
+        const customers = await store.getCustomers();
+        const updatedCustomer = customers.find(c => c.id === customer.id) || customer;
         writeCustomerToSheet({ scriptUrl: config.sheetScriptUrl, scriptToken: config.sheetScriptToken, customer: updatedCustomer });
       }
     }
@@ -356,16 +342,11 @@ router.post('/ai-reply', async (req, res) => {
       return res.status(400).json({ error: 'message খালি' });
     }
 
-    // Bazaar Admin (ওয়েবসাইট চ্যাট) প্রতিবার পুরো কথোপকথনের হিস্টোরি পাঠায় (from: customer/admin/ai/system),
-    // যেটা আগে সম্পূর্ণ উপেক্ষা করা হতো — ফলে AI প্রতিটা মেসেজে আগের কথা ভুলে যেত।
-    // এখন সেটা আমাদের নিজস্ব ফরম্যাটে (role: user/assistant) রূপান্তর করে প্রসঙ্গ হিসেবে ব্যবহার করছি।
     const rawHistory = Array.isArray(body.history) ? body.history : [];
     let history = rawHistory
       .filter(m => m && (m.from === 'customer' || m.from === 'ai' || m.from === 'admin') && m.text)
       .map(m => ({ role: m.from === 'customer' ? 'user' : 'assistant', text: m.text }))
       .slice(-16);
-    // Bazaar সাধারণত বর্তমান মেসেজটাও history-এর শেষে যোগ করে রাখে — সেটা ডুপ্লিকেট হয়ে
-    // যাওয়া ঠেকাতে বাদ দিচ্ছি (আসল মেসেজটা এমনিতেই customerMessage হিসেবে যাচ্ছে)
     if (history.length && history[history.length - 1].role === 'user' && history[history.length - 1].text === message) {
       history = history.slice(0, -1);
     }
