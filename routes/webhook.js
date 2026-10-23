@@ -213,9 +213,10 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, text);
   const fullHistory = await store.getConversation(customer.id);
   const history = fullHistory.slice(0, -1);
+  const ownerRules = (await store.getAiRules()).map(r => r.text);
 
   const { reply, imageUrl, order } = await getAIReplyWithFallback({
-    settings, customerMessage: text, history, sheetContext, businessInfo
+    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules
   });
 
   await store.appendMessage(customer.id, 'assistant', reply);
@@ -352,8 +353,9 @@ router.post('/ai-reply', async (req, res) => {
     }
 
     const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, message);
+    const ownerRules = (await store.getAiRules()).map(r => r.text);
     const { reply } = await getAIReplyWithFallback({
-      settings, customerMessage: message, history, sheetContext, businessInfo
+      settings, customerMessage: message, history, sheetContext, businessInfo, ownerRules
     });
 
     res.json({ reply });
