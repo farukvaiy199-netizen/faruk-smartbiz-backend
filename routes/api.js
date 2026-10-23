@@ -6,6 +6,7 @@ const config = require('../config');
 const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
+const { getOwnerChatReply } = require('../services/ai');
 
 // বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে
 function bdDateString(d) {
@@ -148,6 +149,48 @@ router.post('/broadcast', async (req, res) => {
 
 router.get('/broadcast', async (req, res) => {
   res.json(await store.getBroadcasts());
+});
+
+/* ---------- AI নির্দেশনা — মালিক অ্যাপ থেকে AI-কে শেখান (নতুন) ---------- */
+const MAX_AI_RULES = 40;
+
+router.get('/ai-rules', async (req, res) => {
+  res.json(await store.getAiRules());
+});
+
+router.post('/ai-rules/chat', async (req, res) => {
+  const message = (req.body.message || '').toString().trim().slice(0, 600);
+  if (!message) return res.status(400).json({ error: 'মেসেজ খালি' });
+
+  const settings = await store.getSettings();
+  if (!settings.aiKey) return res.status(400).json({ error: 'আগে Settings-এ AI Key সংযুক্ত করুন' });
+
+  const rules = await store.getAiRules();
+  const history = (Array.isArray(req.body.history) ? req.body.history : [])
+    .filter(m => m && (m.role === 'user' || m.role === 'assistant') && m.text)
+    .slice(-6)
+    .map(m => ({ role: m.role, text: String(m.text).slice(0, 600) }));
+
+  try {
+    const { reply, rule } = await getOwnerChatReply({ settings, message, history, rules });
+    let saved = null;
+    if (rule && String(rule).trim()) {
+      if (rules.length >= MAX_AI_RULES) {
+        return res.json({ reply: `নির্দেশনার সংখ্যা ${MAX_AI_RULES}-এ পৌঁছে গেছে। আগে তালিকা থেকে কিছু মুছে দিন, তারপর নতুনটা বলুন।`, saved: null });
+      }
+      saved = await store.addAiRule(String(rule).trim().slice(0, 400));
+    }
+    res.json({ reply, saved });
+  } catch (err) {
+    console.error('ai-rules chat error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
+    res.status(500).json({ error: 'AI এই মুহূর্তে উত্তর দিতে পারছে না (কোটা শেষ হতে পারে) — একটু পরে আবার চেষ্টা করুন' });
+  }
+});
+
+router.delete('/ai-rules/:id', async (req, res) => {
+  const ok = await store.deleteAiRule(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'নির্দেশনাটা পাওয়া যায়নি' });
+  res.json({ ok: true });
 });
 
 /* ---------- Email Logs ---------- */
