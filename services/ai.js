@@ -23,12 +23,19 @@ function isVisionCapable(provider) {
  * কাস্টমারের মেসেজ পড়ে AI দিয়ে রিপ্লাই বানায়।
  * AI কে বলা হয় JSON আকারে ফেরত দিতে: { reply, order }
  */
-async function getAIReply({ apiKey, provider = 'groq', customerMessage, history = [], sheetContext = '', businessInfo = '' }) {
+async function getAIReply({ apiKey, provider = 'groq', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [] }) {
+  // দোকান মালিক অ্যাপের "AI শেখান" ট্যাব থেকে যেসব নির্দেশনা দিয়েছেন — সর্বোচ্চ অগ্রাধিকার
+  const rulesBlock = ownerRules.length
+    ? `\n=== দোকান মালিকের সরাসরি নির্দেশনা (সর্বোচ্চ অগ্রাধিকার) ===\nনিচের নির্দেশনাগুলো দোকান মালিক নিজে দিয়েছেন। এগুলো শিটের তথ্য এবং আগের কথোপকথনে দেওয়া পুরনো উত্তরের চেয়েও বেশি গুরুত্বপূর্ণ — কোনো বিরোধ থাকলে এগুলোই মানবে:\n${ownerRules.map((r, i) => `${i + 1}) ${r}`).join('\n')}\n`
+    : '';
   const systemPrompt = `
 তুমি "Faruk's SmartBiz" নামের একটা অনলাইন দোকানের কাস্টমার সাপোর্ট সহকারী।
 বাংলায়, সংক্ষেপে উত্তর দাও।
 ${businessInfo ? 'দোকানের তথ্য:\n' + businessInfo : ''}
 ${sheetContext ? sheetContext : ''}
+${rulesBlock}
+=== স্টক ও প্রাপ্যতা ===
+কোনো প্রোডাক্ট আছে কি নেই — এটা শুধু বর্তমান শিটের তথ্য আর মালিকের নির্দেশনা দেখে বলবে। আগের কথোপকথনে তুমি বা অন্য কেউ "স্টকে নেই" বলে থাকলেও সেটা পুরনো হতে পারে, তাই সেটার উপর ভরসা করে আবার "নেই" বলবে না।
 
 === ব্যবহার ও ভদ্রতা ===
 - সবসময় নম্র, ভদ্র ও আন্তরিকভাবে কথা বলবে, কখনো রূঢ় বা তাড়াহুড়ার সুরে না।
@@ -113,18 +120,18 @@ ${sheetContext ? sheetContext : ''}
 }
 
 // প্রধান AI Key ব্যর্থ হলে (rate limit/quota/এরর) স্বয়ংক্রিয়ভাবে ব্যাকআপ Key দিয়ে আবার চেষ্টা করে
-async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo }) {
+async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [] }) {
   try {
     return await getAIReply({
       apiKey: settings.aiKey, provider: settings.aiProvider,
-      customerMessage, history, sheetContext, businessInfo
+      customerMessage, history, sheetContext, businessInfo, ownerRules
     });
   } catch (err) {
     if (settings.aiKey2 && settings.aiProvider2) {
       console.warn('প্রধান AI Key ব্যর্থ হয়েছে, ব্যাকআপ Key দিয়ে আবার চেষ্টা করা হচ্ছে:', err.message);
       return await getAIReply({
         apiKey: settings.aiKey2, provider: settings.aiProvider2,
-        customerMessage, history, sheetContext, businessInfo
+        customerMessage, history, sheetContext, businessInfo, ownerRules
       });
     }
     throw err;
@@ -252,8 +259,40 @@ function parseAIJson(raw) {
   return {
     reply: parsed.reply || 'দুঃখিত, একটু পরে আবার চেষ্টা করুন।',
     imageUrl: parsed.imageUrl || null,
-    order: parsed.order || null
+    order: parsed.order || null,
+    rule: parsed.rule || null
   };
 }
 
-module.exports = { getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable };
+/* ---------- মালিকের সাথে কথা বলে নির্দেশনা শেখা (নতুন) ---------- */
+async function getOwnerChatReply({ settings, message, history = [], rules = [] }) {
+  const systemPrompt = `
+তুমি "Faruk's SmartBiz"-এর সহকারী। এখন যিনি কথা বলছেন তিনি দোকানের মালিক, কাস্টমার না।
+মালিক তোমাকে শেখাচ্ছেন কাস্টমারদের সাথে কথা বলার সময় কী করতে বা বলতে হবে — যেমন কোন প্রোডাক্ট এখন স্টকে আছে বা নেই, নির্দিষ্ট প্রশ্নের কী জবাব দেবে, অফার, ডেলিভারির নিয়ম ইত্যাদি।
+
+এখন পর্যন্ত সংরক্ষিত নির্দেশনা:
+${rules.length ? rules.map((r, i) => `${i + 1}) ${r.text}`).join('\n') : '(এখনো কোনোটা নেই)'}
+
+তোমার কাজ:
+- মালিকের মেসেজে নতুন নির্দেশনা বা তথ্য থাকলে সেটাকে পরিষ্কার, সংক্ষিপ্ত একটা নিয়ম হিসেবে বাংলায় লিখে "rule"-এ দাও, যেন কাস্টমারের সাথে কথা বলার সময় AI সরাসরি মানতে পারে (যেমন: "পিউর সুন্দরবন মধু ১কেজি এখন স্টকে আছে, কাস্টমার চাইলে অর্ডার নিন")। মালিক যা বলেননি তা যোগ করবে না, দাম বা সংখ্যা নিজে থেকে বানাবে না।
+- "reply"-তে মালিককে সংক্ষেপে জানাও কী সংরক্ষণ করলে।
+- মেসেজ অস্পষ্ট হলে, শুধু প্রশ্ন হলে, বা নির্দেশনা না হয়ে সাধারণ কথা হলে "rule" null রাখো এবং "reply"-তে ভদ্রভাবে উত্তর দাও বা স্পষ্ট করে জিজ্ঞেস করো।
+- মালিক আগের কোনো নির্দেশনা বদলাতে বা বাতিল করতে চাইলে তুমি নিজে মুছতে পারো না। "reply"-তে বলো নিচের তালিকায় ওটার পাশের "মুছুন" বাটনে চাপতে, তারপর নতুনটা বলতে। এ ক্ষেত্রে "rule" null।
+
+শুধুমাত্র এই JSON ফরম্যাটে উত্তর দাও: {"reply": "মালিককে বলার কথা", "rule": null অথবা "সংরক্ষণের নিয়ম"}
+`.trim();
+
+  const run = (apiKey, provider) => provider === 'gemini'
+    ? getGeminiReply({ apiKey, systemPrompt, customerMessage: message, history })
+    : getOpenAiCompatibleReply({ apiKey, provider, systemPrompt, customerMessage: message, history });
+
+  try {
+    return await run(settings.aiKey, settings.aiProvider);
+  } catch (err) {
+    if (settings.aiKey2 && settings.aiProvider2) return await run(settings.aiKey2, settings.aiProvider2);
+    throw err;
+  }
+}
+
+module.exports = { getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply };
+
