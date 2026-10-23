@@ -259,11 +259,36 @@ async function getEmailLogs() {
   return list.map(stripId);
 }
 
+/* ---------- মালিকের AI নির্দেশনা (নতুন) ---------- */
+async function getAiRules() {
+  const db = await getDb();
+  const list = await db.collection('aiRules').find().sort({ createdAt: 1 }).toArray();
+  return list.map(stripId);
+}
+
+async function addAiRule(text) {
+  const db = await getDb();
+  const rule = {
+    id: 'R-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    text,
+    createdAt: new Date().toISOString()
+  };
+  await db.collection('aiRules').insertOne(rule);
+  return stripId(rule);
+}
+
+async function deleteAiRule(id) {
+  const db = await getDb();
+  const r = await db.collection('aiRules').deleteOne({ id });
+  return r.deletedCount > 0;
+}
+
 module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
   createOrder, createWebsiteOrder, getOrders, getOrdersByCustomer, updateOrderStatus, attachEmailToLatestOrder,
   addBroadcast, getBroadcasts,
-  addEmailLog, getEmailLogs
+  addEmailLog, getEmailLogs,
+  getAiRules, addAiRule, deleteAiRule
 };
