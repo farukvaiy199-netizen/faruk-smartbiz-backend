@@ -29,5 +29,9 @@ module.exports = {
   // ============ স্থায়ী ডেটাবেস (নতুন) ============
   // Render-এর ফ্রি সার্ভিসে লোকাল ফাইল প্রতি ডিপ্লয়ে মুছে যায় — তাই অর্ডার/কাস্টমার/কথোপকথন
   // এখন MongoDB-তে স্থায়ীভাবে সেভ হয়, redeploy হলেও আর হারাবে না।
-  mongoUri: process.env.MONGO_URI || ''
+  mongoUri: process.env.MONGO_URI || '',
+
+  // এই সার্ভারের পাবলিক ঠিকানা — মালিকের আপলোড করা ছবি Messenger/WhatsApp-এ পাঠানোর সময় এই লিংক দিয়ে পাঠানো হয়
+  // (Render নিজেই RENDER_EXTERNAL_URL সেট করে দেয়, তাই আলাদা কিছু বসাতে হবে না)
+  publicUrl: (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://faruk-smartbiz-backend-1.onrender.com').replace(/\/+$/, '')
 };
