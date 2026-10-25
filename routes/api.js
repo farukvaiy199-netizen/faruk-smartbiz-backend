@@ -153,17 +153,33 @@ router.get('/broadcast', async (req, res) => {
 
 /* ---------- AI নির্দেশনা — মালিক অ্যাপ থেকে AI-কে শেখান (নতুন) ---------- */
 const MAX_AI_RULES = 40;
+const MAX_AI_IMAGES = 30;
 
 router.get('/ai-rules', async (req, res) => {
   res.json(await store.getAiRules());
 });
 
 router.post('/ai-rules/chat', async (req, res) => {
-  const message = (req.body.message || '').toString().trim().slice(0, 600);
-  if (!message) return res.status(400).json({ error: 'মেসেজ খালি' });
+  const imageData = typeof req.body.imageData === 'string' ? req.body.imageData : '';
+  let message = (req.body.message || '').toString().trim().slice(0, 600);
+  if (!message && !imageData) return res.status(400).json({ error: 'মেসেজ খালি' });
+  if (!message) message = 'এই ছবিটা সংরক্ষণ করো।';
 
   const settings = await store.getSettings();
   if (!settings.aiKey) return res.status(400).json({ error: 'আগে Settings-এ AI Key সংযুক্ত করুন' });
+
+  // ছবি থাকলে আগেই যাচাই: ফরম্যাট, সাইজ, সর্বোচ্চ সংখ্যা
+  let image = null;
+  if (imageData) {
+    const m = imageData.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/);
+    if (!m) return res.status(400).json({ error: 'ছবির ফরম্যাট সঠিক না (JPG/PNG/WEBP দিন)' });
+    if (m[2].length > 1200000) return res.status(400).json({ error: 'ছবিটা অনেক বড়, ছোট করে দিন' });
+    const existing = await store.getAiImages();
+    if (existing.length >= MAX_AI_IMAGES) {
+      return res.json({ reply: `ছবির সংখ্যা ${MAX_AI_IMAGES}-এ পৌঁছে গেছে। আগে তালিকা থেকে কিছু মুছে দিন।`, saved: null, savedImage: null });
+    }
+    image = { mime: m[1], b64: m[2] };
+  }
 
   const rules = await store.getAiRules();
   const history = (Array.isArray(req.body.history) ? req.body.history : [])
@@ -172,15 +188,20 @@ router.post('/ai-rules/chat', async (req, res) => {
     .map(m => ({ role: m.role, text: String(m.text).slice(0, 600) }));
 
   try {
-    const { reply, rule } = await getOwnerChatReply({ settings, message, history, rules });
-    let saved = null;
+    const { reply, rule, imageLabel } = await getOwnerChatReply({ settings, message, history, rules, hasImage: !!image });
+    let saved = null, savedImage = null;
+
     if (rule && String(rule).trim()) {
       if (rules.length >= MAX_AI_RULES) {
-        return res.json({ reply: `নির্দেশনার সংখ্যা ${MAX_AI_RULES}-এ পৌঁছে গেছে। আগে তালিকা থেকে কিছু মুছে দিন, তারপর নতুনটা বলুন।`, saved: null });
+        return res.json({ reply: `নির্দেশনার সংখ্যা ${MAX_AI_RULES}-এ পৌঁছে গেছে। আগে তালিকা থেকে কিছু মুছে দিন, তারপর নতুনটা বলুন।`, saved: null, savedImage: null });
       }
       saved = await store.addAiRule(String(rule).trim().slice(0, 400));
     }
-    res.json({ reply, saved });
+    if (image && imageLabel && String(imageLabel).trim()) {
+      savedImage = await store.addAiImage({ label: String(imageLabel).trim().slice(0, 120), mime: image.mime, b64: image.b64 });
+      savedImage.url = `${config.publicUrl}/media/${savedImage.id}`;
+    }
+    res.json({ reply, saved, savedImage });
   } catch (err) {
     console.error('ai-rules chat error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
     res.status(500).json({ error: 'AI এই মুহূর্তে উত্তর দিতে পারছে না (কোটা শেষ হতে পারে) — একটু পরে আবার চেষ্টা করুন' });
@@ -191,6 +212,29 @@ router.delete('/ai-rules/:id', async (req, res) => {
   const ok = await store.deleteAiRule(req.params.id);
   if (!ok) return res.status(404).json({ error: 'নির্দেশনাটা পাওয়া যায়নি' });
   res.json({ ok: true });
+});
+
+router.get('/ai-images', async (req, res) => {
+  const list = await store.getAiImages();
+  res.json(list.map(i => ({ ...i, url: `${config.publicUrl}/media/${i.id}` })));
+});
+
+router.delete('/ai-images/:id', async (req, res) => {
+  const ok = await store.deleteAiImage(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'ছবিটা পাওয়া যায়নি' });
+  res.json({ ok: true });
+});
+
+/* ---------- AI ব্যবহার (টোকেন/অনুরোধ) (নতুন) ---------- */
+router.get('/ai-usage', async (req, res) => {
+  const settings = await store.getSettings();
+  const usage = await store.getAiUsage();
+  res.json({
+    ...usage,
+    limits: settings.aiLimits || {},
+    primary: settings.aiKey ? settings.aiProvider : null,
+    backup: settings.aiKey2 ? settings.aiProvider2 : null
+  });
 });
 
 /* ---------- Email Logs ---------- */
