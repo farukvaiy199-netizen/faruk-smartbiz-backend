@@ -14,7 +14,8 @@ const app = express();
 // express-rate-limit সব রিকোয়েস্টকে ভুল করে একই ব্যবহারকারীর ধরে নিয়ে সবাইকে ব্লক করে দেয়।
 app.set('trust proxy', 1);
 app.use(cors());
-app.use(express.json());
+// ডিফল্ট সীমা মাত্র ১০০KB — মালিকের আপলোড করা ছবি (ডেটা হিসেবে) এর চেয়ে বড় হয়, তাই ২MB করা হলো
+app.use(express.json({ limit: '2mb' }));
 
 app.get('/', (req, res) => {
   res.send('Faruk\'s SmartBiz backend চলছে ✅');
