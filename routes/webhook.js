@@ -54,10 +54,12 @@ router.post('/facebook', async (req, res) => {
       const senderId = event.sender?.id;
       const msg = event.message;
       if (!senderId || !msg) continue;
+      if (msg.is_echo) continue; // পেজ নিজে যে মেসেজ পাঠিয়েছে তার প্রতিধ্বনি — কাস্টমার না
       try {
         const text = msg.text;
         const attachments = msg.attachments || [];
-        const imageAttachment = attachments.find(a => a.type === 'image');
+        // স্টিকার/লাইক বাটনও image হিসেবে আসে — এগুলো আসল ছবি না, তাই বাদ
+        const imageAttachment = attachments.find(a => a.type === 'image' && !(a.payload && a.payload.sticker_id));
         const audioAttachment = attachments.find(a => a.type === 'audio');
 
         let imageBuffer = null, imageMime = null, audioBuffer = null;
@@ -69,7 +71,11 @@ router.post('/facebook', async (req, res) => {
           audioBuffer = await downloadMedia(audioAttachment.payload.url);
         }
 
-        if (!text && !imageBuffer && !audioBuffer) continue;
+        if (!text && !imageBuffer && !audioBuffer) {
+          // বোঝার মতো কিছু নেই (স্টিকার, লাইক, ভিডিও ইত্যাদি) — তবু কাস্টমারকে তালিকায় রাখি
+          await ensureCustomer({ platform: 'facebook', platformId: senderId });
+          continue;
+        }
 
         await handleIncomingMessage({ platform: 'facebook', platformId: senderId, text, imageBuffer, imageMime, audioBuffer });
       } catch (err) {
@@ -114,7 +120,11 @@ router.post('/whatsapp', async (req, res) => {
         audioBuffer = media.buffer;
       }
 
-      if (!from || (!text && !imageBuffer && !audioBuffer)) continue;
+      if (!from) continue;
+      if (!text && !imageBuffer && !audioBuffer) {
+        await ensureCustomer({ platform: 'whatsapp', platformId: from, name, phone: from });
+        continue;
+      }
 
       await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from, imageBuffer, imageMime, audioBuffer });
     } catch (err) {
@@ -125,7 +135,9 @@ router.post('/whatsapp', async (req, res) => {
 
 /* =============== SHARED HANDLER =============== */
 
-async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer }) {
+// যেকোনো ধরনের মেসেজ (স্টিকার, লাইক, ভিডিও ইত্যাদিও) এলে কাস্টমারকে তালিকায় যোগ করি,
+// আর Facebook হলে নাম/ছবি আনার চেষ্টা করি
+async function ensureCustomer({ platform, platformId, name, phone }) {
   const settings = await store.getSettings();
   const customer = await store.findOrCreateCustomer({ platform, platformId, name, phone });
 
@@ -135,6 +147,11 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       await store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
     }
   }
+  return { settings, customer };
+}
+
+async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer }) {
+  const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone });
 
   if (!customer.ai) return;
   if (!settings.aiKey) {
@@ -214,13 +231,20 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const fullHistory = await store.getConversation(customer.id);
   const history = fullHistory.slice(0, -1);
   const ownerRules = (await store.getAiRules()).map(r => r.text);
+  const ownerImages = await store.getAiImages();
 
-  const { reply, imageUrl, order } = await getAIReplyWithFallback({
-    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules
+  const { reply, imageUrl, imageId, order } = await getAIReplyWithFallback({
+    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages
   });
 
+  // মালিকের আপলোড করা ছবি থাকলে সেটাকেই অগ্রাধিকার; না থাকলে শিটের ছবির লিংক
+  let finalImageUrl = imageUrl;
+  if (imageId && ownerImages.some(i => i.id === imageId)) {
+    finalImageUrl = `${config.publicUrl}/media/${imageId}`;
+  }
+
   await store.appendMessage(customer.id, 'assistant', reply);
-  await send(reply, imageUrl);
+  await send(reply, finalImageUrl);
 
   if (order && order.emailOnly && order.email) {
     const updatedOrder = await store.attachEmailToLatestOrder(customer.id, order.email);
