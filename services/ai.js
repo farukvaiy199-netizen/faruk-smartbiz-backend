@@ -1,4 +1,40 @@
 const axios = require('axios');
+const store = require('./store');
+
+// প্রতিটা সফল AI কলের টোকেন ও অনুরোধ সংখ্যা গুনে রাখি, আর কোটা/অথ এরর হলে সেটাও মনে রাখি —
+// ড্যাশবোর্ডের "AI" ট্যাবে এগুলো দেখানো হয়
+function trackUsage(provider, tokens, headers) {
+  store.addAiUsage(provider, tokens).catch(() => {});
+  if (headers) {
+    const rate = {};
+    ['x-ratelimit-remaining-requests', 'x-ratelimit-limit-requests', 'x-ratelimit-remaining-tokens', 'x-ratelimit-limit-tokens']
+      .forEach(k => { if (headers[k] !== undefined) rate[k] = String(headers[k]); });
+    if (Object.keys(rate).length) store.setAiRateInfo(provider, rate).catch(() => {});
+  }
+}
+
+function trackError(provider, err) {
+  const status = err.response && err.response.status;
+  if (status === 429 || status === 402 || status === 401 || status === 403) {
+    const e = err.response.data && err.response.data.error;
+    const msg = (e && (e.message || (typeof e === 'string' ? e : JSON.stringify(e)))) || err.message;
+    store.setAiLastError(provider, `${status}: ${msg}`).catch(() => {});
+  }
+}
+
+async function postTracked(provider, url, body, cfg) {
+  let res;
+  try {
+    res = await axios.post(url, body, cfg);
+  } catch (err) {
+    trackError(provider, err);
+    throw err;
+  }
+  const d = res.data || {};
+  const tokens = (d.usage && d.usage.total_tokens) || (d.usageMetadata && d.usageMetadata.totalTokenCount) || 0;
+  trackUsage(provider, tokens, res.headers);
+  return res;
+}
 
 const ENDPOINTS = {
   groq: 'https://api.groq.com/openai/v1/chat/completions',
@@ -23,17 +59,21 @@ function isVisionCapable(provider) {
  * কাস্টমারের মেসেজ পড়ে AI দিয়ে রিপ্লাই বানায়।
  * AI কে বলা হয় JSON আকারে ফেরত দিতে: { reply, order }
  */
-async function getAIReply({ apiKey, provider = 'groq', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [] }) {
+async function getAIReply({ apiKey, provider = 'groq', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [] }) {
   // দোকান মালিক অ্যাপের "AI শেখান" ট্যাব থেকে যেসব নির্দেশনা দিয়েছেন — সর্বোচ্চ অগ্রাধিকার
   const rulesBlock = ownerRules.length
     ? `\n=== দোকান মালিকের সরাসরি নির্দেশনা (সর্বোচ্চ অগ্রাধিকার) ===\nনিচের নির্দেশনাগুলো দোকান মালিক নিজে দিয়েছেন। এগুলো শিটের তথ্য এবং আগের কথোপকথনে দেওয়া পুরনো উত্তরের চেয়েও বেশি গুরুত্বপূর্ণ — কোনো বিরোধ থাকলে এগুলোই মানবে:\n${ownerRules.map((r, i) => `${i + 1}) ${r}`).join('\n')}\n`
+    : '';
+  // মালিক যেসব প্রোডাক্টের ছবি আপলোড করেছেন — কাস্টমার ছবি চাইলে এখান থেকে পাঠানো হবে
+  const imagesBlock = ownerImages.length
+    ? `\n=== মালিকের আপলোড করা প্রোডাক্ট ছবি ===\nকাস্টমার কোনো প্রোডাক্টের ছবি দেখতে চাইলে নিচের তালিকায় মিল থাকলে সেই ছবির ID "imageId"-তে বসাবে। ছবি সিস্টেম নিজেই পাঠিয়ে দেবে, তুমি কোনো লিংক বানাবে না:\n${ownerImages.map(i => `- ID: ${i.id} → ${i.label}`).join('\n')}\n`
     : '';
   const systemPrompt = `
 তুমি "Faruk's SmartBiz" নামের একটা অনলাইন দোকানের কাস্টমার সাপোর্ট সহকারী।
 বাংলায়, সংক্ষেপে উত্তর দাও।
 ${businessInfo ? 'দোকানের তথ্য:\n' + businessInfo : ''}
 ${sheetContext ? sheetContext : ''}
-${rulesBlock}
+${rulesBlock}${imagesBlock}
 === স্টক ও প্রাপ্যতা ===
 কোনো প্রোডাক্ট আছে কি নেই — এটা শুধু বর্তমান শিটের তথ্য আর মালিকের নির্দেশনা দেখে বলবে। আগের কথোপকথনে তুমি বা অন্য কেউ "স্টকে নেই" বলে থাকলেও সেটা পুরনো হতে পারে, তাই সেটার উপর ভরসা করে আবার "নেই" বলবে না।
 
@@ -90,7 +130,7 @@ ${rulesBlock}
    {"emailOnly": true, "email": "সেই ইমেইল হুবহু"} বসাবে।
 
 === প্রোডাক্টের ছবি পাঠানো ===
-কাস্টমার প্রোডাক্টের ছবি চাইলে, শিটের তথ্যে সেই প্রোডাক্টের সারিতে ছবি-সংক্রান্ত কলামে
+কাস্টমার প্রোডাক্টের ছবি চাইলে, প্রথমে মালিকের আপলোড করা ছবির তালিকা (থাকলে) দেখবে — মিল পেলে "imageId" বসাবে। না পেলে শিটের তথ্যে সেই প্রোডাক্টের সারিতে ছবি-সংক্রান্ত কলামে
 (নামে "image"/"photo"/"picture"/"ছবি" থাকা যেকোনো কলাম) লিংক থাকলে হুবহু কপি করে
 "imageUrl" এ বসাবে। নিজে থেকে লিংক বানাবে না। না পেলে "imageUrl" null রেখে ভদ্রভাবে জানাবে।
 
@@ -98,6 +138,7 @@ ${rulesBlock}
 {
   "reply": "কাস্টমারকে পাঠানোর মেসেজ",
   "imageUrl": null অথবা "শিট থেকে পাওয়া হুবহু ছবির লিংক",
+  "imageId": null অথবা "মালিকের ছবির তালিকা থেকে হুবহু ID",
   "order": null, অথবা {
     "name": "কাস্টমার হুবহু যা লিখেছে",
     "phone": "কাস্টমার হুবহু যা লিখেছে",
@@ -120,18 +161,18 @@ ${rulesBlock}
 }
 
 // প্রধান AI Key ব্যর্থ হলে (rate limit/quota/এরর) স্বয়ংক্রিয়ভাবে ব্যাকআপ Key দিয়ে আবার চেষ্টা করে
-async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [] }) {
+async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [] }) {
   try {
     return await getAIReply({
       apiKey: settings.aiKey, provider: settings.aiProvider,
-      customerMessage, history, sheetContext, businessInfo, ownerRules
+      customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages
     });
   } catch (err) {
     if (settings.aiKey2 && settings.aiProvider2) {
       console.warn('প্রধান AI Key ব্যর্থ হয়েছে, ব্যাকআপ Key দিয়ে আবার চেষ্টা করা হচ্ছে:', err.message);
       return await getAIReply({
         apiKey: settings.aiKey2, provider: settings.aiProvider2,
-        customerMessage, history, sheetContext, businessInfo, ownerRules
+        customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages
       });
     }
     throw err;
@@ -160,7 +201,7 @@ ${sheetContext || 'দোকানের কোনো প্রোডাক্�
   if (provider === 'gemini') {
     const model = MODELS.gemini;
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const res = await axios.post(endpoint, {
+    const res = await postTracked('gemini', endpoint, {
       contents: [{
         role: 'user',
         parts: [
@@ -176,7 +217,7 @@ ${sheetContext || 'দোকানের কোনো প্রোডাক্�
 
   const endpoint = ENDPOINTS[provider] || ENDPOINTS.openai;
   const model = provider === 'openrouter' ? MODELS.openrouter : MODELS.openai;
-  const res = await axios.post(endpoint, {
+  const res = await postTracked(provider, endpoint, {
     model,
     messages: [
       { role: 'system', content: visionPrompt },
@@ -212,7 +253,7 @@ async function getOpenAiCompatibleReply({ apiKey, provider, systemPrompt, custom
     headers['X-Title'] = "Faruk's SmartBiz";
   }
 
-  const res = await axios.post(
+  const res = await postTracked(provider, 
     endpoint,
     { model, messages, temperature: 0.15, response_format: { type: 'json_object' } },
     { headers, timeout: 15000 }
@@ -235,7 +276,7 @@ async function getGeminiReply({ apiKey, systemPrompt, customerMessage, history }
     { role: 'user', parts: [{ text: customerMessage }] }
   ];
 
-  const res = await axios.post(
+  const res = await postTracked('gemini', 
     endpoint,
     {
       contents,
@@ -260,12 +301,14 @@ function parseAIJson(raw) {
     reply: parsed.reply || 'দুঃখিত, একটু পরে আবার চেষ্টা করুন।',
     imageUrl: parsed.imageUrl || null,
     order: parsed.order || null,
-    rule: parsed.rule || null
+    rule: parsed.rule || null,
+    imageId: parsed.imageId || null,
+    imageLabel: parsed.imageLabel || null
   };
 }
 
 /* ---------- মালিকের সাথে কথা বলে নির্দেশনা শেখা (নতুন) ---------- */
-async function getOwnerChatReply({ settings, message, history = [], rules = [] }) {
+async function getOwnerChatReply({ settings, message, history = [], rules = [], hasImage = false }) {
   const systemPrompt = `
 তুমি "Faruk's SmartBiz"-এর সহকারী। এখন যিনি কথা বলছেন তিনি দোকানের মালিক, কাস্টমার না।
 মালিক তোমাকে শেখাচ্ছেন কাস্টমারদের সাথে কথা বলার সময় কী করতে বা বলতে হবে — যেমন কোন প্রোডাক্ট এখন স্টকে আছে বা নেই, নির্দিষ্ট প্রশ্নের কী জবাব দেবে, অফার, ডেলিভারির নিয়ম ইত্যাদি।
@@ -279,7 +322,13 @@ ${rules.length ? rules.map((r, i) => `${i + 1}) ${r.text}`).join('\n') : '(এ�
 - মেসেজ অস্পষ্ট হলে, শুধু প্রশ্ন হলে, বা নির্দেশনা না হয়ে সাধারণ কথা হলে "rule" null রাখো এবং "reply"-তে ভদ্রভাবে উত্তর দাও বা স্পষ্ট করে জিজ্ঞেস করো।
 - মালিক আগের কোনো নির্দেশনা বদলাতে বা বাতিল করতে চাইলে তুমি নিজে মুছতে পারো না। "reply"-তে বলো নিচের তালিকায় ওটার পাশের "মুছুন" বাটনে চাপতে, তারপর নতুনটা বলতে। এ ক্ষেত্রে "rule" null।
 
-শুধুমাত্র এই JSON ফরম্যাটে উত্তর দাও: {"reply": "মালিককে বলার কথা", "rule": null অথবা "সংরক্ষণের নিয়ম"}
+${hasImage ? `
+এই মেসেজের সাথে মালিক একটা ছবি সংযুক্ত করেছেন। তুমি ছবিটা দেখতে পাচ্ছ না, মালিকের লেখা থেকে বুঝবে ওটা কোন প্রোডাক্টের ছবি।
+- লেখায় প্রোডাক্টের নাম স্পষ্ট থাকলে "imageLabel"-এ ছোট একটা নাম দাও (যেমন "পিউর সুন্দরবন মধু ১কেজি")। এতে ছবিটা সংরক্ষিত হবে, আর কাস্টমার ছবি চাইলে AI এটাই পাঠাবে।
+- স্পষ্ট না হলে "imageLabel" null রাখো আর "reply"-তে জিজ্ঞেস করো ছবিটা কোন প্রোডাক্টের।
+- ছবির জন্য আলাদা করে "rule" বানানোর দরকার নেই, null রাখো।` : ''}
+
+শুধুমাত্র এই JSON ফরম্যাটে উত্তর দাও: {"reply": "মালিককে বলার কথা", "rule": null অথবা "সংরক্ষণের নিয়ম"${hasImage ? ', "imageLabel": null অথবা "প্রোডাক্টের ছোট নাম"' : ''}}
 `.trim();
 
   const run = (apiKey, provider) => provider === 'gemini'
