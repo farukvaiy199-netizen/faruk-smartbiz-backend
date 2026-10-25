@@ -12,9 +12,39 @@ async function getDb() {
   }
   if (!clientPromise) {
     const client = new MongoClient(config.mongoUri);
-    clientPromise = client.connect().then(c => c.db());
+    clientPromise = client.connect().then(async (c) => {
+      const db = c.db();
+      await prepareDb(db);
+      return db;
+    });
   }
   return clientPromise;
+}
+
+// সার্ভার চালুর সময় একবার: একই কাস্টমার দুইবার তৈরি হওয়া ঠেকানোর ইনডেক্স, আর আগের ভুলে
+// একই আইডি (ORD-001001) পাওয়া অর্ডারগুলোকে আলাদা আইডি দেওয়া
+async function prepareDb(db) {
+  try {
+    await db.collection('customers').createIndex({ platform: 1, platformId: 1 }, { unique: true });
+  } catch (err) {
+    console.error('কাস্টমার ইনডেক্স তৈরি করা যায়নি (আগের ডুপ্লিকেট কাস্টমার থাকতে পারে):', err.message);
+  }
+  try {
+    const dupGroups = await db.collection('orders').aggregate([
+      { $group: { _id: '$id', n: { $sum: 1 } } },
+      { $match: { n: { $gt: 1 } } }
+    ]).toArray();
+    for (const g of dupGroups) {
+      const docs = await db.collection('orders').find({ id: g._id }).sort({ createdAt: 1 }).toArray();
+      for (const d of docs.slice(1)) {
+        const newId = await nextOrderIdFrom(db);
+        await db.collection('orders').updateOne({ _id: d._id }, { $set: { id: newId } });
+        console.log(`ডুপ্লিকেট অর্ডার আইডি ঠিক করা হলো: ${g._id} → ${newId}`);
+      }
+    }
+  } catch (err) {
+    console.error('অর্ডার আইডি মেরামত করা যায়নি:', err.message);
+  }
 }
 
 function stripId(doc) {
@@ -30,7 +60,9 @@ function defaultSettings() {
     sheetLink: '', faqSheetLink: '',
     aiKey: '', aiProvider: 'groq', aiAutoReply: true,
     // ব্যাকআপ AI Key — প্রধানটা কোটা/রেট-লিমিটে আটকে গেলে এটা ব্যবহার হবে
-    aiKey2: '', aiProvider2: 'groq'
+    aiKey2: '', aiProvider2: 'groq',
+    // প্রতিটা প্রোভাইডারের দৈনিক টোকেন সীমা (আপনার প্ল্যান অনুযায়ী বদলানো যাবে) — Groq ফ্রি = ১,০০,০০০
+    aiLimits: { groq: 100000 }
   };
 }
 
@@ -62,24 +94,31 @@ async function saveSettings(partial) {
 }
 
 /* ---------- Customers ---------- */
+function newCustomerId() {
+  return 'C-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+}
+
 async function findOrCreateCustomer({ platform, platformId, name, phone, photoUrl }) {
   const db = await getDb();
   const col = db.collection('customers');
-  let customer = await col.findOne({ platform, platformId });
-  if (!customer) {
-    const count = await col.countDocuments();
-    customer = {
-      id: 'C-' + (1000 + count + 1),
-      platform, platformId,
-      name: name || 'অজানা কাস্টমার',
-      phone: phone || '',
-      photoUrl: photoUrl || '',
-      orders: 0,
-      ai: true,
-      createdAt: new Date().toISOString()
-    };
-    await col.insertOne(customer);
-  }
+  // একসাথে দুইটা মেসেজ এলেও যেন একজন কাস্টমারের দুইটা রেকর্ড না হয়, তাই এক ধাপে (atomic) খুঁজে/তৈরি করি
+  const result = await col.findOneAndUpdate(
+    { platform, platformId },
+    {
+      $setOnInsert: {
+        id: newCustomerId(),
+        platform, platformId,
+        name: name || 'অজানা কাস্টমার',
+        phone: phone || '',
+        photoUrl: photoUrl || '',
+        orders: 0,
+        ai: true,
+        createdAt: new Date().toISOString()
+      }
+    },
+    { upsert: true, returnDocument: 'after' }
+  );
+  const customer = (result && result.platformId !== undefined) ? result : (result && result.value) || await col.findOne({ platform, platformId });
   return stripId(customer);
 }
 
@@ -127,15 +166,21 @@ async function appendMessage(customerId, role, text) {
 }
 
 /* ---------- Orders ---------- */
-async function nextOrderId() {
-  const db = await getDb();
+async function nextOrderIdFrom(db) {
   const result = await db.collection('counters').findOneAndUpdate(
     { _id: 'orderSeq' },
     { $inc: { value: 1 } },
     { upsert: true, returnDocument: 'after' }
   );
-  const seq = (result && result.value && result.value.value) || 1;
+  // MongoDB driver-এর নতুন ভার্সন সরাসরি ডকুমেন্ট ফেরত দেয়, পুরনো ভার্সন { value: ডকুমেন্ট } দেয় —
+  // দুটো ক্ষেত্রেই যেন সঠিক সংখ্যা পাওয়া যায়
+  const doc = (result && typeof result.value === 'object' && result.value !== null) ? result.value : result;
+  const seq = (doc && Number(doc.value)) || 1;
   return 'ORD-' + String(1000 + seq).padStart(6, '0');
+}
+
+async function nextOrderId() {
+  return nextOrderIdFrom(await getDb());
 }
 
 async function createOrder({ customerId, name, phone, address, product, qty, price, email, source }) {
@@ -194,9 +239,8 @@ async function createWebsiteOrder(payload = {}) {
     const col = db.collection('customers');
     customer = await col.findOne({ phone: payload.phone, platform: 'website' });
     if (!customer) {
-      const count = await col.countDocuments();
       customer = {
-        id: 'C-' + (1000 + count + 1),
+        id: newCustomerId(),
         platform: 'website',
         platformId: payload.phone,
         name: payload.customer || 'ওয়েবসাইট কাস্টমার',
@@ -283,6 +327,83 @@ async function deleteAiRule(id) {
   return r.deletedCount > 0;
 }
 
+/* ---------- AI ব্যবহার ট্র্যাকিং (নতুন) ---------- */
+function bdDay(offsetDays = 0) {
+  return new Date(Date.now() - offsetDays * 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Dhaka' });
+}
+
+async function addAiUsage(provider, tokens) {
+  const db = await getDb();
+  const date = bdDay();
+  await db.collection('aiUsage').updateOne(
+    { _id: `${date}|${provider}` },
+    { $inc: { tokens: Number(tokens) || 0, requests: 1 }, $set: { date, provider } },
+    { upsert: true }
+  );
+}
+
+async function setAiRateInfo(provider, info) {
+  const db = await getDb();
+  await db.collection('meta').updateOne(
+    { _id: 'aiRate:' + provider },
+    { $set: { ...info, at: new Date().toISOString() } },
+    { upsert: true }
+  );
+}
+
+async function setAiLastError(provider, message) {
+  const db = await getDb();
+  await db.collection('meta').updateOne(
+    { _id: 'aiError:' + provider },
+    { $set: { message: String(message).slice(0, 300), at: new Date().toISOString() } },
+    { upsert: true }
+  );
+}
+
+async function getAiUsage() {
+  const db = await getDb();
+  const dates = [0, 1, 2, 3, 4, 5, 6].map(bdDay);
+  const rows = await db.collection('aiUsage').find({ date: { $in: dates } }).toArray();
+  const today = rows.filter(r => r.date === dates[0]).map(r => ({ provider: r.provider, tokens: r.tokens || 0, requests: r.requests || 0 }));
+  const week = {};
+  rows.forEach(r => { week[r.provider] = (week[r.provider] || 0) + (r.tokens || 0); });
+
+  const metaDocs = await db.collection('meta').find({ _id: { $regex: '^ai(Rate|Error):' } }).toArray();
+  const rate = {}, lastErrors = {};
+  metaDocs.forEach(d => {
+    const { _id, ...rest } = d;
+    if (_id.startsWith('aiRate:')) rate[_id.slice(7)] = rest;
+    else lastErrors[_id.slice(8)] = rest;
+  });
+  return { today, week, rate, lastErrors };
+}
+
+/* ---------- মালিকের আপলোড করা প্রোডাক্ট ছবি (নতুন) ---------- */
+async function getAiImages() {
+  const db = await getDb();
+  const list = await db.collection('aiImages').find({}, { projection: { b64: 0 } }).sort({ createdAt: 1 }).toArray();
+  return list.map(stripId);
+}
+
+async function addAiImage({ label, mime, b64 }) {
+  const db = await getDb();
+  const id = 'IMG' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const doc = { id, label, mime, b64, createdAt: new Date().toISOString() };
+  await db.collection('aiImages').insertOne(doc);
+  return { id, label, createdAt: doc.createdAt };
+}
+
+async function getAiImageData(id) {
+  const db = await getDb();
+  return db.collection('aiImages').findOne({ id });
+}
+
+async function deleteAiImage(id) {
+  const db = await getDb();
+  const r = await db.collection('aiImages').deleteOne({ id });
+  return r.deletedCount > 0;
+}
+
 module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
@@ -290,5 +411,7 @@ module.exports = {
   createOrder, createWebsiteOrder, getOrders, getOrdersByCustomer, updateOrderStatus, attachEmailToLatestOrder,
   addBroadcast, getBroadcasts,
   addEmailLog, getEmailLogs,
-  getAiRules, addAiRule, deleteAiRule
+  getAiRules, addAiRule, deleteAiRule,
+  addAiUsage, setAiRateInfo, setAiLastError, getAiUsage,
+  getAiImages, addAiImage, getAiImageData, deleteAiImage
 };
