@@ -15,7 +15,8 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
 // ডিফল্ট সীমা মাত্র ১০০KB — মালিকের আপলোড করা ছবি (ডেটা হিসেবে) এর চেয়ে বড় হয়, তাই ২MB করা হলো
-app.use(express.json({ limit: '2mb' }));
+// rawBody রাখা হয় Meta-র সই যাচাই করার জন্য (সই মূল রিকোয়েস্ট বডির উপর হিসেব হয়)
+app.use(express.json({ limit: '2mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 app.get('/', (req, res) => {
   res.send('Faruk\'s SmartBiz backend চলছে ✅');
