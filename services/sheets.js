@@ -131,7 +131,37 @@ async function getProductStock(sheetLink, productName) {
   }
 }
 
-module.exports = { getSheetContext, getCombinedSheetContext, getProductStock, writeOrderToSheet, writeCustomerToSheet };
+// শিটের প্রতিটা প্রোডাক্টের নাম ও (থাকলে) Stock কলামের সংখ্যা — অ্যাপের স্টক পেজে তালিকা দেখানোর জন্য
+async function getSheetProducts(sheetLink) {
+  if (!sheetLink) return [];
+  try {
+    const rows = await fetchSheetRows(sheetLink);
+    if (!rows || rows.length < 2) return [];
+    const header = rows[0].map(h => (h || '').toLowerCase());
+    let nameIdx = header.findIndex(h => h.includes('name') || h.includes('নাম') || h.includes('product') || h.includes('প্রোডাক্ট'));
+    if (nameIdx === -1) nameIdx = 0;
+    const stockIdx = header.findIndex(h => h.includes('stock') || h.includes('স্টক') || h.includes('quantity'));
+    const out = [];
+    const seen = new Set();
+    rows.slice(1, 300).forEach(r => {
+      const name = (r[nameIdx] || '').trim();
+      if (!name || seen.has(name)) return;
+      seen.add(name);
+      let stock = null;
+      if (stockIdx !== -1) {
+        const n = parseInt(r[stockIdx], 10);
+        if (!isNaN(n)) stock = n;
+      }
+      out.push({ name, stock });
+    });
+    return out;
+  } catch (err) {
+    console.error('শিট থেকে প্রোডাক্ট তালিকা আনতে ব্যর্থ:', err.message);
+    return [];
+  }
+}
+
+module.exports = { getSheetContext, getCombinedSheetContext, getProductStock, getSheetProducts, writeOrderToSheet, writeCustomerToSheet };
 
 /* ---------- Apps Script দিয়ে শিটে লেখা (order/customer) ---------- */
 async function writeOrderToSheet({ scriptUrl, scriptToken, order }) {
