@@ -59,7 +59,11 @@ function isVisionCapable(provider) {
  * কাস্টমারের মেসেজ পড়ে AI দিয়ে রিপ্লাই বানায়।
  * AI কে বলা হয় JSON আকারে ফেরত দিতে: { reply, order }
  */
-async function getAIReply({ apiKey, provider = 'groq', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [] }) {
+async function getAIReply({ apiKey, provider = 'groq', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [], stockList = [] }) {
+  // অ্যাপের স্টক পেজ থেকে মালিকের বসানো বর্তমান স্টক — এটাই সবচেয়ে নির্ভরযোগ্য
+  const stockBlock = stockList.length
+    ? `\n=== বর্তমান স্টক (অ্যাপ থেকে, সবচেয়ে নির্ভরযোগ্য) ===\nনিচের তালিকায় যে প্রোডাক্ট আছে তার স্টক শুধু এখান থেকে বলবে (শিটের Stock কলামের চেয়ে এটা বেশি সঠিক)। ০ হলে "স্টকে নেই" বলবে, আর অর্ডার নেবে না:\n${stockList.map(e => `- ${e.name}: ${e.qty > 0 ? e.qty + 'টি আছে' : 'স্টক শেষ'}`).join('\n')}\n`
+    : '';
   // দোকান মালিক অ্যাপের "AI শেখান" ট্যাব থেকে যেসব নির্দেশনা দিয়েছেন — সর্বোচ্চ অগ্রাধিকার
   const rulesBlock = ownerRules.length
     ? `\n=== দোকান মালিকের সরাসরি নির্দেশনা (সর্বোচ্চ অগ্রাধিকার) ===\nনিচের নির্দেশনাগুলো দোকান মালিক নিজে দিয়েছেন। এগুলো শিটের তথ্য এবং আগের কথোপকথনে দেওয়া পুরনো উত্তরের চেয়েও বেশি গুরুত্বপূর্ণ — কোনো বিরোধ থাকলে এগুলোই মানবে:\n${ownerRules.map((r, i) => `${i + 1}) ${r}`).join('\n')}\n`
@@ -73,7 +77,7 @@ async function getAIReply({ apiKey, provider = 'groq', customerMessage, history 
 বাংলায়, সংক্ষেপে উত্তর দাও।
 ${businessInfo ? 'দোকানের তথ্য:\n' + businessInfo : ''}
 ${sheetContext ? sheetContext : ''}
-${rulesBlock}${imagesBlock}
+${rulesBlock}${imagesBlock}${stockBlock}
 === স্টক ও প্রাপ্যতা ===
 কোনো প্রোডাক্ট আছে কি নেই — এটা শুধু বর্তমান শিটের তথ্য আর মালিকের নির্দেশনা দেখে বলবে। আগের কথোপকথনে তুমি বা অন্য কেউ "স্টকে নেই" বলে থাকলেও সেটা পুরনো হতে পারে, তাই সেটার উপর ভরসা করে আবার "নেই" বলবে না।
 
@@ -102,6 +106,14 @@ ${rulesBlock}${imagesBlock}
 প্রশ্নটা দোকানের তথ্য দিয়ে উত্তর দেওয়া সম্ভব না হলে, বা জটিল/স্পর্শকাতর বিষয় (রিফান্ড
 বিরোধ, ক্ষতিগ্রস্ত প্রোডাক্ট, বিশেষ অনুরোধ) হলে, অনুমান করে উত্তর না দিয়ে ভদ্রভাবে বলবে
 সরাসরি সাপোর্ট প্রতিনিধির সাথে কথা বলতে, নাম্বার: 01792872209
+
+=== মালিকের সাহায্য দরকার হলে (handoff) ===
+শুধু এই ক্ষেত্রগুলোতে "handoff"-এ ছোট একটা কারণ লিখবে (যেমন "রিফান্ড চাইছে", "ক্ষতিগ্রস্ত পণ্য নিয়ে রাগ করছে", "মানুষের সাথে কথা চায়", "উত্তর জানি না"):
+- কাস্টমার রেগে আছে বা অভিযোগ করছে, রিফান্ড/ফেরত/ক্ষতিগ্রস্ত বা ভুল পণ্য নিয়ে কথা বলছে
+- কাস্টমার স্পষ্টভাবে মানুষের সাথে কথা বলতে চাইছে
+- প্রশ্নের উত্তর শিট, স্টক বা মালিকের নির্দেশনায় নেই এবং অনুমান করা ঠিক হবে না
+এসব ক্ষেত্রে reply-তে ভদ্রভাবে জানাবে যে আমাদের প্রতিনিধি শীঘ্রই কথা বলবেন, আর সাপোর্ট নাম্বার দেবে। সমস্যাটা নিজে মেটানোর চেষ্টা করবে না।
+দাম, ডেলিভারি, স্টক, অর্ডারের মতো সাধারণ প্রশ্নে কখনো handoff দেবে না — অকারণে দিলে মালিককে বিরক্ত করা হয়।
 
 === অর্ডার নেওয়ার নিয়ম (কঠোরভাবে মানতে হবে) ===
 ১) কাস্টমার যা টাইপ করে পাঠায় তা হুবহু (word-for-word) কপি করে "order" এ বসাবে —
@@ -139,6 +151,7 @@ ${rulesBlock}${imagesBlock}
   "reply": "কাস্টমারকে পাঠানোর মেসেজ",
   "imageUrl": null অথবা "শিট থেকে পাওয়া হুবহু ছবির লিংক",
   "imageId": null অথবা "মালিকের ছবির তালিকা থেকে হুবহু ID",
+  "handoff": null অথবা "মালিকের সাহায্য কেন দরকার তার ছোট কারণ",
   "order": null, অথবা {
     "name": "কাস্টমার হুবহু যা লিখেছে",
     "phone": "কাস্টমার হুবহু যা লিখেছে",
@@ -161,18 +174,18 @@ ${rulesBlock}${imagesBlock}
 }
 
 // প্রধান AI Key ব্যর্থ হলে (rate limit/quota/এরর) স্বয়ংক্রিয়ভাবে ব্যাকআপ Key দিয়ে আবার চেষ্টা করে
-async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [] }) {
+async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [], stockList = [] }) {
   try {
     return await getAIReply({
       apiKey: settings.aiKey, provider: settings.aiProvider,
-      customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages
+      customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList
     });
   } catch (err) {
     if (settings.aiKey2 && settings.aiProvider2) {
       console.warn('প্রধান AI Key ব্যর্থ হয়েছে, ব্যাকআপ Key দিয়ে আবার চেষ্টা করা হচ্ছে:', err.message);
       return await getAIReply({
         apiKey: settings.aiKey2, provider: settings.aiProvider2,
-        customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages
+        customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList
       });
     }
     throw err;
@@ -303,6 +316,7 @@ function parseAIJson(raw) {
     order: parsed.order || null,
     rule: parsed.rule || null,
     imageId: parsed.imageId || null,
+    handoff: parsed.handoff || null,
     imageLabel: parsed.imageLabel || null
   };
 }
