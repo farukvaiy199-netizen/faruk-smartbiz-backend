@@ -7,6 +7,8 @@ const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
 const { getOwnerChatReply } = require('../services/ai');
+const { notifyOwner, getPublicKey } = require('../services/notify');
+const { getSheetProducts } = require('../services/sheets');
 
 // বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে
 function bdDateString(d) {
@@ -19,7 +21,11 @@ router.get('/dashboard/summary', async (req, res) => {
   const customers = await store.getCustomers();
   const today = bdDateString(new Date());
   const todayOrders = orders.filter(o => bdDateString(o.createdAt) === today);
+  const settings = await store.getSettings();
+  const threshold = settings.lowStockThreshold ?? 5;
+  const stockEntries = await store.getStockList();
   res.json({
+    lowStockCount: stockEntries.filter(e => e.qty <= threshold).length,
     todayRevenue: todayOrders.reduce((sum, o) => sum + (o.price * o.qty), 0),
     todayOrders: todayOrders.length,
     pendingCount: orders.filter(o => o.status === 'Pending').length,
@@ -32,13 +38,58 @@ router.get('/orders', async (req, res) => {
   res.json(await store.getOrders());
 });
 
+// স্ট্যাটাস বদলালে কাস্টমারকে যে মেসেজ যাবে
+const STATUS_MESSAGES = {
+  Processing: id => `আপনার অর্ডার ${id} এখন প্রসেসিং-এ আছে। শীঘ্রই কুরিয়ারে পাঠানো হবে। 🙏`,
+  Delivered: id => `আপনার অর্ডার ${id} ডেলিভারি সম্পন্ন হয়েছে। আমাদের সাথে থাকার জন্য ধন্যবাদ! 🙏`,
+  Cancelled: id => `দুঃখিত, আপনার অর্ডার ${id} বাতিল করা হয়েছে। কোনো প্রশ্ন থাকলে আমাদের জানান।`
+};
+
 router.patch('/orders/:id', async (req, res) => {
-  const { status } = req.body;
+  const { status, notify } = req.body;
   const valid = ['Pending', 'Processing', 'Delivered', 'Cancelled'];
   if (!valid.includes(status)) return res.status(400).json({ error: 'অবৈধ status' });
-  const order = await store.updateOrderStatus(req.params.id, status);
-  if (!order) return res.status(404).json({ error: 'অর্ডার পাওয়া যায়নি' });
-  res.json(order);
+
+  const before = await store.getOrderById(req.params.id);
+  if (!before) return res.status(404).json({ error: 'অর্ডার পাওয়া যায়নি' });
+  let order = await store.updateOrderStatus(req.params.id, status);
+
+  // বাতিল করলে স্টক ফেরত যায়, বাতিল থেকে আবার চালু করলে স্টক আবার কমে
+  if (before.stockItem) {
+    const qty = Number(before.qty) || 1;
+    if (status === 'Cancelled' && before.status !== 'Cancelled' && !before.stockRestored) {
+      await store.incrementStock(before.stockItem, qty);
+      order = await store.setOrderFields(before.id, { stockRestored: true });
+    } else if (before.status === 'Cancelled' && status !== 'Cancelled' && before.stockRestored) {
+      const dec = await store.decrementStock(before.stockItem, qty);
+      if (dec.ok) order = await store.setOrderFields(before.id, { stockRestored: false });
+    }
+  }
+
+  // কাস্টমারকে জানানো (Messenger/WhatsApp-এ কাস্টমারের শেষ মেসেজের ২৪ ঘণ্টার মধ্যে হলে তবেই যায়)
+  let notifyStatus = 'skipped', notifyNote = '';
+  if (notify !== false && status !== before.status && STATUS_MESSAGES[status]) {
+    const customer = before.customerId ? await store.getCustomerById(before.customerId) : null;
+    const settings = await store.getSettings();
+    const text = STATUS_MESSAGES[status](before.id);
+    try {
+      if (customer && customer.platform === 'facebook' && settings.fbToken) {
+        await sendFacebookMessage(customer.platformId, text, settings.fbToken);
+        notifyStatus = 'sent';
+      } else if (customer && customer.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
+        await sendWhatsAppMessage(customer.platformId, text, settings.waPhoneNumberId, settings.waToken);
+        notifyStatus = 'sent';
+      } else {
+        notifyNote = customer ? 'ওয়েবসাইট কাস্টমার — মেসেজ পাঠানোর মাধ্যম নেই' : 'কাস্টমার পাওয়া যায়নি';
+      }
+    } catch (err) {
+      notifyStatus = 'failed';
+      const m = String((err.response && err.response.data && err.response.data.error && err.response.data.error.message) || err.message);
+      notifyNote = /window|24|outside|allowed|session/i.test(m) ? '২৪ ঘণ্টা পেরিয়ে গেছে — কাস্টমারকে নিজে জানান' : m.slice(0, 120);
+    }
+    order = await store.setOrderFields(before.id, { notifyStatus, notifyNote, notifyAt: new Date().toISOString() });
+  }
+  res.json({ ...order, notifyStatus, notifyNote });
 });
 
 // অর্ডার CSV আকারে ডাউনলোড (Excel-এ খোলা যায়)
@@ -66,6 +117,13 @@ router.patch('/customers/:id/ai', async (req, res) => {
   const customer = await store.setCustomerAI(req.params.id, !!ai);
   if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
   res.json(customer);
+});
+
+// "মানুষের অপেক্ষায়" ট্যাগ সরানো (মালিক দেখে নিয়েছেন)
+router.patch('/customers/:id/handled', async (req, res) => {
+  const c = await store.clearNeedsHuman(req.params.id);
+  if (!c) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
+  res.json(c);
 });
 
 // কারো নামে ট্যাপ করলে তার সম্পূর্ণ অর্ডার + কথোপকথন হিস্টোরি
@@ -235,6 +293,69 @@ router.get('/ai-usage', async (req, res) => {
     primary: settings.aiKey ? settings.aiProvider : null,
     backup: settings.aiKey2 ? settings.aiProvider2 : null
   });
+});
+
+/* ---------- নোটিফিকেশন ও পুশ (নতুন) ---------- */
+router.get('/push/public-key', async (req, res) => {
+  res.json({ publicKey: await getPublicKey() });
+});
+
+router.post('/push/subscribe', async (req, res) => {
+  const sub = req.body.subscription;
+  if (!sub || !sub.endpoint) return res.status(400).json({ error: 'সাবস্ক্রিপশন পাওয়া যায়নি' });
+  await store.savePushSub(sub);
+  res.json({ ok: true });
+});
+
+router.post('/push/test', async (req, res) => {
+  await notifyOwner({ type: 'test', title: '✅ নোটিফিকেশন চালু আছে', body: 'SmartBiz থেকে টেস্ট নোটিফিকেশন' });
+  res.json({ ok: true });
+});
+
+router.get('/notifications', async (req, res) => {
+  res.json(await store.getNotifications());
+});
+
+router.get('/notifications/count', async (req, res) => {
+  res.json({ unread: await store.countUnreadNotifications() });
+});
+
+router.post('/notifications/read', async (req, res) => {
+  await store.markNotificationsRead();
+  res.json({ ok: true });
+});
+
+/* ---------- স্টক (অ্যাপের ভেতরে) (নতুন) ---------- */
+router.get('/stock', async (req, res) => {
+  const settings = await store.getSettings();
+  const [entries, sheet] = await Promise.all([store.getStockList(), getSheetProducts(settings.sheetLink)]);
+  const map = new Map(entries.map(e => [e.name, e]));
+  const items = sheet.map(p => ({ name: p.name, qty: map.has(p.name) ? map.get(p.name).qty : null, sheetStock: p.stock, inSheet: true }));
+  entries.forEach(e => {
+    if (!sheet.some(p => p.name === e.name)) items.push({ name: e.name, qty: e.qty, sheetStock: null, inSheet: false });
+  });
+  res.json({ threshold: settings.lowStockThreshold ?? 5, items });
+});
+
+router.post('/stock', async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'প্রোডাক্টের নাম নেই' });
+  const qty = req.body.qty;
+  if (qty !== null && qty !== '' && qty !== undefined && !(Number(qty) >= 0)) return res.status(400).json({ error: 'সংখ্যা সঠিক না' });
+  const item = await store.setStock(name, qty);
+  res.json({ ok: true, item });
+});
+
+// শিটের Stock কলামে যেসব প্রোডাক্টের সংখ্যা আছে, অ্যাপে এখনো বসানো হয়নি এমনগুলো একবারে এনে দেয়
+router.post('/stock/import', async (req, res) => {
+  const settings = await store.getSettings();
+  const [entries, sheet] = await Promise.all([store.getStockList(), getSheetProducts(settings.sheetLink)]);
+  const have = new Set(entries.map(e => e.name));
+  let count = 0;
+  for (const p of sheet) {
+    if (p.stock !== null && !have.has(p.name)) { await store.setStock(p.name, p.stock); count++; }
+  }
+  res.json({ ok: true, imported: count });
 });
 
 /* ---------- Email Logs ---------- */
