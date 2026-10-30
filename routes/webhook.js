@@ -9,6 +9,8 @@ const { getCombinedSheetContext, getProductStock, writeOrderToSheet, writeCustom
 const { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedia } = require('../services/facebook');
 const { sendWhatsAppMessage, sendWhatsAppImage, getWhatsAppMediaBuffer } = require('../services/whatsapp');
 const { sendOrderConfirmationEmail } = require('../services/email');
+const { notifyOwner } = require('../services/notify');
+const crypto = require('crypto');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
@@ -33,6 +35,49 @@ function buildConfirmationText(order) {
   return `✅ আপনার অর্ডারটি কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: ${order.id}\nপ্রোডাক্ট: ${order.product} x${order.qty}\nমোট মূল্য: ৳${total}\nঠিকানা: ${order.address || ''}\n\nধন্যবাদ আমাদের সাথে থাকার জন্য! 🙏`;
 }
 
+// নোটিফিকেশনে কাস্টমারের নাম দেখানোর জন্য — নাম জানা না থাকলে প্ল্যাটফর্ম + আইডির শেষ ৪ অক্ষর
+function displayName(c) {
+  if (c.name && c.name !== 'অজানা কাস্টমার') return c.name;
+  const plat = c.platform === 'facebook' ? 'Messenger' : c.platform === 'whatsapp' ? 'WhatsApp' : 'কাস্টমার';
+  return plat + ' ···' + String(c.platformId || c.id || '').slice(-4);
+}
+
+// Meta প্রতিটা ওয়েবহুক রিকোয়েস্টের সাথে App Secret দিয়ে বানানো একটা সই পাঠায় (X-Hub-Signature-256)।
+// সেটা মিলিয়ে দেখলে ভুয়া রিকোয়েস্ট ধরা পড়ে। META_SIGNATURE_ENFORCE=true না থাকলে শুধু লগে সতর্কতা দেয়,
+// রিকোয়েস্ট আটকায় না — যাতে App Secret ভুল থাকলে আসল মেসেজ হারিয়ে না যায়।
+const signatureOkLogged = {};
+function verifyMeta(secret, label) {
+  return (req, res, next) => {
+    if (!secret) {
+      if (!signatureOkLogged[label + ':nosecret']) {
+        console.warn(`⚠️ ${label}: App Secret সেট নেই, সই যাচাই বাদ দেওয়া হচ্ছে`);
+        signatureOkLogged[label + ':nosecret'] = true;
+      }
+      return next();
+    }
+    const sig = req.get('x-hub-signature-256') || '';
+    const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(req.rawBody || Buffer.from('')).digest('hex');
+    let ok = false;
+    try {
+      ok = sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+    } catch (e) { ok = false; }
+
+    if (ok) {
+      if (!signatureOkLogged[label]) {
+        console.log(`✅ ${label}: Meta-র সই মিলেছে`);
+        signatureOkLogged[label] = true;
+      }
+      return next();
+    }
+    if (config.metaSignatureEnforce) {
+      console.warn(`🚫 ${label}: সই মেলেনি, রিকোয়েস্ট বাদ দেওয়া হলো`);
+      return res.sendStatus(403);
+    }
+    console.warn(`⚠️ ${label}: সই মেলেনি (এখন শুধু সতর্কতা, রিকোয়েস্ট চলছে) — App Secret ঠিক আছে কিনা দেখুন`);
+    return next();
+  };
+}
+
 /* =============== FACEBOOK MESSENGER =============== */
 
 router.get('/facebook', (req, res) => {
@@ -45,7 +90,7 @@ router.get('/facebook', (req, res) => {
   return res.sendStatus(403);
 });
 
-router.post('/facebook', async (req, res) => {
+router.post('/facebook', verifyMeta(config.fbAppSecret, 'Facebook'), async (req, res) => {
   res.sendStatus(200);
   const entries = req.body.entry || [];
   for (const entry of entries) {
@@ -97,7 +142,7 @@ router.get('/whatsapp', (req, res) => {
   return res.sendStatus(403);
 });
 
-router.post('/whatsapp', async (req, res) => {
+router.post('/whatsapp', verifyMeta(config.waAppSecret, 'WhatsApp'), async (req, res) => {
   res.sendStatus(200);
   const value = req.body.entry?.[0]?.changes?.[0]?.value;
   const messages = value?.messages || [];
@@ -232,9 +277,10 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const history = fullHistory.slice(0, -1);
   const ownerRules = (await store.getAiRules()).map(r => r.text);
   const ownerImages = await store.getAiImages();
+  const stockList = (await store.getStockList()).map(e => ({ name: e.name, qty: e.qty }));
 
-  const { reply, imageUrl, imageId, order } = await getAIReplyWithFallback({
-    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages
+  const { reply, imageUrl, imageId, order, handoff } = await getAIReplyWithFallback({
+    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList
   });
 
   // মালিকের আপলোড করা ছবি থাকলে সেটাকেই অগ্রাধিকার; না থাকলে শিটের ছবির লিংক
@@ -245,6 +291,16 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
 
   await store.appendMessage(customer.id, 'assistant', reply);
   await send(reply, finalImageUrl);
+
+  // AI আটকে গেছে বা কাস্টমার রাগ করছে — মালিককে পুশ পাঠাই (AI চালুই থাকে), কাস্টমারের পাশে লাল ট্যাগ বসে
+  if (handoff && !customer.needsHuman) {
+    await store.setNeedsHuman(customer.id, handoff);
+    await notifyOwner({
+      type: 'handoff',
+      title: `🙋 ${displayName(customer)} আপনার সাথে কথা বলতে চান`,
+      body: `${handoff} — "${String(text).slice(0, 80)}"`
+    });
+  }
 
   if (order && order.emailOnly && order.email) {
     const updatedOrder = await store.attachEmailToLatestOrder(customer.id, order.email);
@@ -273,28 +329,68 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       return;
     }
 
-    const stock = await getProductStock(settings.sheetLink, order.product);
-    if (stock !== null && stock <= 0) {
-      const outOfStockMsg = `দুঃখিত, "${order.product}" এই মুহূর্তে স্টকে নেই। অন্য কোনো প্রোডাক্ট দেখতে চান?`;
-      await store.appendMessage(customer.id, 'assistant', outOfStockMsg);
-      await send(outOfStockMsg);
-      return;
+    const wantQty = Number(order.qty) || 1;
+
+    // স্টক: আগে অ্যাপের স্টক পেজের সংখ্যা দেখি; সেখানে না থাকলে শিটের Stock কলাম
+    const stockEntry = await store.findStockEntry(order.product);
+    let reservedStock = null;
+    if (stockEntry) {
+      const dec = await store.decrementStock(stockEntry.name, wantQty);
+      if (!dec.ok) {
+        const outMsg = dec.qty > 0
+          ? `দুঃখিত, "${order.product}" এখন মাত্র ${dec.qty}টি আছে। কম পরিমাণে নিতে চাইলে জানান।`
+          : `দুঃখিত, "${order.product}" এই মুহূর্তে স্টকে নেই। অন্য কোনো প্রোডাক্ট দেখতে চান?`;
+        await store.appendMessage(customer.id, 'assistant', outMsg);
+        await send(outMsg);
+        return;
+      }
+      reservedStock = { name: stockEntry.name, qty: dec.qty };
+    } else {
+      const stock = await getProductStock(settings.sheetLink, order.product);
+      if (stock !== null && stock <= 0) {
+        const outOfStockMsg = `দুঃখিত, "${order.product}" এই মুহূর্তে স্টকে নেই। অন্য কোনো প্রোডাক্ট দেখতে চান?`;
+        await store.appendMessage(customer.id, 'assistant', outOfStockMsg);
+        await send(outOfStockMsg);
+        return;
+      }
     }
 
     if (order.name || order.phone) {
       await store.updateCustomerContact(customer.id, { name: order.name, phone: order.phone });
     }
-    const savedOrder = await store.createOrder({
-      customerId: customer.id,
-      name: order.name || customer.name,
-      phone: order.phone || customer.phone || '',
-      address: order.address || '',
-      email: order.email || '',
-      product: order.product,
-      qty: order.qty || 1,
-      price: order.price || 0,
-      source: platform === 'facebook' ? 'Messenger' : 'WhatsApp'
+    let savedOrder;
+    try {
+      savedOrder = await store.createOrder({
+        customerId: customer.id,
+        name: order.name || customer.name,
+        phone: order.phone || customer.phone || '',
+        address: order.address || '',
+        email: order.email || '',
+        product: order.product,
+        qty: wantQty,
+        price: order.price || 0,
+        source: platform === 'facebook' ? 'Messenger' : 'WhatsApp',
+        stockItem: reservedStock ? reservedStock.name : ''
+      });
+    } catch (err) {
+      // অর্ডার সেভ না হলে আটকে রাখা স্টক ফেরত দিই
+      if (reservedStock) await store.incrementStock(reservedStock.name, wantQty);
+      throw err;
+    }
+
+    // মালিককে জানাই: নতুন অর্ডার, আর স্টক কমে গেলে আলাদা সতর্কতা
+    await notifyOwner({
+      type: 'order',
+      title: `🛒 নতুন অর্ডার ${savedOrder.id}`,
+      body: `${savedOrder.name} · ${savedOrder.product} x${savedOrder.qty} · ৳${(savedOrder.price || 0) * (savedOrder.qty || 1)}`
     });
+    if (reservedStock && reservedStock.qty <= (settings.lowStockThreshold ?? 5)) {
+      await notifyOwner({
+        type: 'stock',
+        title: reservedStock.qty <= 0 ? `❌ স্টক শেষ: ${reservedStock.name}` : `⚠️ স্টক কম: ${reservedStock.name}`,
+        body: reservedStock.qty <= 0 ? 'আর কোনো পিস নেই' : `মাত্র ${reservedStock.qty}টি বাকি`
+      });
+    }
 
     const confirmationText = buildConfirmationText(savedOrder);
     await store.appendMessage(customer.id, 'assistant', confirmationText);
@@ -326,6 +422,11 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
 router.post('/order', async (req, res) => {
   try {
     const order = await store.createWebsiteOrder(req.body || {});
+    await notifyOwner({
+      type: 'order',
+      title: `🛒 ওয়েবসাইটে নতুন অর্ডার ${order.id}`,
+      body: `${order.name} · ${order.product} · ৳${order.price || 0}`
+    });
     res.json({ ok: true, orderId: order.id });
   } catch (err) {
     console.error('Order webhook error:', err.message);
@@ -378,9 +479,17 @@ router.post('/ai-reply', async (req, res) => {
 
     const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, message);
     const ownerRules = (await store.getAiRules()).map(r => r.text);
-    const { reply } = await getAIReplyWithFallback({
-      settings, customerMessage: message, history, sheetContext, businessInfo, ownerRules
+    const stockList = (await store.getStockList()).map(e => ({ name: e.name, qty: e.qty }));
+    const { reply, handoff } = await getAIReplyWithFallback({
+      settings, customerMessage: message, history, sheetContext, businessInfo, ownerRules, stockList
     });
+    if (handoff) {
+      await notifyOwner({
+        type: 'handoff',
+        title: `🙋 ওয়েবসাইট চ্যাটে ${visitorName || body.customerEmail || 'একজন কাস্টমার'} সাহায্য চান`,
+        body: `${handoff} — "${message.slice(0, 80)}"`
+      });
+    }
 
     res.json({ reply });
   } catch (err) {
