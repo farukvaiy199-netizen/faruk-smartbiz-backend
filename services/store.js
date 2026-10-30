@@ -62,7 +62,9 @@ function defaultSettings() {
     // ব্যাকআপ AI Key — প্রধানটা কোটা/রেট-লিমিটে আটকে গেলে এটা ব্যবহার হবে
     aiKey2: '', aiProvider2: 'groq',
     // প্রতিটা প্রোভাইডারের দৈনিক টোকেন সীমা (আপনার প্ল্যান অনুযায়ী বদলানো যাবে) — Groq ফ্রি = ১,০০,০০০
-    aiLimits: { groq: 100000 }
+    aiLimits: { groq: 100000 },
+    // স্টক এই সংখ্যা বা এর নিচে নামলে মালিকের কাছে অ্যালার্ট যায়
+    lowStockThreshold: 5
   };
 }
 
@@ -183,7 +185,7 @@ async function nextOrderId() {
   return nextOrderIdFrom(await getDb());
 }
 
-async function createOrder({ customerId, name, phone, address, product, qty, price, email, source }) {
+async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem }) {
   const db = await getDb();
   const id = await nextOrderId();
   const order = {
@@ -193,6 +195,7 @@ async function createOrder({ customerId, name, phone, address, product, qty, pri
     email: email || '',
     product, qty: qty || 1, price: price || 0,
     status: 'Pending', source,
+    stockItem: stockItem || '', stockRestored: false,
     createdAt: new Date().toISOString()
   };
   await db.collection('orders').insertOne(order);
@@ -404,6 +407,183 @@ async function deleteAiImage(id) {
   return r.deletedCount > 0;
 }
 
+/* ---------- একটা সাধারণ সাহায্যকারী: findOneAndUpdate-এর ফল (নতুন/পুরনো driver দুই ভার্সনেই) ---------- */
+function docOf(result) {
+  if (!result) return null;
+  if (typeof result.value === 'object' && result.value !== null) return result.value;
+  if (result._id !== undefined) return result;
+  return null;
+}
+
+/* ---------- অর্ডারের স্ট্যাটাস/নোটিফাই তথ্য, স্টক ফেরত (নতুন) ---------- */
+async function getOrderById(id) {
+  const db = await getDb();
+  return stripId(await db.collection('orders').findOne({ id }));
+}
+
+async function setOrderFields(id, fields) {
+  const db = await getDb();
+  await db.collection('orders').updateOne({ id }, { $set: fields });
+  return stripId(await db.collection('orders').findOne({ id }));
+}
+
+async function getCustomerById(id) {
+  const db = await getDb();
+  return stripId(await db.collection('customers').findOne({ id }));
+}
+
+/* ---------- "মানুষের অপেক্ষায়" ফ্ল্যাগ (নতুন) ---------- */
+async function setNeedsHuman(id, reason) {
+  const db = await getDb();
+  await db.collection('customers').updateOne(
+    { id },
+    { $set: { needsHuman: true, needsHumanReason: String(reason || '').slice(0, 200), needsHumanAt: new Date().toISOString() } }
+  );
+}
+
+async function clearNeedsHuman(id) {
+  const db = await getDb();
+  await db.collection('customers').updateOne(
+    { id },
+    { $set: { needsHuman: false }, $unset: { needsHumanReason: '', needsHumanAt: '' } }
+  );
+  return stripId(await db.collection('customers').findOne({ id }));
+}
+
+/* ---------- নোটিফিকেশন ও পুশ সাবস্ক্রিপশন (নতুন) ---------- */
+async function addNotification({ type, title, body }) {
+  const db = await getDb();
+  const col = db.collection('notifications');
+  const doc = {
+    id: 'N' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+    type, title, body: body || '', read: false, createdAt: new Date().toISOString()
+  };
+  await col.insertOne(doc);
+  // সর্বশেষ ১০০টা রাখি, পুরনোগুলো মুছে ফেলি
+  const old = await col.find({}, { projection: { _id: 1 } }).sort({ createdAt: -1 }).skip(100).toArray();
+  if (old.length) await col.deleteMany({ _id: { $in: old.map(o => o._id) } });
+  return stripId(doc);
+}
+
+async function getNotifications(limit = 30) {
+  const db = await getDb();
+  const col = db.collection('notifications');
+  const items = (await col.find().sort({ createdAt: -1 }).limit(limit).toArray()).map(stripId);
+  const unread = await col.countDocuments({ read: false });
+  return { items, unread };
+}
+
+async function countUnreadNotifications() {
+  const db = await getDb();
+  return db.collection('notifications').countDocuments({ read: false });
+}
+
+async function markNotificationsRead() {
+  const db = await getDb();
+  await db.collection('notifications').updateMany({ read: false }, { $set: { read: true } });
+}
+
+async function savePushSub(subscription) {
+  const db = await getDb();
+  await db.collection('pushSubs').updateOne(
+    { endpoint: subscription.endpoint },
+    { $set: { endpoint: subscription.endpoint, subscription, createdAt: new Date().toISOString() } },
+    { upsert: true }
+  );
+}
+
+async function getPushSubs() {
+  const db = await getDb();
+  return (await db.collection('pushSubs').find().toArray()).map(stripId);
+}
+
+async function deletePushSub(endpoint) {
+  const db = await getDb();
+  await db.collection('pushSubs').deleteOne({ endpoint });
+}
+
+// VAPID কী — প্রথমবার নিজে থেকে তৈরি হয়ে ডেটাবেসে সেভ হয়, আলাদা কিছু বসাতে হয় না
+async function getVapidKeys(generate) {
+  const db = await getDb();
+  const col = db.collection('meta');
+  let doc = await col.findOne({ _id: 'vapid' });
+  if (!doc) {
+    const keys = generate();
+    await col.updateOne({ _id: 'vapid' }, { $setOnInsert: { publicKey: keys.publicKey, privateKey: keys.privateKey } }, { upsert: true });
+    doc = await col.findOne({ _id: 'vapid' });
+  }
+  return { publicKey: doc.publicKey, privateKey: doc.privateKey };
+}
+
+/* ---------- স্টক (অ্যাপের ভেতরে) (নতুন) ---------- */
+function normName(str) {
+  return String(str || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+async function getStockList() {
+  const db = await getDb();
+  return (await db.collection('stock').find().sort({ name: 1 }).toArray()).map(stripId);
+}
+
+async function setStock(name, qty) {
+  const db = await getDb();
+  const col = db.collection('stock');
+  if (qty === null || qty === undefined || qty === '') {
+    await col.deleteOne({ name });
+    return null;
+  }
+  const n = Math.max(0, Math.floor(Number(qty)));
+  await col.updateOne(
+    { name },
+    { $set: { name, qty: n, updatedAt: new Date().toISOString() } },
+    { upsert: true }
+  );
+  return { name, qty: n };
+}
+
+// AI যে নাম লিখেছে তার সাথে সবচেয়ে মিল থাকা স্টক এন্ট্রি খোঁজে (পুরোপুরি মিল > সবচেয়ে লম্বা আংশিক মিল)
+async function findStockEntry(productName) {
+  const target = normName(productName);
+  if (!target) return null;
+  const list = await getStockList();
+  const exact = list.find(e => normName(e.name) === target);
+  if (exact) return exact;
+  let best = null;
+  for (const e of list) {
+    const n = normName(e.name);
+    if (n.length < 3) continue;
+    if (n.includes(target) || target.includes(n)) {
+      if (!best || n.length > normName(best.name).length) best = e;
+    }
+  }
+  return best;
+}
+
+// স্টক থেকে n টা কমায় — যথেষ্ট না থাকলে কমায় না (একসাথে দুই অর্ডার এলেও নেগেটিভ হবে না)
+async function decrementStock(name, n) {
+  const db = await getDb();
+  const result = await db.collection('stock').findOneAndUpdate(
+    { name, qty: { $gte: n } },
+    { $inc: { qty: -n }, $set: { updatedAt: new Date().toISOString() } },
+    { returnDocument: 'after' }
+  );
+  const doc = docOf(result);
+  if (doc) return { ok: true, qty: doc.qty };
+  const cur = await db.collection('stock').findOne({ name });
+  return { ok: false, qty: cur ? cur.qty : 0 };
+}
+
+async function incrementStock(name, n) {
+  const db = await getDb();
+  const result = await db.collection('stock').findOneAndUpdate(
+    { name },
+    { $inc: { qty: n }, $set: { updatedAt: new Date().toISOString() } },
+    { returnDocument: 'after' }
+  );
+  const doc = docOf(result);
+  return doc ? { ok: true, qty: doc.qty } : { ok: false, qty: 0 };
+}
+
 module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
@@ -413,5 +593,10 @@ module.exports = {
   addEmailLog, getEmailLogs,
   getAiRules, addAiRule, deleteAiRule,
   addAiUsage, setAiRateInfo, setAiLastError, getAiUsage,
-  getAiImages, addAiImage, getAiImageData, deleteAiImage
+  getAiImages, addAiImage, getAiImageData, deleteAiImage,
+  getOrderById, setOrderFields, getCustomerById,
+  setNeedsHuman, clearNeedsHuman,
+  addNotification, getNotifications, countUnreadNotifications, markNotificationsRead,
+  savePushSub, getPushSubs, deletePushSub, getVapidKeys,
+  getStockList, setStock, findStockEntry, decrementStock, incrementStock
 };
