@@ -54,4 +54,60 @@ async function downloadMedia(url) {
   return Buffer.from(res.data);
 }
 
-module.exports = { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedia };
+/* ---------- পেজে পোস্ট (ছবিসহ) — এখনই অথবা ফেসবুকের নিজস্ব শিডিউলে ---------- */
+const FormData = require('form-data');
+const GRAPH = 'https://graph.facebook.com/v19.0';
+
+function friendlyFbError(err) {
+  const e = err.response && err.response.data && err.response.data.error;
+  if (!e) return new Error(err.message);
+  let msg = e.message || err.message;
+  if (e.code === 190) msg = 'Facebook টোকেনের মেয়াদ শেষ — Settings থেকে Facebook আবার কানেক্ট করুন';
+  else if (e.code === 200 || e.code === 10 || e.code === 299) msg = 'পোস্ট করার অনুমতি (pages_manage_posts) নেই — Settings থেকে Facebook আবার কানেক্ট করুন';
+  const out = new Error(msg);
+  out.fbError = e;
+  return out;
+}
+
+async function uploadUnpublishedOrLivePhoto(token, buffer, fields) {
+  const form = new FormData();
+  form.append('source', buffer, { filename: 'post.jpg', contentType: 'image/jpeg' });
+  form.append('access_token', token);
+  Object.keys(fields).forEach(k => form.append(k, String(fields[k])));
+  const res = await axios.post(`${GRAPH}/me/photos`, form, {
+    headers: form.getHeaders(), timeout: 60000, maxBodyLength: Infinity, maxContentLength: Infinity
+  });
+  return res.data;
+}
+
+// scheduledAtMs না দিলে এখনই পোস্ট হয়। দিলে ফেসবুক নিজেই ঠিক সময়ে পোস্ট করে
+// (আমাদের সার্ভার ঘুমিয়ে থাকলেও সমস্যা নেই)। ফেসবুকের নিয়ম: এখন থেকে ১০ মিনিট থেকে ৩০ দিনের মধ্যে।
+async function publishPagePhoto({ token, caption, buffer, scheduledAtMs }) {
+  try {
+    if (!scheduledAtMs) {
+      const r = await uploadUnpublishedOrLivePhoto(token, buffer, { caption });
+      return { fbPostId: r.post_id || r.id, fbPhotoId: r.id };
+    }
+    const photo = await uploadUnpublishedOrLivePhoto(token, buffer, { published: 'false' });
+    const params = new URLSearchParams();
+    params.append('message', caption);
+    params.append('attached_media[0]', JSON.stringify({ media_fbid: photo.id }));
+    params.append('published', 'false');
+    params.append('scheduled_publish_time', String(Math.floor(scheduledAtMs / 1000)));
+    params.append('access_token', token);
+    const res = await axios.post(`${GRAPH}/me/feed`, params, { timeout: 30000 });
+    return { fbPostId: res.data.id, fbPhotoId: photo.id };
+  } catch (err) {
+    throw friendlyFbError(err);
+  }
+}
+
+async function deleteFbPost({ token, id }) {
+  try {
+    await axios.delete(`${GRAPH}/${id}`, { params: { access_token: token }, timeout: 15000 });
+  } catch (err) {
+    throw friendlyFbError(err);
+  }
+}
+
+module.exports = { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedia, publishPagePhoto, deleteFbPost };
