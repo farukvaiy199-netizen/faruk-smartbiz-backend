@@ -39,16 +39,65 @@ async function postTracked(provider, url, body, cfg) {
 const ENDPOINTS = {
   groq: 'https://api.groq.com/openai/v1/chat/completions',
   openai: 'https://api.openai.com/v1/chat/completions',
-  openrouter: 'https://openrouter.ai/api/v1/chat/completions'
-  // gemini আলাদাভাবে হ্যান্ডেল হয়, নিচে দেখুন
+  openrouter: 'https://openrouter.ai/api/v1/chat/completions',
+  deepseek: 'https://api.deepseek.com/chat/completions',
+  mistral: 'https://api.mistral.ai/v1/chat/completions'
+  // gemini আলাদাভাবে হ্যান্ডেল হয়, নিচে দেখুন। "custom" এর ঠিকানা মালিক নিজে দেন।
 };
 
 const MODELS = {
   groq: 'llama-3.3-70b-versatile',
   openai: 'gpt-4o-mini',
   openrouter: 'openai/gpt-4o-mini',
-  gemini: 'gemini-2.0-flash'
+  gemini: 'gemini-2.0-flash',
+  deepseek: 'deepseek-chat',
+  mistral: 'mistral-small-latest'
 };
+
+// সেটিংসে তিনটা AI Key-র ঘর আছে (aiKey, aiKey2, aiKey3)। যেগুলোতে Key বসানো আছে সেগুলো ক্রমানুসারে সাজিয়ে দেয়।
+// প্রতিটা ঘরে প্রোভাইডার, ঐচ্ছিক মডেলের নাম আর (custom হলে) Base URL থাকে।
+function getSlots(settings) {
+  const slots = [];
+  for (const sfx of ['', '2', '3']) {
+    const apiKey = settings['aiKey' + sfx];
+    if (!apiKey) continue;
+    slots.push({
+      apiKey,
+      provider: settings['aiProvider' + sfx] || 'groq',
+      model: (settings['aiModel' + sfx] || '').trim(),
+      baseUrl: (settings['aiBaseUrl' + sfx] || '').trim()
+    });
+  }
+  return slots;
+}
+
+// ক্রমানুসারে প্রতিটা ঘর চেষ্টা করে — একটা কোটা/রেট-লিমিট/এররে আটকালে পরেরটা
+async function withSlots(settings, fn) {
+  const slots = getSlots(settings);
+  if (!slots.length) throw new Error('কোনো AI Key সংযুক্ত নেই');
+  let lastErr;
+  for (let i = 0; i < slots.length; i++) {
+    try {
+      return await fn(slots[i]);
+    } catch (err) {
+      lastErr = err;
+      const more = i < slots.length - 1;
+      console.warn(`AI Key #${i + 1} (${slots[i].provider}) ব্যর্থ: ${(err.response && err.response.status) || ''} ${err.message}${more ? ' — পরের Key চেষ্টা করা হচ্ছে' : ''}`);
+    }
+  }
+  throw lastErr;
+}
+
+function resolveEndpoint(provider, baseUrl) {
+  if (provider === 'custom') {
+    let u = String(baseUrl || '').trim().replace(/\/+$/, '');
+    if (!u) throw new Error('Custom AI-র Base URL দেওয়া নেই');
+    if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+    if (!/\/chat\/completions$/.test(u)) u += '/chat/completions';
+    return u;
+  }
+  return ENDPOINTS[provider] || ENDPOINTS.groq;
+}
 
 // ছবি বোঝার (vision) ক্ষমতা শুধু এই প্রোভাইডারগুলোর আছে — Groq-এর টেক্সট মডেল ছবি দেখতে পারে না
 function isVisionCapable(provider) {
@@ -59,7 +108,7 @@ function isVisionCapable(provider) {
  * কাস্টমারের মেসেজ পড়ে AI দিয়ে রিপ্লাই বানায়।
  * AI কে বলা হয় JSON আকারে ফেরত দিতে: { reply, order }
  */
-async function getAIReply({ apiKey, provider = 'groq', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [], stockList = [] }) {
+async function getAIReply({ apiKey, provider = 'groq', model = '', baseUrl = '', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [], stockList = [] }) {
   // অ্যাপের স্টক পেজ থেকে মালিকের বসানো বর্তমান স্টক — এটাই সবচেয়ে নির্ভরযোগ্য
   const stockBlock = stockList.length
     ? `\n=== বর্তমান স্টক (অ্যাপ থেকে, সবচেয়ে নির্ভরযোগ্য) ===\nনিচের তালিকায় যে প্রোডাক্ট আছে তার স্টক শুধু এখান থেকে বলবে (শিটের Stock কলামের চেয়ে এটা বেশি সঠিক)। ০ হলে "স্টকে নেই" বলবে, আর অর্ডার নেবে না:\n${stockList.map(e => `- ${e.name}: ${e.qty > 0 ? e.qty + 'টি আছে' : 'স্টক শেষ'}`).join('\n')}\n`
@@ -168,28 +217,16 @@ ${rulesBlock}${imagesBlock}${stockBlock}
 `.trim();
 
   if (provider === 'gemini') {
-    return getGeminiReply({ apiKey, systemPrompt, customerMessage, history });
+    return getGeminiReply({ apiKey, model, systemPrompt, customerMessage, history });
   }
-  return getOpenAiCompatibleReply({ apiKey, provider, systemPrompt, customerMessage, history });
+  return getOpenAiCompatibleReply({ apiKey, provider, model, baseUrl, systemPrompt, customerMessage, history });
 }
 
-// প্রধান AI Key ব্যর্থ হলে (rate limit/quota/এরর) স্বয়ংক্রিয়ভাবে ব্যাকআপ Key দিয়ে আবার চেষ্টা করে
+// প্রধান AI Key ব্যর্থ হলে (rate limit/quota/এরর) স্বয়ংক্রিয়ভাবে পরের ঘরের Key দিয়ে আবার চেষ্টা করে
 async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [], stockList = [] }) {
-  try {
-    return await getAIReply({
-      apiKey: settings.aiKey, provider: settings.aiProvider,
-      customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList
-    });
-  } catch (err) {
-    if (settings.aiKey2 && settings.aiProvider2) {
-      console.warn('প্রধান AI Key ব্যর্থ হয়েছে, ব্যাকআপ Key দিয়ে আবার চেষ্টা করা হচ্ছে:', err.message);
-      return await getAIReply({
-        apiKey: settings.aiKey2, provider: settings.aiProvider2,
-        customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList
-      });
-    }
-    throw err;
-  }
+  return withSlots(settings, (slot) => getAIReply({
+    ...slot, customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList
+  }));
 }
 
 /* ---------- ছবি দেখে প্রোডাক্ট মেলানো (নতুন) ---------- */
@@ -246,10 +283,11 @@ ${sheetContext || 'দোকানের কোনো প্রোডাক্�
   return parseAIJson(raw);
 }
 
-/* ---------- Groq / OpenAI / OpenRouter (একই ফরম্যাট) ---------- */
-async function getOpenAiCompatibleReply({ apiKey, provider, systemPrompt, customerMessage, history }) {
-  const endpoint = ENDPOINTS[provider] || ENDPOINTS.groq;
-  const model = MODELS[provider] || MODELS.groq;
+/* ---------- Groq / OpenAI / OpenRouter / DeepSeek / Mistral / Custom (একই ফরম্যাট) ---------- */
+async function getOpenAiCompatibleReply({ apiKey, provider, model = '', baseUrl = '', systemPrompt, customerMessage, history, rawJson = false }) {
+  const endpoint = resolveEndpoint(provider, baseUrl);
+  const useModel = model || MODELS[provider] || (provider === 'custom' ? '' : MODELS.groq);
+  if (!useModel) throw new Error('Custom AI-র মডেলের নাম দেওয়া নেই');
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -266,19 +304,27 @@ async function getOpenAiCompatibleReply({ apiKey, provider, systemPrompt, custom
     headers['X-Title'] = "Faruk's SmartBiz";
   }
 
-  const res = await postTracked(provider, 
-    endpoint,
-    { model, messages, temperature: 0.15, response_format: { type: 'json_object' } },
-    { headers, timeout: 15000 }
-  );
+  const body = { model: useModel, messages, temperature: 0.15, response_format: { type: 'json_object' } };
+  let res;
+  try {
+    res = await postTracked(provider, endpoint, body, { headers, timeout: 20000 });
+  } catch (err) {
+    // কাস্টম প্রোভাইডার অনেক সময় response_format বোঝে না (400) — ওটা ছাড়া আরেকবার চেষ্টা
+    if (provider === 'custom' && err.response && err.response.status === 400) {
+      const { response_format, ...plain } = body;
+      res = await postTracked(provider, endpoint, plain, { headers, timeout: 20000 });
+    } else {
+      throw err;
+    }
+  }
 
-  const raw = res.data.choices?.[0]?.message?.content || '{}';
-  return parseAIJson(raw);
+  const raw = (res.data.choices && res.data.choices[0] && res.data.choices[0].message && res.data.choices[0].message.content) || '{}';
+  return rawJson ? parseRawJson(raw) : parseAIJson(raw);
 }
 
 /* ---------- Google Gemini (আলাদা ফরম্যাট) ---------- */
-async function getGeminiReply({ apiKey, systemPrompt, customerMessage, history }) {
-  const model = MODELS.gemini;
+async function getGeminiReply({ apiKey, model: modelOverride = '', systemPrompt, customerMessage, history, rawJson = false }) {
+  const model = modelOverride || MODELS.gemini;
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const contents = [
@@ -300,7 +346,21 @@ async function getGeminiReply({ apiKey, systemPrompt, customerMessage, history }
   );
 
   const raw = res.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  return parseAIJson(raw);
+  return rawJson ? parseRawJson(raw) : parseAIJson(raw);
+}
+
+// কাস্টমার-চ্যাটের বাইরের কাজের জন্য (যেমন পোস্টের খসড়া): JSON যেমন আছে তেমনই ফেরত দেয়
+function parseRawJson(raw) {
+  try { return JSON.parse(raw); } catch (e) {}
+  const m = String(raw).match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch (e) {} }
+  return {};
+}
+
+async function getJsonReply({ settings, systemPrompt, userMessage }) {
+  return withSlots(settings, (slot) => slot.provider === 'gemini'
+    ? getGeminiReply({ apiKey: slot.apiKey, model: slot.model, systemPrompt, customerMessage: userMessage, history: [], rawJson: true })
+    : getOpenAiCompatibleReply({ ...slot, systemPrompt, customerMessage: userMessage, history: [], rawJson: true }));
 }
 
 function parseAIJson(raw) {
@@ -308,7 +368,10 @@ function parseAIJson(raw) {
   try {
     parsed = JSON.parse(raw);
   } catch (e) {
-    parsed = { reply: raw, order: null };
+    // কিছু AI JSON-এর আগে-পরে অতিরিক্ত লেখা বা ```json বসায় — ভেতরের { ... } অংশটা তুলে নিই
+    const m = String(raw).match(/\{[\s\S]*\}/);
+    if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) { parsed = null; } }
+    if (!parsed) parsed = { reply: raw, order: null };
   }
   return {
     reply: parsed.reply || 'দুঃখিত, একটু পরে আবার চেষ্টা করুন।',
@@ -345,17 +408,10 @@ ${hasImage ? `
 শুধুমাত্র এই JSON ফরম্যাটে উত্তর দাও: {"reply": "মালিককে বলার কথা", "rule": null অথবা "সংরক্ষণের নিয়ম"${hasImage ? ', "imageLabel": null অথবা "প্রোডাক্টের ছোট নাম"' : ''}}
 `.trim();
 
-  const run = (apiKey, provider) => provider === 'gemini'
-    ? getGeminiReply({ apiKey, systemPrompt, customerMessage: message, history })
-    : getOpenAiCompatibleReply({ apiKey, provider, systemPrompt, customerMessage: message, history });
-
-  try {
-    return await run(settings.aiKey, settings.aiProvider);
-  } catch (err) {
-    if (settings.aiKey2 && settings.aiProvider2) return await run(settings.aiKey2, settings.aiProvider2);
-    throw err;
-  }
+  return withSlots(settings, (slot) => slot.provider === 'gemini'
+    ? getGeminiReply({ apiKey: slot.apiKey, model: slot.model, systemPrompt, customerMessage: message, history })
+    : getOpenAiCompatibleReply({ ...slot, systemPrompt, customerMessage: message, history }));
 }
 
-module.exports = { getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply };
+module.exports = { getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply, getSlots, getJsonReply };
 
