@@ -61,10 +61,16 @@ function defaultSettings() {
     aiKey: '', aiProvider: 'groq', aiAutoReply: true,
     // ব্যাকআপ AI Key — প্রধানটা কোটা/রেট-লিমিটে আটকে গেলে এটা ব্যবহার হবে
     aiKey2: '', aiProvider2: 'groq',
+    aiKey3: '', aiProvider3: 'groq',
+    // প্রতিটা ঘরের ঐচ্ছিক মডেলের নাম ও (custom প্রোভাইডারের জন্য) Base URL — খালি থাকলে ডিফল্ট ব্যবহার হয়
+    aiModel: '', aiModel2: '', aiModel3: '',
+    aiBaseUrl: '', aiBaseUrl2: '', aiBaseUrl3: '',
     // প্রতিটা প্রোভাইডারের দৈনিক টোকেন সীমা (আপনার প্ল্যান অনুযায়ী বদলানো যাবে) — Groq ফ্রি = ১,০০,০০০
     aiLimits: { groq: 100000 },
     // স্টক এই সংখ্যা বা এর নিচে নামলে মালিকের কাছে অ্যালার্ট যায়
-    lowStockThreshold: 5
+    lowStockThreshold: 5,
+    // মালিকের নোট: আসন্ন উপলক্ষ, অফার, কোন দিকে জোর দেবেন — পোস্টের খসড়া বানানোর সময় AI এটা দেখে
+    postNotes: ''
   };
 }
 
@@ -74,7 +80,8 @@ function computeConnected(s) {
     wa: !!(s.waToken && s.waPhoneNumberId),
     sheet: !!s.sheetLink,
     ai: !!s.aiKey,
-    ai2: !!s.aiKey2
+    ai2: !!s.aiKey2,
+    ai3: !!s.aiKey3
   };
 }
 
@@ -584,6 +591,33 @@ async function incrementStock(name, n) {
   return doc ? { ok: true, qty: doc.qty } : { ok: false, qty: 0 };
 }
 
+/* ---------- ফেসবুক পোস্টের হিস্টোরি (নতুন) ---------- */
+async function addPost(doc) {
+  const db = await getDb();
+  const post = { id: 'P' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), createdAt: new Date().toISOString(), ...doc };
+  await db.collection('posts').insertOne(post);
+  // সর্বশেষ ৬০টা রাখি, পুরনো থাম্বনেইলসহ মুছে ফেলি — ডেটাবেসের জায়গা বাঁচাতে
+  const col = db.collection('posts');
+  const old = await col.find({}, { projection: { _id: 1 } }).sort({ createdAt: -1 }).skip(60).toArray();
+  if (old.length) await col.deleteMany({ _id: { $in: old.map(o => o._id) } });
+  return stripId(post);
+}
+
+async function getPosts(limit = 30) {
+  const db = await getDb();
+  return (await db.collection('posts').find().sort({ createdAt: -1 }).limit(limit).toArray()).map(stripId);
+}
+
+async function getPostById(id) {
+  const db = await getDb();
+  return stripId(await db.collection('posts').findOne({ id }));
+}
+
+async function deletePostRecord(id) {
+  const db = await getDb();
+  await db.collection('posts').deleteOne({ id });
+}
+
 module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
@@ -598,5 +632,6 @@ module.exports = {
   setNeedsHuman, clearNeedsHuman,
   addNotification, getNotifications, countUnreadNotifications, markNotificationsRead,
   savePushSub, getPushSubs, deletePushSub, getVapidKeys,
-  getStockList, setStock, findStockEntry, decrementStock, incrementStock
+  getStockList, setStock, findStockEntry, decrementStock, incrementStock,
+  addPost, getPosts, getPostById, deletePostRecord
 };
