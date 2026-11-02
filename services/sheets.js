@@ -141,6 +141,7 @@ async function getSheetProducts(sheetLink) {
     let nameIdx = header.findIndex(h => h.includes('name') || h.includes('নাম') || h.includes('product') || h.includes('প্রোডাক্ট'));
     if (nameIdx === -1) nameIdx = 0;
     const stockIdx = header.findIndex(h => h.includes('stock') || h.includes('স্টক') || h.includes('quantity'));
+    const priceIdx = header.findIndex(h => h.includes('price') || h.includes('দাম') || h.includes('মূল্য') || h.includes('মুল্য'));
     const out = [];
     const seen = new Set();
     rows.slice(1, 300).forEach(r => {
@@ -152,7 +153,13 @@ async function getSheetProducts(sheetLink) {
         const n = parseInt(r[stockIdx], 10);
         if (!isNaN(n)) stock = n;
       }
-      out.push({ name, stock });
+      let price = '';
+      if (priceIdx !== -1) {
+        const raw = (r[priceIdx] || '').trim();
+        // শুধু সংখ্যা হলে ৳ বসাই, নইলে শিটে যেভাবে লেখা সেভাবেই রাখি
+        price = /^[0-9০-৯.,\s]+$/.test(raw) && raw ? '৳' + raw.replace(/\s+/g, '') : raw;
+      }
+      out.push({ name, stock, price });
     });
     return out;
   } catch (err) {
