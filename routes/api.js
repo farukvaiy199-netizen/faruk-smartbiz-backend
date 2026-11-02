@@ -6,9 +6,11 @@ const config = require('../config');
 const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
-const { getOwnerChatReply } = require('../services/ai');
+const { getOwnerChatReply, getSlots } = require('../services/ai');
 const { notifyOwner, getPublicKey } = require('../services/notify');
 const { getSheetProducts } = require('../services/sheets');
+const { generatePostDraft } = require('../services/content');
+const { publishPagePhoto, deleteFbPost } = require('../services/facebook');
 
 // বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে
 function bdDateString(d) {
@@ -21,12 +23,18 @@ router.get('/dashboard/summary', async (req, res) => {
   const customers = await store.getCustomers();
   const today = bdDateString(new Date());
   const todayOrders = orders.filter(o => bdDateString(o.createdAt) === today);
+  const liveOrders = orders.filter(o => o.status !== 'Cancelled');
+  const trend = [6, 5, 4, 3, 2, 1, 0].map(i => {
+    const day = bdDateString(new Date(Date.now() - i * 86400000));
+    return liveOrders.filter(o => bdDateString(o.createdAt) === day).reduce((sum, o) => sum + (o.price || 0) * (o.qty || 1), 0);
+  });
   const settings = await store.getSettings();
   const threshold = settings.lowStockThreshold ?? 5;
   const stockEntries = await store.getStockList();
   res.json({
     lowStockCount: stockEntries.filter(e => e.qty <= threshold).length,
-    todayRevenue: todayOrders.reduce((sum, o) => sum + (o.price * o.qty), 0),
+    todayRevenue: todayOrders.filter(o => o.status !== 'Cancelled').reduce((sum, o) => sum + (o.price || 0) * (o.qty || 1), 0),
+    trend,
     todayOrders: todayOrders.length,
     pendingCount: orders.filter(o => o.status === 'Pending').length,
     totalCustomers: customers.length
@@ -224,7 +232,7 @@ router.post('/ai-rules/chat', async (req, res) => {
   if (!message) message = 'এই ছবিটা সংরক্ষণ করো।';
 
   const settings = await store.getSettings();
-  if (!settings.aiKey) return res.status(400).json({ error: 'আগে Settings-এ AI Key সংযুক্ত করুন' });
+  if (!getSlots(settings).length) return res.status(400).json({ error: 'আগে Settings-এ AI Key সংযুক্ত করুন' });
 
   // ছবি থাকলে আগেই যাচাই: ফরম্যাট, সাইজ, সর্বোচ্চ সংখ্যা
   let image = null;
@@ -291,7 +299,8 @@ router.get('/ai-usage', async (req, res) => {
     ...usage,
     limits: settings.aiLimits || {},
     primary: settings.aiKey ? settings.aiProvider : null,
-    backup: settings.aiKey2 ? settings.aiProvider2 : null
+    backup: settings.aiKey2 ? settings.aiProvider2 : null,
+    backup2: settings.aiKey3 ? settings.aiProvider3 : null
   });
 });
 
@@ -358,6 +367,78 @@ router.post('/stock/import', async (req, res) => {
   res.json({ ok: true, imported: count });
 });
 
+/* ---------- ফেসবুক পোস্ট (নতুন) ---------- */
+router.get('/posts', async (req, res) => {
+  res.json(await store.getPosts(30));
+});
+
+router.post('/posts/generate', async (req, res) => {
+  const settings = await store.getSettings();
+  if (!getSlots(settings).length) return res.status(400).json({ error: 'আগে Settings-এ AI Key সংযুক্ত করুন' });
+  try {
+    const draft = await generatePostDraft(settings, String(req.body.hint || ''));
+    res.json({ draft });
+  } catch (err) {
+    console.error('post draft error:', err.response?.data ? JSON.stringify(err.response.data) : err.message);
+    res.status(500).json({ error: err.message && err.message.startsWith('AI খসড়া') ? err.message : 'AI এই মুহূর্তে খসড়া বানাতে পারছে না (কোটা শেষ হতে পারে) — একটু পরে আবার চেষ্টা করুন' });
+  }
+});
+
+router.post('/posts', async (req, res) => {
+  const settings = await store.getSettings();
+  if (!settings.fbToken) return res.status(400).json({ error: 'আগে Settings থেকে Facebook পেজ সংযুক্ত করুন' });
+
+  const caption = String(req.body.caption || '').trim().slice(0, 2000);
+  if (!caption) return res.status(400).json({ error: 'ক্যাপশন খালি' });
+
+  const m = String(req.body.imageData || '').match(/^data:image\/(?:jpeg|png);base64,([A-Za-z0-9+/=]+)$/);
+  if (!m) return res.status(400).json({ error: 'ছবির ডেটা সঠিক না' });
+  if (m[1].length > 2500000) return res.status(400).json({ error: 'ছবিটা অনেক বড়' });
+  const buffer = Buffer.from(m[1], 'base64');
+
+  let whenMs = null;
+  if (req.body.scheduledAt) {
+    whenMs = new Date(req.body.scheduledAt).getTime();
+    if (isNaN(whenMs)) return res.status(400).json({ error: 'সময় সঠিক না' });
+    if (whenMs < Date.now() + 11 * 60000) return res.status(400).json({ error: 'অন্তত ১১ মিনিট পরের সময় দিন (ফেসবুকের নিয়ম)' });
+    if (whenMs > Date.now() + 29 * 86400000) return res.status(400).json({ error: 'সর্বোচ্চ ২৯ দিন পর পর্যন্ত শিডিউল করা যায়' });
+  }
+
+  const thumb = typeof req.body.thumbData === 'string' && req.body.thumbData.length < 80000 && req.body.thumbData.startsWith('data:image/') ? req.body.thumbData : '';
+  const base = { caption, productName: String(req.body.productName || '').slice(0, 120), thumb };
+
+  try {
+    const r = await publishPagePhoto({ token: settings.fbToken, caption, buffer, scheduledAtMs: whenMs });
+    const post = await store.addPost({
+      ...base,
+      status: whenMs ? 'scheduled' : 'published',
+      scheduledAt: whenMs ? new Date(whenMs).toISOString() : null,
+      fbPostId: r.fbPostId, fbPhotoId: r.fbPhotoId
+    });
+    res.json(post);
+  } catch (err) {
+    console.error('fb publish error:', err.message);
+    await store.addPost({ ...base, status: 'failed', error: String(err.message).slice(0, 200), scheduledAt: whenMs ? new Date(whenMs).toISOString() : null });
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// নির্ধারিত পোস্ট ফেসবুক থেকে বাতিল করে তালিকা থেকে সরায়। পোস্ট হয়ে যাওয়া/ব্যর্থ পোস্ট শুধু তালিকা থেকে সরে (ফেসবুক থেকে মোছে না)
+router.delete('/posts/:id', async (req, res) => {
+  const post = await store.getPostById(req.params.id);
+  if (!post) return res.status(404).json({ error: 'পোস্টটা পাওয়া যায়নি' });
+  if (post.status === 'scheduled' && post.fbPostId) {
+    const settings = await store.getSettings();
+    try {
+      await deleteFbPost({ token: settings.fbToken, id: post.fbPostId });
+    } catch (err) {
+      return res.status(502).json({ error: 'ফেসবুক থেকে বাতিল করা যায়নি (' + err.message + ') — Facebook-এর Publishing Tools থেকে নিজে বাতিল করুন' });
+    }
+  }
+  await store.deletePostRecord(post.id);
+  res.json({ ok: true });
+});
+
 /* ---------- Email Logs ---------- */
 router.get('/email-logs', async (req, res) => {
   res.json(await store.getEmailLogs());
@@ -377,6 +458,10 @@ router.get('/settings', async (req, res) => {
     faqSheetLink: s.faqSheetLink,
     aiProvider: s.aiProvider,
     aiProvider2: s.aiProvider2,
+    aiProvider3: s.aiProvider3,
+    aiModel: s.aiModel, aiModel2: s.aiModel2, aiModel3: s.aiModel3,
+    aiBaseUrl: s.aiBaseUrl, aiBaseUrl2: s.aiBaseUrl2, aiBaseUrl3: s.aiBaseUrl3,
+    postNotes: s.postNotes,
     aiAutoReply: s.aiAutoReply,
     connected: s.connected,
     sheetStorageConfigured: !!config.sheetScriptUrl,
