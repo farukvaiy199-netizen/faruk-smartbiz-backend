@@ -3,7 +3,7 @@ const router = express.Router();
 
 const config = require('../config');
 const store = require('../services/store');
-const { getAIReplyWithFallback, getVisionReply, isVisionCapable } = require('../services/ai');
+const { getAIReplyWithFallback, getVisionReply, isVisionCapable, getSlots } = require('../services/ai');
 const { transcribeAudio, isWhisperCapable } = require('../services/speech');
 const { getCombinedSheetContext, getProductStock, writeOrderToSheet, writeCustomerToSheet } = require('../services/sheets');
 const { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedia } = require('../services/facebook');
@@ -25,9 +25,8 @@ async function withRetry(fn, retries = 1, delayMs = 1500) {
 }
 
 function pickCapableKey(settings, capableCheck) {
-  if (settings.aiKey && capableCheck(settings.aiProvider)) return { apiKey: settings.aiKey, provider: settings.aiProvider };
-  if (settings.aiKey2 && capableCheck(settings.aiProvider2)) return { apiKey: settings.aiKey2, provider: settings.aiProvider2 };
-  return null;
+  const slot = getSlots(settings).find(sl => capableCheck(sl.provider));
+  return slot ? { apiKey: slot.apiKey, provider: slot.provider } : null;
 }
 
 function buildConfirmationText(order) {
@@ -199,7 +198,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone });
 
   if (!customer.ai) return;
-  if (!settings.aiKey) {
+  if (!getSlots(settings).length) {
     console.warn('AI API key সেট করা নেই — Settings থেকে বসান।');
     return;
   }
@@ -461,7 +460,7 @@ router.post('/ai-reply', async (req, res) => {
     if (!settings.aiAutoReply) {
       return res.json({ reply: '' });
     }
-    if (!settings.aiKey) {
+    if (!getSlots(settings).length) {
       return res.status(400).json({ error: 'AI API key সংযুক্ত নেই — SmartBiz Settings-এ বসান' });
     }
     if (!message.trim()) {
