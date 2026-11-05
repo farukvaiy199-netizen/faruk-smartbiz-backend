@@ -10,6 +10,7 @@ const { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedi
 const { sendWhatsAppMessage, sendWhatsAppImage, getWhatsAppMediaBuffer } = require('../services/whatsapp');
 const { sendOrderConfirmationEmail } = require('../services/email');
 const { notifyOwner } = require('../services/notify');
+const { sendInstagramMessage, sendInstagramImage, getInstagramProfile } = require('../services/instagram');
 const crypto = require('crypto');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
@@ -37,7 +38,7 @@ function buildConfirmationText(order) {
 // নোটিফিকেশনে কাস্টমারের নাম দেখানোর জন্য — নাম জানা না থাকলে প্ল্যাটফর্ম + আইডির শেষ ৪ অক্ষর
 function displayName(c) {
   if (c.name && c.name !== 'অজানা কাস্টমার') return c.name;
-  const plat = c.platform === 'facebook' ? 'Messenger' : c.platform === 'whatsapp' ? 'WhatsApp' : 'কাস্টমার';
+  const plat = c.platform === 'facebook' ? 'Messenger' : c.platform === 'whatsapp' ? 'WhatsApp' : c.platform === 'instagram' ? 'Instagram' : 'কাস্টমার';
   return plat + ' ···' + String(c.platformId || c.id || '').slice(-4);
 }
 
@@ -177,6 +178,59 @@ router.post('/whatsapp', verifyMeta(config.waAppSecret, 'WhatsApp'), async (req,
   }
 });
 
+/* =============== INSTAGRAM (মেসেজ) =============== */
+// Meta অ্যাপের Webhooks → Instagram-এ এই লিংক বসাতে হয়: https://<আপনার-সার্ভার>/webhook/instagram
+
+router.get('/instagram', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === config.webhookVerifyToken) {
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+router.post('/instagram', verifyMeta(config.fbAppSecret, 'Instagram'), async (req, res) => {
+  res.sendStatus(200);
+  const entries = req.body.entry || [];
+  for (const entry of entries) {
+    const events = entry.messaging || [];
+    for (const event of events) {
+      const senderId = event.sender && event.sender.id;
+      const msg = event.message;
+      if (!senderId || !msg) continue;
+      // নিজের অ্যাকাউন্টের পাঠানো মেসেজের প্রতিধ্বনি বাদ
+      if (msg.is_echo || String(senderId) === String(entry.id)) continue;
+      try {
+        const text = msg.text;
+        const attachments = msg.attachments || [];
+        const imageAttachment = attachments.find(a => a.type === 'image');
+        const audioAttachment = attachments.find(a => a.type === 'audio');
+
+        let imageBuffer = null, imageMime = null, audioBuffer = null;
+        if (imageAttachment && imageAttachment.payload && imageAttachment.payload.url) {
+          imageBuffer = await downloadMedia(imageAttachment.payload.url);
+          imageMime = 'image/jpeg';
+        }
+        if (audioAttachment && audioAttachment.payload && audioAttachment.payload.url) {
+          audioBuffer = await downloadMedia(audioAttachment.payload.url);
+        }
+
+        if (!text && !imageBuffer && !audioBuffer) {
+          // স্টোরি রিপ্লাই/রিল শেয়ার ইত্যাদি — বোঝার মতো কিছু নেই, তবু কাস্টমারকে তালিকায় রাখি
+          await ensureCustomer({ platform: 'instagram', platformId: senderId });
+          continue;
+        }
+
+        await handleIncomingMessage({ platform: 'instagram', platformId: senderId, text, imageBuffer, imageMime, audioBuffer });
+      } catch (err) {
+        console.error('Instagram webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response && err.response.data ? JSON.stringify(err.response.data) : err.message);
+      }
+    }
+  }
+});
+
 /* =============== SHARED HANDLER =============== */
 
 // যেকোনো ধরনের মেসেজ (স্টিকার, লাইক, ভিডিও ইত্যাদিও) এলে কাস্টমারকে তালিকায় যোগ করি,
@@ -189,6 +243,12 @@ async function ensureCustomer({ platform, platformId, name, phone }) {
     const profile = await getFacebookProfile(platformId, settings.fbToken);
     if (profile.name || profile.photoUrl) {
       await store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
+    }
+  }
+  if (platform === 'instagram' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
+    const profile = await getInstagramProfile(platformId, settings.fbToken);
+    if (profile.name || profile.photoUrl || profile.username) {
+      await store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl, username: profile.username });
     }
   }
   return { settings, customer };
@@ -215,6 +275,12 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       if (imgUrl) {
         try { await withRetry(() => sendWhatsAppImage(platformId, imgUrl, settings.waPhoneNumberId, settings.waToken)); }
         catch (err) { console.error('ছবি পাঠাতে ব্যর্থ (WhatsApp):', err.message); }
+      }
+    } else if (platform === 'instagram' && settings.fbToken) {
+      await withRetry(() => sendInstagramMessage(platformId, replyText, settings.fbToken));
+      if (imgUrl) {
+        try { await withRetry(() => sendInstagramImage(platformId, imgUrl, settings.fbToken)); }
+        catch (err) { console.error('ছবি পাঠাতে ব্যর্থ (Instagram):', err.message); }
       }
     }
   };
@@ -368,7 +434,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
         product: order.product,
         qty: wantQty,
         price: order.price || 0,
-        source: platform === 'facebook' ? 'Messenger' : 'WhatsApp',
+        source: platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : 'WhatsApp',
         stockItem: reservedStock ? reservedStock.name : ''
       });
     } catch (err) {
