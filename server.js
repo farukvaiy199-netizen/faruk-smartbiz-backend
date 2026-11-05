@@ -3,6 +3,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const config = require('./config');
 const store = require('./services/store');
+const { runDueInstagramPosts } = require('./services/scheduler');
 
 const authRoutes = require('./routes/auth');
 const requireAuth = require('./middleware/auth');
@@ -46,6 +47,34 @@ app.use('/webhook/ai-reply', webhookLimiter);
 app.use('/webhook/order', webhookLimiter);
 app.use('/webhook', webhookRoutes);
 
+// শিডিউল করা পোস্টের ছবি — Instagram এই পাবলিক লিংক থেকে ছবি নিয়ে পোস্ট করে
+app.get('/pmedia/:file', async (req, res) => {
+  try {
+    const id = String(req.params.file).replace(/\.[a-z0-9]+$/i, '');
+    const m = await store.getPostMedia(id);
+    if (!m) return res.sendStatus(404);
+    res.set('Content-Type', m.mime || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(Buffer.from(m.b64, 'base64'));
+  } catch (err) {
+    res.sendStatus(500);
+  }
+});
+
+// UptimeRobot প্রতি ৫ মিনিটে এই লিংকে পিং করলে সার্ভার জেগে ওঠে এবং সময় হয়ে যাওয়া Instagram পোস্ট চালায়
+app.get('/cron/run', async (req, res) => {
+  try {
+    const key = await store.getCronKey();
+    const given = String(req.query.key || '');
+    const ok = given.length === key.length && require('crypto').timingSafeEqual(Buffer.from(given), Buffer.from(key));
+    if (!ok) return res.sendStatus(403);
+    const ran = await runDueInstagramPosts();
+    res.json({ ok: true, ran });
+  } catch (err) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 // মালিকের আপলোড করা প্রোডাক্ট ছবি — Messenger/WhatsApp এই পাবলিক লিংক থেকে ছবি নিয়ে কাস্টমারকে দেখায়
 app.get('/media/:id', async (req, res) => {
   try {
@@ -61,6 +90,10 @@ app.get('/media/:id', async (req, res) => {
 
 // বাকি সব /api রুট — বৈধ লগইন টোকেন ছাড়া কেউ ডেটা দেখতে বা কিছু পরিবর্তন করতে পারবে না
 app.use('/api', requireAuth, apiRoutes);
+
+// সার্ভার জেগে থাকলে প্রতি মিনিটে সময় হয়ে যাওয়া Instagram পোস্ট চালাই; চালু হওয়ার ২০ সেকেন্ড পরেও একবার (ঘুম থেকে ওঠার পর বাকি কাজ ধরতে)
+setInterval(() => { runDueInstagramPosts().catch(() => {}); }, 60 * 1000);
+setTimeout(() => { runDueInstagramPosts().catch(() => {}); }, 20 * 1000);
 
 app.listen(config.port, () => {
   console.log(`✅ Server চলছে: http://localhost:${config.port}`);
