@@ -70,7 +70,9 @@ function defaultSettings() {
     // স্টক এই সংখ্যা বা এর নিচে নামলে মালিকের কাছে অ্যালার্ট যায়
     lowStockThreshold: 5,
     // মালিকের নোট: আসন্ন উপলক্ষ, অফার, কোন দিকে জোর দেবেন — পোস্টের খসড়া বানানোর সময় AI এটা দেখে
-    postNotes: ''
+    postNotes: '',
+    // পেজের সাথে যুক্ত Instagram অ্যাকাউন্ট (Facebook কানেক্টের সময় নিজে থেকে খুঁজে বের হয়)
+    igUserId: '', igUsername: ''
   };
 }
 
@@ -81,7 +83,8 @@ function computeConnected(s) {
     sheet: !!s.sheetLink,
     ai: !!s.aiKey,
     ai2: !!s.aiKey2,
-    ai3: !!s.aiKey3
+    ai3: !!s.aiKey3,
+    ig: !!s.igUserId
   };
 }
 
@@ -144,13 +147,14 @@ async function setCustomerAI(id, aiOn) {
   return stripId(await col.findOne({ id }));
 }
 
-async function updateCustomerContact(id, { name, phone, photoUrl }) {
+async function updateCustomerContact(id, { name, phone, photoUrl, username }) {
   const db = await getDb();
   const col = db.collection('customers');
   const set = {};
   if (name && name.trim()) set.name = name.trim();
   if (phone && phone.trim()) set.phone = phone.trim();
   if (photoUrl) set.photoUrl = photoUrl;
+  if (username) set.username = username;
   if (Object.keys(set).length) await col.updateOne({ id }, { $set: set });
   return stripId(await col.findOne({ id }));
 }
@@ -598,8 +602,12 @@ async function addPost(doc) {
   await db.collection('posts').insertOne(post);
   // সর্বশেষ ৬০টা রাখি, পুরনো থাম্বনেইলসহ মুছে ফেলি — ডেটাবেসের জায়গা বাঁচাতে
   const col = db.collection('posts');
-  const old = await col.find({}, { projection: { _id: 1 } }).sort({ createdAt: -1 }).skip(60).toArray();
-  if (old.length) await col.deleteMany({ _id: { $in: old.map(o => o._id) } });
+  const old = await col.find({}, { projection: { _id: 1, mediaId: 1 } }).sort({ createdAt: -1 }).skip(60).toArray();
+  if (old.length) {
+    await col.deleteMany({ _id: { $in: old.map(o => o._id) } });
+    const mediaIds = old.map(o => o.mediaId).filter(Boolean);
+    if (mediaIds.length) await db.collection('postMedia').deleteMany({ id: { $in: mediaIds } });
+  }
   return stripId(post);
 }
 
@@ -618,6 +626,59 @@ async function deletePostRecord(id) {
   await db.collection('posts').deleteOne({ id });
 }
 
+/* ---------- Instagram শিডিউল: পোস্টের ছবি, কাজের তালিকা, গোপন কী (নতুন) ---------- */
+async function addPostMedia({ mime, b64 }) {
+  const db = await getDb();
+  const id = 'PM' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  await db.collection('postMedia').insertOne({ id, mime, b64, createdAt: new Date().toISOString() });
+  return id;
+}
+async function getPostMedia(id) {
+  const db = await getDb();
+  return db.collection('postMedia').findOne({ id });
+}
+async function deletePostMedia(id) {
+  const db = await getDb();
+  await db.collection('postMedia').deleteOne({ id });
+}
+async function updatePost(id, fields) {
+  const db = await getDb();
+  await db.collection('posts').updateOne({ id }, { $set: fields });
+  return stripId(await db.collection('posts').findOne({ id }));
+}
+// সময় হয়েছে এমন একটা Instagram কাজ আটকে নেয় (একসাথে দুইবার পোস্ট ঠেকাতে atomic)
+async function claimDueIgPost() {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const result = await db.collection('posts').findOneAndUpdate(
+    { igStatus: 'pending', igDueAt: { $lte: now } },
+    { $set: { igStatus: 'publishing', igClaimedAt: now } },
+    { sort: { igDueAt: 1 }, returnDocument: 'after' }
+  );
+  return stripId(docOf(result));
+}
+// ১০ মিনিটের বেশি "চলছে" অবস্থায় আটকে থাকা কাজ আবার না চালিয়ে ব্যর্থ ধরি — নইলে দুইবার পোস্ট হয়ে যেতে পারে
+async function failStuckIgPosts() {
+  const db = await getDb();
+  const cutoff = new Date(Date.now() - 10 * 60000).toISOString();
+  await db.collection('posts').updateMany(
+    { igStatus: 'publishing', igClaimedAt: { $lt: cutoff } },
+    { $set: { igStatus: 'failed', igError: 'অনিশ্চিত অবস্থা — Instagram-এ গিয়ে দেখে নিন পোস্ট হয়েছে কিনা' } }
+  );
+}
+// বাইরের পিং (UptimeRobot) যে গোপন লিংকে আসবে তার কী — প্রথমবার নিজে তৈরি হয়
+async function getCronKey() {
+  const db = await getDb();
+  const col = db.collection('meta');
+  let doc = await col.findOne({ _id: 'cron' });
+  if (!doc) {
+    const key = require('crypto').randomBytes(12).toString('hex');
+    await col.updateOne({ _id: 'cron' }, { $setOnInsert: { key } }, { upsert: true });
+    doc = await col.findOne({ _id: 'cron' });
+  }
+  return doc.key;
+}
+
 module.exports = {
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
@@ -633,5 +694,6 @@ module.exports = {
   addNotification, getNotifications, countUnreadNotifications, markNotificationsRead,
   savePushSub, getPushSubs, deletePushSub, getVapidKeys,
   getStockList, setStock, findStockEntry, decrementStock, incrementStock,
-  addPost, getPosts, getPostById, deletePostRecord
+  addPost, getPosts, getPostById, deletePostRecord,
+  addPostMedia, getPostMedia, deletePostMedia, updatePost, claimDueIgPost, failStuckIgPosts, getCronKey
 };
