@@ -11,6 +11,8 @@ const { notifyOwner, getPublicKey } = require('../services/notify');
 const { getSheetProducts } = require('../services/sheets');
 const { generatePostDraft } = require('../services/content');
 const { publishPagePhoto, deleteFbPost } = require('../services/facebook');
+const { detectInstagramAccount, sendInstagramMessage } = require('../services/instagram');
+const { publishIgJob } = require('../services/scheduler');
 
 // বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে
 function bdDateString(d) {
@@ -86,6 +88,9 @@ router.patch('/orders/:id', async (req, res) => {
         notifyStatus = 'sent';
       } else if (customer && customer.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
         await sendWhatsAppMessage(customer.platformId, text, settings.waPhoneNumberId, settings.waToken);
+        notifyStatus = 'sent';
+      } else if (customer && customer.platform === 'instagram' && settings.fbToken) {
+        await sendInstagramMessage(customer.platformId, text, settings.fbToken);
         notifyStatus = 'sent';
       } else {
         notifyNote = customer ? 'ওয়েবসাইট কাস্টমার — মেসেজ পাঠানোর মাধ্যম নেই' : 'কাস্টমার পাওয়া যায়নি';
@@ -197,6 +202,8 @@ router.post('/broadcast', async (req, res) => {
         await sendFacebookMessage(c.platformId, message, settings.fbToken);
       } else if (c.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
         await sendWhatsAppMessage(c.platformId, message, settings.waPhoneNumberId, settings.waToken);
+      } else if (c.platform === 'instagram' && settings.fbToken) {
+        await sendInstagramMessage(c.platformId, message, settings.fbToken);
       } else {
         throw new Error('platform not connected');
       }
@@ -409,12 +416,33 @@ router.post('/posts', async (req, res) => {
 
   try {
     const r = await publishPagePhoto({ token: settings.fbToken, caption, buffer, scheduledAtMs: whenMs });
+    // Instagram-এও পোস্ট করার অনুরোধ থাকলে ছবি ডেটাবেসে রাখি (Instagram পাবলিক লিংক থেকে ছবি নেয়)
+    const wantIg = req.body.postToInstagram === true;
+    let igFields = {};
+    if (wantIg) {
+      if (!settings.igUserId) {
+        igFields = { igStatus: 'skipped', igError: 'Instagram সংযুক্ত নেই' };
+      } else {
+        const mediaId = await store.addPostMedia({ mime: 'image/jpeg', b64: m[1] });
+        igFields = {
+          igStatus: whenMs ? 'pending' : 'publishing',
+          igDueAt: whenMs ? new Date(whenMs).toISOString() : new Date().toISOString(),
+          mediaId
+        };
+      }
+    }
     const post = await store.addPost({
       ...base,
+      ...igFields,
       status: whenMs ? 'scheduled' : 'published',
       scheduledAt: whenMs ? new Date(whenMs).toISOString() : null,
       fbPostId: r.fbPostId, fbPhotoId: r.fbPhotoId
     });
+    // এখনই পোস্ট হলে Instagram-এও সাথে সাথে; শিডিউল হলে সময় এলে সার্ভার নিজে পোস্ট করবে
+    if (igFields.igStatus === 'publishing') {
+      await publishIgJob(post, settings, false);
+      return res.json(await store.getPostById(post.id));
+    }
     res.json(post);
   } catch (err) {
     console.error('fb publish error:', err.message);
@@ -435,8 +463,29 @@ router.delete('/posts/:id', async (req, res) => {
       return res.status(502).json({ error: 'ফেসবুক থেকে বাতিল করা যায়নি (' + err.message + ') — Facebook-এর Publishing Tools থেকে নিজে বাতিল করুন' });
     }
   }
+  if (post.mediaId) await store.deletePostMedia(post.mediaId);
   await store.deletePostRecord(post.id);
   res.json({ ok: true });
+});
+
+/* ---------- Instagram (নতুন) ---------- */
+router.post('/settings/ig-detect', async (req, res) => {
+  const settings = await store.getSettings();
+  if (!settings.fbToken) return res.status(400).json({ error: 'আগে Facebook পেজ সংযুক্ত করুন' });
+  try {
+    const ig = await detectInstagramAccount(settings.fbToken, settings.fbPageId);
+    if (!ig) return res.json({ ok: false, message: 'এই পেজের সাথে যুক্ত কোনো Instagram Professional অ্যাকাউন্ট পাওয়া যায়নি, অথবা টোকেনে Instagram-এর অনুমতি নেই' });
+    await store.saveSettings(ig);
+    res.json({ ok: true, ...ig });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// UptimeRobot-এ যে গোপন লিংক বসাতে হবে (শিডিউল করা Instagram পোস্ট সময়মতো চালাতে)
+router.get('/cron-info', async (req, res) => {
+  const key = await store.getCronKey();
+  res.json({ url: `${config.publicUrl}/cron/run?key=${key}` });
 });
 
 /* ---------- Email Logs ---------- */
@@ -462,6 +511,7 @@ router.get('/settings', async (req, res) => {
     aiModel: s.aiModel, aiModel2: s.aiModel2, aiModel3: s.aiModel3,
     aiBaseUrl: s.aiBaseUrl, aiBaseUrl2: s.aiBaseUrl2, aiBaseUrl3: s.aiBaseUrl3,
     postNotes: s.postNotes,
+    igUserId: s.igUserId, igUsername: s.igUsername,
     aiAutoReply: s.aiAutoReply,
     connected: s.connected,
     sheetStorageConfigured: !!config.sheetScriptUrl,
@@ -499,7 +549,13 @@ router.post('/settings/fb-auto', async (req, res) => {
     const longLivedToken = r.data.access_token;
 
     await store.saveSettings({ fbToken: longLivedToken, fbPageId: pageId, fbAppId });
-    res.json({ ok: true, pageName });
+    // পেজের সাথে যুক্ত Instagram অ্যাকাউন্ট থাকলে নিজে থেকে খুঁজে সেভ করি (না পেলেও ফেসবুক কানেকশন ঠিকই থাকে)
+    let ig = null;
+    try {
+      ig = await detectInstagramAccount(longLivedToken, pageId);
+      if (ig) await store.saveSettings(ig);
+    } catch (e) { console.warn('Instagram খোঁজা যায়নি:', e.message); }
+    res.json({ ok: true, pageName, ig });
   } catch (err) {
     console.error('fb-auto error:', err.response?.data || err.message);
     res.status(400).json({ error: 'Facebook টোকেন এক্সচেঞ্জ ব্যর্থ হয়েছে' });
