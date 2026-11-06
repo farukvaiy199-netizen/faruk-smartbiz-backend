@@ -35,6 +35,9 @@ module.exports = {
   // (Render নিজেই RENDER_EXTERNAL_URL সেট করে দেয়, তাই আলাদা কিছু বসাতে হবে না)
   // Meta-র সই (X-Hub-Signature-256) না মিললে রিকোয়েস্ট বাদ দেবে কিনা। প্রথমে false (শুধু লগে সতর্কতা) রাখুন,
   // লগে "✅ সই মিলেছে" দেখার পর Render-এ META_SIGNATURE_ENFORCE=true বসান।
+  // Instagram-এর আলাদা "Instagram app secret" থাকলে (Meta অ্যাপের Instagram সেটআপ পেজে দেখায়) এখানে বসান —
+  // Instagram ওয়েবহুকের সই ওটা দিয়েও হতে পারে। না বসালে শুধু FB_APP_SECRET দিয়ে মেলানো হয়।
+  igAppSecret: process.env.IG_APP_SECRET || '',
   metaSignatureEnforce: process.env.META_SIGNATURE_ENFORCE === 'true',
 
   publicUrl: (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://faruk-smartbiz-backend-1.onrender.com').replace(/\/+$/, '')
