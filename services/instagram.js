@@ -29,6 +29,25 @@ async function detectInstagramAccount(token, pageId) {
   }
 }
 
+// পেজ এই অ্যাপের মেসেজ-ওয়েবহুকে সাবস্ক্রাইব করা আছে কিনা দেখে; "messages" না থাকলে যোগ করে (আগের ফিল্ডগুলো রেখেই)।
+// ফলাফল: { fields: [...], changed: bool, error: string|null } — কখনো এরর ছোঁড়ে না
+async function ensurePageSubscription(token, pageId) {
+  const target = pageId || 'me';
+  try {
+    const cur = await axios.get(`${GRAPH}/${target}/subscribed_apps`, { params: { access_token: token }, timeout: 15000 });
+    const apps = (cur.data && cur.data.data) || [];
+    const fields = apps.length ? (apps[0].subscribed_fields || []) : [];
+    if (fields.includes('messages')) return { fields, changed: false, error: null };
+    const merged = Array.from(new Set(fields.concat(['messages', 'messaging_postbacks'])));
+    await axios.post(`${GRAPH}/${target}/subscribed_apps`,
+      new URLSearchParams({ subscribed_fields: merged.join(','), access_token: token }), { timeout: 15000 });
+    return { fields: merged, changed: true, error: null };
+  } catch (err) {
+    const e = err.response && err.response.data && err.response.data.error;
+    return { fields: [], changed: false, error: (e && e.message) || err.message };
+  }
+}
+
 // ছবি (JPEG, পাবলিক লিংক) → মিডিয়া কনটেইনার → পাবলিশ
 async function publishInstagramPhoto({ token, igUserId, imageUrl, caption }) {
   try {
@@ -110,4 +129,4 @@ async function getInstagramProfile(igsid, token) {
   }
 }
 
-module.exports = { detectInstagramAccount, publishInstagramPhoto, sendInstagramMessage, sendInstagramImage, getInstagramProfile, chunkByBytes, igError };
+module.exports = { ensurePageSubscription, detectInstagramAccount, publishInstagramPhoto, sendInstagramMessage, sendInstagramImage, getInstagramProfile, chunkByBytes, igError };
