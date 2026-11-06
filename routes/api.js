@@ -11,7 +11,7 @@ const { notifyOwner, getPublicKey } = require('../services/notify');
 const { getSheetProducts } = require('../services/sheets');
 const { generatePostDraft } = require('../services/content');
 const { publishPagePhoto, deleteFbPost } = require('../services/facebook');
-const { detectInstagramAccount, sendInstagramMessage } = require('../services/instagram');
+const { detectInstagramAccount, sendInstagramMessage, ensurePageSubscription } = require('../services/instagram');
 const { publishIgJob } = require('../services/scheduler');
 
 // বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে
@@ -476,7 +476,8 @@ router.post('/settings/ig-detect', async (req, res) => {
     const ig = await detectInstagramAccount(settings.fbToken, settings.fbPageId);
     if (!ig) return res.json({ ok: false, message: 'এই পেজের সাথে যুক্ত কোনো Instagram Professional অ্যাকাউন্ট পাওয়া যায়নি, অথবা টোকেনে Instagram-এর অনুমতি নেই' });
     await store.saveSettings(ig);
-    res.json({ ok: true, ...ig });
+    const sub = await ensurePageSubscription(settings.fbToken, settings.fbPageId);
+    res.json({ ok: true, ...ig, pageFields: sub.fields, subscriptionChanged: sub.changed, subscriptionError: sub.error });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
