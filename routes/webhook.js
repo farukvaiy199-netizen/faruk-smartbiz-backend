@@ -46,9 +46,10 @@ function displayName(c) {
 // সেটা মিলিয়ে দেখলে ভুয়া রিকোয়েস্ট ধরা পড়ে। META_SIGNATURE_ENFORCE=true না থাকলে শুধু লগে সতর্কতা দেয়,
 // রিকোয়েস্ট আটকায় না — যাতে App Secret ভুল থাকলে আসল মেসেজ হারিয়ে না যায়।
 const signatureOkLogged = {};
-function verifyMeta(secret, label) {
+function verifyMeta(secretOrList, label) {
+  const secrets = (Array.isArray(secretOrList) ? secretOrList : [secretOrList]).filter(Boolean);
   return (req, res, next) => {
-    if (!secret) {
+    if (!secrets.length) {
       if (!signatureOkLogged[label + ':nosecret']) {
         console.warn(`⚠️ ${label}: App Secret সেট নেই, সই যাচাই বাদ দেওয়া হচ্ছে`);
         signatureOkLogged[label + ':nosecret'] = true;
@@ -56,11 +57,14 @@ function verifyMeta(secret, label) {
       return next();
     }
     const sig = req.get('x-hub-signature-256') || '';
-    const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(req.rawBody || Buffer.from('')).digest('hex');
+    const raw = req.rawBody || Buffer.from('');
     let ok = false;
-    try {
-      ok = sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
-    } catch (e) { ok = false; }
+    for (const secret of secrets) {
+      const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');
+      try {
+        if (sig.length === expected.length && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) { ok = true; break; }
+      } catch (e) { /* পরের secret চেষ্টা */ }
+    }
 
     if (ok) {
       if (!signatureOkLogged[label]) {
@@ -70,7 +74,7 @@ function verifyMeta(secret, label) {
       return next();
     }
     if (config.metaSignatureEnforce) {
-      console.warn(`🚫 ${label}: সই মেলেনি, রিকোয়েস্ট বাদ দেওয়া হলো`);
+      console.warn(`🚫 ${label}: সই মেলেনি, রিকোয়েস্ট বাদ দেওয়া হলো${label === 'Instagram' ? ' — Render-এ IG_APP_SECRET (Instagram app secret) বসিয়ে দেখুন' : ''}`);
       return res.sendStatus(403);
     }
     console.warn(`⚠️ ${label}: সই মেলেনি (এখন শুধু সতর্কতা, রিকোয়েস্ট চলছে) — App Secret ঠিক আছে কিনা দেখুন`);
@@ -93,6 +97,7 @@ router.get('/facebook', (req, res) => {
 router.post('/facebook', verifyMeta(config.fbAppSecret, 'Facebook'), async (req, res) => {
   res.sendStatus(200);
   const entries = req.body.entry || [];
+  console.log(`📩 Facebook ওয়েবহুক এসেছে: object=${req.body.object}, মেসেজ-ইভেন্ট=${entries.reduce((n, e) => n + ((e.messaging || []).length), 0)}`);
   for (const entry of entries) {
     const events = entry.messaging || [];
     for (const event of events) {
@@ -191,9 +196,11 @@ router.get('/instagram', (req, res) => {
   return res.sendStatus(403);
 });
 
-router.post('/instagram', verifyMeta(config.fbAppSecret, 'Instagram'), async (req, res) => {
+router.post('/instagram', verifyMeta([config.fbAppSecret, config.igAppSecret], 'Instagram'), async (req, res) => {
   res.sendStatus(200);
   const entries = req.body.entry || [];
+  // Meta আদৌ Instagram ইভেন্ট পাঠাচ্ছে কিনা বোঝার জন্য প্রতিবার একটা লাইন লগে লিখি
+  console.log(`📩 Instagram ওয়েবহুক এসেছে: object=${req.body.object}, entry=${entries.length}, মেসেজ-ইভেন্ট=${entries.reduce((n, e) => n + ((e.messaging || []).length), 0)}`);
   for (const entry of entries) {
     const events = entry.messaging || [];
     for (const event of events) {
@@ -256,6 +263,7 @@ async function ensureCustomer({ platform, platformId, name, phone }) {
 
 async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer }) {
   const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone });
+  console.log(`💬 মেসেজ প্রসেস হচ্ছে: ${platform} / ${platformId} (AI ${customer.ai ? 'চালু' : 'বন্ধ'})`);
 
   if (!customer.ai) return;
   if (!getSlots(settings).length) {
