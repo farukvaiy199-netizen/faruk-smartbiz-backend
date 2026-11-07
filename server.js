@@ -4,6 +4,7 @@ const rateLimit = require('express-rate-limit');
 const config = require('./config');
 const store = require('./services/store');
 const { runDueInstagramPosts } = require('./services/scheduler');
+const videoPosts = require('./services/videoPosts');
 
 const authRoutes = require('./routes/auth');
 const requireAuth = require('./middleware/auth');
@@ -61,6 +62,16 @@ app.get('/pmedia/:file', async (req, res) => {
   }
 });
 
+// শিডিউল/পোস্ট করা ভিডিও — Instagram এই পাবলিক লিংক থেকে ভিডিও নিয়ে রিল বানায় (MongoDB GridFS থেকে)
+app.get('/pvideo/:file', async (req, res) => {
+  try {
+    const id = String(req.params.file).replace(/\.[a-z0-9]+$/i, '');
+    await videoPosts.streamVideo(id, req, res);
+  } catch (err) {
+    if (!res.headersSent) res.sendStatus(500);
+  }
+});
+
 // UptimeRobot প্রতি ৫ মিনিটে এই লিংকে পিং করলে সার্ভার জেগে ওঠে এবং সময় হয়ে যাওয়া Instagram পোস্ট চালায়
 app.get('/cron/run', async (req, res) => {
   try {
@@ -95,6 +106,8 @@ app.use('/api', requireAuth, apiRoutes);
 setInterval(() => { runDueInstagramPosts().catch(() => {}); }, 60 * 1000);
 setTimeout(() => { runDueInstagramPosts().catch(() => {}); }, 20 * 1000);
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, () => {
   console.log(`✅ Server চলছে: http://localhost:${config.port}`);
 });
+// বড় ভিডিও আপলোডে মোবাইল নেটে ৫ মিনিটের বেশি লাগতে পারে — Node-এর ডিফল্ট ৫ মিনিটের সীমা বাড়ানো হলো
+server.requestTimeout = 30 * 60 * 1000;
