@@ -13,6 +13,10 @@ const { generatePostDraft } = require('../services/content');
 const { publishPagePhoto, deleteFbPost } = require('../services/facebook');
 const { detectInstagramAccount, sendInstagramMessage, ensurePageSubscription } = require('../services/instagram');
 const { publishIgJob } = require('../services/scheduler');
+const videoPosts = require('../services/videoPosts');
+const multer = require('multer');
+const os = require('os');
+const fs = require('fs');
 
 // বাংলাদেশের সময় (UTC+6) অনুযায়ী তারিখ বের করে
 function bdDateString(d) {
@@ -451,6 +455,60 @@ router.post('/posts', async (req, res) => {
   }
 });
 
+/* ---------- ভিডিও পোস্ট: গ্যালারি থেকে ভিডিও → Facebook পেজ ও Instagram রিল (নতুন) ---------- */
+// ভিডিও বড় ফাইল, তাই JSON নয় — multipart আসে। ফাইল আগে সার্ভারের অস্থায়ী ফোল্ডারে নামে, তারপর পেছনে ফেসবুকে যায়।
+const videoUpload = multer({ dest: os.tmpdir(), limits: { fileSize: 200 * 1024 * 1024, files: 1 } });
+
+router.post('/posts/video', (req, res, next) => {
+  videoUpload.single('video')(req, res, err => {
+    if (!err) return next();
+    const tooBig = err.code === 'LIMIT_FILE_SIZE';
+    res.status(tooBig ? 413 : 400).json({ error: tooBig ? 'ভিডিও ২০০ MB-এর বেশি — ছোট ভিডিও দিন' : 'ভিডিও আপলোড ব্যর্থ হয়েছে' });
+  });
+}, async (req, res) => {
+  const file = req.file;
+  const drop = () => { if (file) fs.unlink(file.path, () => {}); };
+  try {
+    if (!file) return res.status(400).json({ error: 'ভিডিও পাওয়া যায়নি' });
+    if (!/^video\//i.test(file.mimetype || '')) { drop(); return res.status(400).json({ error: 'ভিডিও ফাইল বেছে নিন' }); }
+
+    const caption = String(req.body.caption || '').trim().slice(0, 2000);
+    if (!caption) { drop(); return res.status(400).json({ error: 'ক্যাপশন খালি' }); }
+
+    const settings = await store.getSettings();
+    const wantFb = req.body.postToFacebook !== 'false';
+    const wantIg = req.body.postToInstagram === 'true';
+    if (!wantFb && !wantIg) { drop(); return res.status(400).json({ error: 'Facebook বা Instagram অন্তত একটা বেছে নিন' }); }
+    if (!settings.fbToken) { drop(); return res.status(400).json({ error: 'আগে Settings থেকে Facebook পেজ সংযুক্ত করুন' }); }
+    if (!wantFb && !settings.igUserId) { drop(); return res.status(400).json({ error: 'Instagram সংযুক্ত নেই' }); }
+
+    let whenMs = null;
+    if (req.body.scheduledAt) {
+      whenMs = new Date(req.body.scheduledAt).getTime();
+      if (isNaN(whenMs)) { drop(); return res.status(400).json({ error: 'সময় সঠিক না' }); }
+      if (whenMs < Date.now() + 11 * 60000) { drop(); return res.status(400).json({ error: 'অন্তত ১১ মিনিট পরের সময় দিন (ফেসবুকের নিয়ম)' }); }
+      if (whenMs > Date.now() + 29 * 86400000) { drop(); return res.status(400).json({ error: 'সর্বোচ্চ ২৯ দিন পর পর্যন্ত শিডিউল করা যায়' }); }
+    }
+
+    const thumb = typeof req.body.thumbData === 'string' && req.body.thumbData.length < 80000 && req.body.thumbData.startsWith('data:image/') ? req.body.thumbData : '';
+    const post = await store.addPost({
+      caption, productName: String(req.body.productName || '').slice(0, 120), thumb,
+      mediaType: 'video',
+      status: 'processing',
+      scheduledAt: whenMs ? new Date(whenMs).toISOString() : null
+    });
+
+    // ফাইল সার্ভারে পৌঁছে গেছে — অ্যাপকে সাথে সাথে জবাব দিই, ফেসবুক/Instagram-এ পাঠানো পেছনে চলে (তালিকায় অবস্থা দেখা যায়)
+    res.json(post);
+    videoPosts.processVideoPost({ post, filePath: file.path, mime: file.mimetype, settings, whenMs, wantFb, wantIg })
+      .catch(err => console.error('video post error:', err.message));
+  } catch (err) {
+    drop();
+    console.error('video upload error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'ভিডিও জমা নেওয়া যায়নি' });
+  }
+});
+
 // নির্ধারিত পোস্ট ফেসবুক থেকে বাতিল করে তালিকা থেকে সরায়। পোস্ট হয়ে যাওয়া/ব্যর্থ পোস্ট শুধু তালিকা থেকে সরে (ফেসবুক থেকে মোছে না)
 router.delete('/posts/:id', async (req, res) => {
   const post = await store.getPostById(req.params.id);
@@ -463,7 +521,10 @@ router.delete('/posts/:id', async (req, res) => {
       return res.status(502).json({ error: 'ফেসবুক থেকে বাতিল করা যায়নি (' + err.message + ') — Facebook-এর Publishing Tools থেকে নিজে বাতিল করুন' });
     }
   }
-  if (post.mediaId) await store.deletePostMedia(post.mediaId);
+  if (post.mediaId) {
+    if (post.mediaType === 'video') await videoPosts.deleteVideo(post.mediaId);
+    else await store.deletePostMedia(post.mediaId);
+  }
   await store.deletePostRecord(post.id);
   res.json({ ok: true });
 });
