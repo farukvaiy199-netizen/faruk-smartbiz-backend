@@ -679,7 +679,18 @@ async function getCronKey() {
   return doc.key;
 }
 
+// ৪০ মিনিটের বেশি "আপলোড চলছে" অবস্থায় আটকে থাকা ভিডিও পোস্ট ব্যর্থ ধরি (সার্ভার মাঝপথে রিস্টার্ট হলে এমন হতে পারে)
+async function failStuckVideoPosts() {
+  const db = await getDb();
+  const cutoff = new Date(Date.now() - 40 * 60000).toISOString();
+  await db.collection('posts').updateMany(
+    { status: 'processing', createdAt: { $lt: cutoff } },
+    { $set: { status: 'failed', error: 'ভিডিও আপলোড শেষ হয়নি (সার্ভার রিস্টার্ট হতে পারে) — আবার চেষ্টা করুন' } }
+  );
+}
+
 module.exports = {
+  getDb, failStuckVideoPosts,
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
