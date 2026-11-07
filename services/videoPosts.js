@@ -2,11 +2,16 @@
 // ভিডিও বড় ফাইল, তাই সার্ভারের ডিস্কে নয় MongoDB-তে (GridFS) রাখা হয় — redeploy হলেও হারায় না।
 // শুধু Instagram-এর জন্য রাখা হয় (Instagram পাবলিক লিংক থেকে ভিডিও টেনে নেয়); পাবলিশ বা ব্যর্থ হলে মুছে ফেলা হয়।
 const fs = require('fs');
+const { spawn } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const { GridFSBucket } = require('mongodb');
 const store = require('./store');
 const { notifyOwner } = require('./notify');
+
+// ffmpeg-static থাকলে তার বাইনারি, নইলে সিস্টেমের ffmpeg; কোনোটাই না থাকলে রূপান্তর বাদ যায় (ভিডিও যেমন আছে তেমনই যায়)
+let FFMPEG = 'ffmpeg';
+try { FFMPEG = require('ffmpeg-static') || 'ffmpeg'; } catch (e) { /* নেই */ }
 
 const GRAPH = 'https://graph.facebook.com/v19.0';
 const GRAPH_VIDEO = 'https://graph-video.facebook.com/v19.0';
@@ -150,9 +155,59 @@ async function publishInstagramReel({ token, igUserId, videoUrl, caption }) {
   }
 }
 
+
+/* ---------- যেকোনো ভিডিও → Facebook/Instagram-এর উপযোগী MP4 (H.264 + AAC) ---------- */
+function runFfmpeg(args, timeoutMs) {
+  return new Promise((resolve) => {
+    let err = '';
+    let p;
+    try { p = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] }); }
+    catch (e) { return resolve({ code: -1, err: String(e.message || e) }); }
+    const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch (e) {} }, timeoutMs);
+    p.stderr.on('data', d => { if (err.length < 200000) err += d.toString(); });
+    p.on('error', e => { clearTimeout(t); resolve({ code: -1, err: String(e.message || e) }); });
+    p.on('close', code => { clearTimeout(t); resolve({ code, err }); });
+  });
+}
+
+// ফরম্যাট আগেই ঠিক (H.264 + yuv420p, অডিও AAC বা নেই) হলে null; নইলে নতুন MP4 ফাইলের পথ। ffmpeg না থাকলে/ব্যর্থ হলে null।
+async function normalizeVideo(filePath) {
+  const probe = await runFfmpeg(['-hide_banner', '-i', filePath], 60000);
+  if (probe.code === -1) return null; // ffmpeg চালানো যায়নি
+  const info = probe.err;
+  const v264 = /Video: h264[^\n]*yuv420p/.test(info);
+  const hasAudio = /Audio:/.test(info);
+  const aac = !hasAudio || /Audio: aac/.test(info);
+  if (v264 && aac) return null;
+
+  const out = filePath + '.conv.mp4';
+  const r = await runFfmpeg([
+    '-y', '-i', filePath,
+    '-map', '0:v:0', '-map', '0:a:0?',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p',
+    '-vf', "scale='min(1080,iw)':-2",
+    '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+    '-movflags', '+faststart', '-threads', '1',
+    out
+  ], 25 * 60 * 1000);
+  if (r.code !== 0 || !fs.existsSync(out)) {
+    fs.unlink(out, () => {});
+    console.error('ভিডিও রূপান্তর ব্যর্থ:', String(r.err).slice(-300));
+    return null;
+  }
+  return out;
+}
+
 /* ---------- পুরো কাজ (রিকোয়েস্টের জবাব দেওয়ার পর পেছনে চলে) ---------- */
-async function processVideoPost({ post, filePath, mime, settings, whenMs, wantFb, wantIg }) {
+async function processVideoPost({ post, filePath: origPath, mime: origMime, settings, whenMs, wantFb, wantIg }) {
+  let filePath = origPath, mime = origMime, convPath = null;
   try {
+    // ০) ফরম্যাট ঠিক না থাকলে নিজে থেকেই MP4 (H.264) বানিয়ে নিই — HEVC/MOV/অন্য ফরম্যাট সব চলবে
+    try {
+      convPath = await normalizeVideo(origPath);
+      if (convPath) { filePath = convPath; mime = 'video/mp4'; }
+    } catch (e) { console.error('রূপান্তর এরর:', e.message); }
+
     // ১) Facebook
     let fbVideoId = '';
     if (wantFb) {
@@ -201,11 +256,12 @@ async function processVideoPost({ post, filePath, mime, settings, whenMs, wantFb
     console.error('ভিডিও পোস্ট এরর:', err.message);
     await store.updatePost(post.id, { status: 'failed', error: errMsg(err) }).catch(() => {});
   } finally {
-    fs.unlink(filePath, () => {});
+    fs.unlink(origPath, () => {});
+    if (convPath) fs.unlink(convPath, () => {});
   }
 }
 
 module.exports = {
   processVideoPost, publishInstagramReel, uploadFacebookVideo,
-  saveVideo, deleteVideo, streamVideo, parseRange
+  saveVideo, deleteVideo, streamVideo, parseRange, normalizeVideo
 };
