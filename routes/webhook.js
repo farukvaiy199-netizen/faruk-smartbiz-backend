@@ -16,6 +16,17 @@ const shop = require('../services/shop');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
+// ওয়েবসাইট সংযুক্ত থাকলে প্রোডাক্টের তালিকা ওয়েবসাইট থেকেই আসে (শিটের পুরনো তালিকা নয়); শিটের FAQ আগের মতোই কাজ করে
+async function getSheetCtx(settings, text) {
+  const websiteOnly = await shop.usesWebsiteProducts();
+  try {
+    return await getCombinedSheetContext(websiteOnly ? '' : settings.sheetLink, settings.faqSheetLink, text);
+  } catch (err) {
+    console.error('শিট তথ্য আনা যায়নি:', err.message);
+    return '';
+  }
+}
+
 async function withRetry(fn, retries = 1, delayMs = 1500) {
   try {
     return await fn();
@@ -324,7 +335,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       return;
     }
 
-    const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, '');
+    const sheetContext = (await getSheetCtx(settings, '')) + (await shop.getAiContext(''));
     try {
       const { reply } = await getVisionReply({
         apiKey: visionKey.apiKey, provider: visionKey.provider,
@@ -346,7 +357,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
 
   await store.appendMessage(customer.id, 'user', text);
 
-  const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, text);
+  const sheetContext = await getSheetCtx(settings, text);
   const fullHistory = await store.getConversation(customer.id);
   const history = fullHistory.slice(0, -1);
   const ownerRules = (await store.getAiRules()).map(r => r.text);
@@ -354,7 +365,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const stockList = (await store.getStockList()).map(e => ({ name: e.name, qty: e.qty }));
   const shopContext = await shop.getAiContext(text); // ই-কমার্স ওয়েবসাইটের লাইভ প্রোডাক্ট/স্টক/অফার (সংযুক্ত না থাকলে ফাঁকা)
 
-  const { reply, imageUrl, imageId, order, handoff } = await getAIReplyWithFallback({
+  const { reply, imageUrl, imageId, shopProductId, order, handoff } = await getAIReplyWithFallback({
     settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext
   });
 
@@ -362,6 +373,10 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   let finalImageUrl = imageUrl;
   if (imageId && ownerImages.some(i => i.id === imageId)) {
     finalImageUrl = `${config.publicUrl}/media/${imageId}`;
+  }
+  // ওয়েবসাইটের প্রোডাক্টের ছবি (পাওয়া না গেলে null — তখন reply-তে থাকা লিংকই কাস্টমার পান)
+  if (!finalImageUrl && shopProductId) {
+    finalImageUrl = await shop.getProductImage(shopProductId);
   }
 
   await store.appendMessage(customer.id, 'assistant', reply);
@@ -552,7 +567,7 @@ router.post('/ai-reply', async (req, res) => {
       history = history.slice(0, -1);
     }
 
-    const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, message);
+    const sheetContext = await getSheetCtx(settings, message);
     const ownerRules = (await store.getAiRules()).map(r => r.text);
     const stockList = (await store.getStockList()).map(e => ({ name: e.name, qty: e.qty }));
     const shopContext = await shop.getAiContext(message);
