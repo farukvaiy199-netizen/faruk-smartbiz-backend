@@ -14,6 +14,7 @@ const { publishPagePhoto, deleteFbPost } = require('../services/facebook');
 const { detectInstagramAccount, sendInstagramMessage, ensurePageSubscription } = require('../services/instagram');
 const { publishIgJob } = require('../services/scheduler');
 const videoPosts = require('../services/videoPosts');
+const shop = require('../services/shop');
 const multer = require('multer');
 const os = require('os');
 const fs = require('fs');
@@ -653,6 +654,24 @@ router.post('/settings/wa-auto', async (req, res) => {
     console.error('wa-auto error:', err.response?.data || err.message);
     res.status(400).json({ error: 'WhatsApp টোকেন এক্সচেঞ্জ ব্যর্থ হয়েছে' });
   }
+});
+
+/* ---------- ই-কমার্স ওয়েবসাইট সংযোগ (নতুন) ---------- */
+router.get('/shop/status', async (req, res) => {
+  try { res.json(await shop.status()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+router.post('/shop/connect', async (req, res) => {
+  try { res.json(await shop.connect(req.body || {})); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/shop/sync', async (req, res) => {
+  try { res.json((await shop.sync(true)) || (await shop.status())); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/shop/disconnect', async (req, res) => {
+  try { await shop.disconnect(); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 module.exports = router;
