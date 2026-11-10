@@ -165,6 +165,7 @@ ${rulesBlock}${imagesBlock}${stockBlock}${shopContext}
 দাম, ডেলিভারি, স্টক, অর্ডারের মতো সাধারণ প্রশ্নে কখনো handoff দেবে না — অকারণে দিলে মালিককে বিরক্ত করা হয়।
 
 === অর্ডার নেওয়ার নিয়ম (কঠোরভাবে মানতে হবে) ===
+[ওয়েবসাইটের তথ্যের মধ্যে "অর্ডার নেওয়ার নীতি" থাকলে আগে সেটা মানবে — কাস্টমার এখানে অর্ডার দিতে চাইলে তবেই নিচের নিয়ম প্রযোজ্য]
 ১) কাস্টমার যা টাইপ করে পাঠায় তা হুবহু (word-for-word) কপি করে "order" এ বসাবে —
    নাম/ফোন/ঠিকানা কখনো অনুবাদ/সংক্ষেপ/অনুমান করবে না।
 ২) কখনোই কোনো তথ্য নিজে থেকে অনুমান করে বসাবে না। কাস্টমার স্পষ্ট না বললে সেই ফিল্ড খালি থাকবে।
@@ -200,6 +201,7 @@ ${rulesBlock}${imagesBlock}${stockBlock}${shopContext}
   "reply": "কাস্টমারকে পাঠানোর মেসেজ",
   "imageUrl": null অথবা "শিট থেকে পাওয়া হুবহু ছবির লিংক",
   "imageId": null অথবা "মালিকের ছবির তালিকা থেকে হুবহু ID",
+  "shopProductId": null অথবা "ওয়েবসাইটের প্রোডাক্ট-তালিকার [ID] থেকে হুবহু ID (শুধু ছবি পাঠাতে)",
   "handoff": null অথবা "মালিকের সাহায্য কেন দরকার তার ছোট কারণ",
   "order": null, অথবা {
     "name": "কাস্টমার হুবহু যা লিখেছে",
@@ -379,6 +381,7 @@ function parseAIJson(raw) {
     order: parsed.order || null,
     rule: parsed.rule || null,
     imageId: parsed.imageId || null,
+    shopProductId: parsed.shopProductId || null,
     handoff: parsed.handoff || null,
     imageLabel: parsed.imageLabel || null
   };
