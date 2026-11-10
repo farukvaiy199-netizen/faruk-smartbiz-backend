@@ -5,13 +5,17 @@
 const axios = require('axios');
 const store = require('./store');
 const { notifyOwner } = require('./notify');
+const config = require('../config');
 
 const DEFAULT_ROOT = 'bazaar_store/khanglobalshop_main';
+const DEFAULT_SITE = 'https://farukvaiy199-netizen.github.io/khanglobalshop/';
+// ছবি ছাড়া হালকা ফিল্ড — প্রোডাক্টের ছবি অনেক সময় ডেটাবেসের ভেতরে বড় base64 হয়ে থাকে, তাই প্রতি মিনিটে সেটা টানা হয় না
+const LIGHT_FIELDS = ['name', 'category', 'price', 'oldPrice', 'stock', 'sku', 'desc', 'status', 'emoji'];
 const CACHE_MS = 60 * 1000; // AI রিপ্লাইয়ের সময় সর্বোচ্চ ১ মিনিটের পুরনো তথ্য — মানে প্রায় "লাইভ"
 
 function defaults() {
   return {
-    connected: false, projectId: '', apiKey: '', root: DEFAULT_ROOT, botEmail: '', botPassword: '',
+    connected: false, projectId: '', apiKey: '', root: DEFAULT_ROOT, site: DEFAULT_SITE, productLink: '', botEmail: '', botPassword: '',
     show: { products: true, stock: true, orders: true, messages: true, offers: true },
     low: 5, every: 'live', lastSync: null, counts: null
   };
@@ -96,17 +100,19 @@ async function fsGet(cfg, path, params, token) {
   const r = await axios.get(baseUrl(cfg) + '/' + path, {
     params: { key: cfg.apiKey, ...(params || {}) },
     headers: token ? { Authorization: 'Bearer ' + token } : {},
+    paramsSerializer: { indexes: null },
     timeout: 20000
   });
   return r.data;
 }
 
-async function listDocs(cfg, col, { pageSize = 300, maxPages = 10, orderBy, token } = {}) {
+async function listDocs(cfg, col, { pageSize = 300, maxPages = 10, orderBy, token, mask } = {}) {
   const out = [];
   let pageToken = '';
   for (let i = 0; i < maxPages; i++) {
     const params = { pageSize };
     if (orderBy) params.orderBy = orderBy;
+    if (mask) params['mask.fieldPaths'] = mask;
     if (pageToken) params.pageToken = pageToken;
     let data;
     try {
@@ -165,7 +171,7 @@ let snap = null; // { products, settings, fetchedAt }
 async function fetchSnapshot(cfg) {
   const token = await botToken(cfg).catch(() => '');
   const [prodDocs, setDoc] = await Promise.all([
-    listDocs(cfg, 'products', { token }),
+    listDocs(cfg, 'products', { token, mask: LIGHT_FIELDS }),
     fsGet(cfg, 'parts/settings', {}, '').catch(() => null)
   ]);
   let settings = {};
@@ -199,37 +205,56 @@ function stockText(p, cfg) {
   return 'স্টকে আছে';
 }
 
+function siteUrl(cfg) { return String(cfg.site || DEFAULT_SITE).trim() || DEFAULT_SITE; }
+// প্রোডাক্টের সরাসরি লিংকের ছাঁচ থাকলে (যেমন https://.../?product={id}) সেটা, নইলে ওয়েবসাইটের মূল লিংক
+function productUrl(cfg, p) {
+  const t = String(cfg.productLink || '').trim();
+  return t ? t.replace('{id}', encodeURIComponent(p.id)) : siteUrl(cfg);
+}
+
+async function usesWebsiteProducts() {
+  try {
+    const cfg = await getCfg();
+    return !!(cfg.connected && cfg.show.products);
+  } catch (e) { return false; }
+}
+
 async function getAiContext(message) {
   try {
     const { cfg, snap: s } = await getSnapshot();
     if (!s) return '';
-    let txt = '\n=== ই-কমার্স ওয়েবসাইটের লাইভ তথ্য (অ্যাডমিন প্যানেল থেকে — প্রোডাক্ট, দাম ও স্টকের জন্য এটাই সবচেয়ে নির্ভরযোগ্য) ===\n';
+    const site = siteUrl(cfg);
+    let txt = '\n=== ই-কমার্স ওয়েবসাইটের লাইভ তথ্য (অ্যাডমিন প্যানেল থেকে) ===\n' +
+      'প্রোডাক্ট, দাম, স্টক ও অফারের জন্য এই অংশটাই একমাত্র নির্ভরযোগ্য উৎস। শিটে বা আগের কথোপকথনে অন্য কোনো প্রোডাক্ট-তালিকা থাকলে সেটা পুরনো ধরে নেবে — এই তালিকার সাথে না মিললে এই তালিকাই ঠিক।\n' +
+      `ওয়েবসাইট: ${site}\n`;
     if (cfg.show.products) {
       const act = activeProducts(s.products);
       let list = act;
       let note = '';
-      if (act.length > 60) {
+      if (act.length > 40) {
         const words = tokensOf(message);
         const scored = act.map(p => {
           const hay = (p.name + ' ' + p.category + ' ' + p.sku).toLowerCase();
           return { p, sc: words.reduce((n, w) => n + (hay.includes(w) ? 1 : 0), 0) };
         }).filter(x => x.sc > 0).sort((a, b) => b.sc - a.sc);
-        list = scored.slice(0, 25).map(x => x.p);
+        list = (scored.length ? scored.map(x => x.p) : act).slice(0, 30);
         const cats = Array.from(new Set(act.map(p => p.category).filter(Boolean))).slice(0, 20);
-        note = `ওয়েবসাইটে মোট ${act.length}টি প্রোডাক্ট আছে। কাস্টমারের প্রশ্নের সাথে মেলে এমনগুলো নিচে দেওয়া হলো` +
-          (cats.length ? ` (বিভাগ: ${cats.join(', ')})` : '') + '। নিচে না থাকলে বলবে "এই নামে কিছু পাচ্ছি না, নাম একটু ভিন্নভাবে বলবেন?"।\n';
+        note = `ওয়েবসাইটে মোট ${act.length}টি সক্রিয় প্রোডাক্ট আছে` + (cats.length ? ` (বিভাগ: ${cats.join(', ')})` : '') +
+          `। নিচে কাস্টমারের প্রশ্নের সাথে মেলে এমন (বা মেলা না গেলে প্রথম ${list.length}টি) দেওয়া হলো। কোনোটা নিচে না থাকলে বলবে "এই নামে কিছু পাচ্ছি না, নাম একটু ভিন্নভাবে বলবেন?" অথবা ওয়েবসাইটের লিংক দেবে।\n`;
       }
-      txt += note;
+      txt += note + `ওয়েবসাইটের প্রোডাক্ট (মোট ${act.length}টি):\n`;
       txt += list.length
         ? list.map(p => {
-            const parts = [p.name];
+            const parts = [`[ID: ${p.id}]`, p.name];
             if (p.price !== null) parts.push('৳' + p.price + (p.oldPrice && p.oldPrice > p.price ? ` (আগে ৳${p.oldPrice})` : ''));
             if (p.category) parts.push(p.category);
             const st = stockText(p, cfg); if (st) parts.push(st);
             if (p.desc) parts.push(p.desc);
+            parts.push('লিংক: ' + productUrl(cfg, p));
             return '- ' + parts.join(' | ');
           }).join('\n') + '\n'
-        : '(এই প্রশ্নের সাথে মেলে এমন প্রোডাক্ট ওয়েবসাইটে পাওয়া যায়নি)\n';
+        : '(ওয়েবসাইটে এখন কোনো সক্রিয় প্রোডাক্ট নেই)\n';
+      txt += 'কাস্টমার "কী কী পণ্য আছে" জানতে চাইলে এই তালিকার সবগুলো প্রোডাক্টের নাম ও দাম (স্টক শেষ হলে সেটাও) গুছিয়ে বলবে, শেষে ওয়েবসাইটের লিংক দেবে।\n';
     }
     if (cfg.show.offers) {
       const st = s.settings || {};
@@ -240,12 +265,75 @@ async function getAiContext(message) {
       if (st.announce) offers.push('ঘোষণা: ' + String(st.announce).slice(0, 200));
       if (offers.length) txt += 'চলমান অফার:\n' + offers.map(o => '- ' + o).join('\n') + '\n';
     }
-    txt += 'নিয়ম: উপরের তালিকায় যা নেই তা বানিয়ে বলবে না। "স্টক শেষ" প্রোডাক্টের অর্ডার নেবে না, বরং বিকল্প প্রোডাক্ট সাজেস্ট করবে। দাম শুধু এই তালিকা থেকে বলবে।\n';
+    txt += `
+=== ছবি ও লিংক (ওয়েবসাইটের প্রোডাক্ট) ===
+- কাস্টমার কোনো প্রোডাক্টের ছবি দেখতে চাইলে (বা প্রোডাক্ট দেখানোর সময় ছবি দিলে ভালো হয়) সেই প্রোডাক্টের [ID] থেকে হুবহু ID "shopProductId"-তে বসাবে। ছবি সিস্টেম নিজেই পাঠিয়ে দেবে — তুমি ছবির লিংক বানাবে না, "imageUrl" ও "imageId" null রাখবে। ছবি পাঠানো না গেলে সিস্টেম কিছু করবে না, তাই reply-তে সবসময় প্রোডাক্টের লিংকও দেবে।
+- প্রোডাক্ট নিয়ে কথা বললে উপরের "লিংক:" অংশ থেকে হুবহু লিংক কপি করে দেবে। লিংক নিজে বানাবে না।
+
+=== অর্ডার নেওয়ার নীতি (ওয়েবসাইট সংযুক্ত থাকায় — নিচের "অর্ডার নেওয়ার নিয়ম"-এর উপরে প্রযোজ্য) ===
+১) কাস্টমার কোনো প্রোডাক্ট কিনতে বা অর্ডার করতে চাইলে সাথে সাথে "order" বানাবে না এবং নাম/ফোন/ঠিকানা চাইতে শুরু করবে না।
+২) প্রথমে প্রোডাক্টের নাম, দাম ও ওয়েবসাইটের লিংক দিয়ে ভদ্রভাবে জিজ্ঞেস করবে: "আপনি কি আমাদের ওয়েবসাইট থেকে নিজে অর্ডার করবেন, নাকি আমাকে দিয়ে এখানেই অর্ডার দিতে চান?"
+৩) কাস্টমার ওয়েবসাইট বাছলে লিংকটা আবার দিয়ে সহজ করে বলবে কীভাবে অর্ডার করবে। "order" অবশ্যই null।
+৪) কাস্টমার স্পষ্টভাবে এখানেই (চ্যাটে) অর্ডার দিতে চাইলে তবেই নিচের অর্ডার-নিয়ম মেনে নাম, ফোন, ঠিকানা, পরিমাণ নিয়ে অর্ডার নেবে।
+৫) যে প্রোডাক্ট "স্টক শেষ", তার অর্ডার কোনোভাবেই নেবে না; বিকল্প প্রোডাক্ট সাজেস্ট করবে।
+৬) কাস্টমার আগেই ওয়েবসাইট বা চ্যাট — যেকোনো একটা বেছে নিয়ে থাকলে (কথোপকথনে দেখা গেলে) আবার একই প্রশ্ন করবে না।
+`;
     return txt;
   } catch (err) {
     console.error('AI-র জন্য ই-কমার্স তথ্য বানানো যায়নি:', err.message);
     return '';
   }
+}
+
+/* ---------- প্রোডাক্টের ছবি ---------- */
+// ছবি হয় পাবলিক লিংক (Cloudinary ইত্যাদি) নয়তো ডেটাবেসের ভেতর base64। দ্বিতীয় ক্ষেত্রে আমাদের সার্ভার /shopimg/<id>.jpg থেকে পরিবেশন করে।
+const imgCache = new Map(); // id -> { v: string, at }
+async function getRawImage(cfg, id) {
+  const hit = imgCache.get(id);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.v;
+  let doc;
+  try {
+    doc = await fsGet(cfg, 'products/' + encodeURIComponent(id), { 'mask.fieldPaths': ['image'] }, '');
+  } catch (err) {
+    const token = await botToken(cfg).catch(() => '');
+    if (!token) return '';
+    doc = await fsGet(cfg, 'products/' + encodeURIComponent(id), { 'mask.fieldPaths': ['image'] }, token);
+  }
+  const v = String((fromFields(doc.fields || {}).image) || '');
+  if (imgCache.size > 25) imgCache.delete(imgCache.keys().next().value);
+  imgCache.set(id, { v, at: Date.now() });
+  return v;
+}
+
+// কাস্টমারকে পাঠানোর মতো পাবলিক ছবির লিংক; ছবি না থাকলে/পাওয়া না গেলে null
+async function getProductImage(id) {
+  try {
+    if (!id) return null;
+    const cfg = await getCfg();
+    if (!cfg.connected) return null;
+    const v = await getRawImage(cfg, String(id));
+    if (/^https?:\/\//i.test(v)) return v;
+    if (/^data:image\//i.test(v)) return `${config.publicUrl}/shopimg/${encodeURIComponent(id)}.jpg`;
+    return null;
+  } catch (err) {
+    console.error('প্রোডাক্টের ছবি আনা যায়নি:', explain(err));
+    return null;
+  }
+}
+
+// GET /shopimg/:id — base64 ছবিকে আসল ছবি হিসেবে পরিবেশন
+async function serveProductImage(id, res) {
+  const cfg = await getCfg();
+  if (!cfg.connected) return res.sendStatus(404);
+  const v = await getRawImage(cfg, String(id));
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(v);
+  if (m) {
+    res.set('Content-Type', m[1]);
+    res.set('Cache-Control', 'public, max-age=3600');
+    return res.send(Buffer.from(m[2], 'base64'));
+  }
+  if (/^https?:\/\//i.test(v)) return res.redirect(v);
+  return res.sendStatus(404);
 }
 
 /* ---------- সংযোগ, সিঙ্ক, সতর্কতা ---------- */
@@ -257,7 +345,9 @@ function publicStatus(cfg, sum) {
     lowItems: sum ? sum.lowItems : (cfg.lowItems || []),
     outItems: sum ? sum.outItems : (cfg.outItems || []),
     orders: cfg.ordersInfo || null,
-    hasBot: !!(cfg.botEmail && cfg.botPassword)
+    hasBot: !!(cfg.botEmail && cfg.botPassword),
+    site: cfg.site || DEFAULT_SITE,
+    productLink: cfg.productLink || ''
   };
 }
 
@@ -275,7 +365,9 @@ async function connect(input) {
   const low = Math.max(1, parseInt(input.low, 10) || 5);
   const every = ['live', '5', '15', '60'].includes(String(input.every)) ? String(input.every) : 'live';
 
-  const cfg = { ...defaults(), connected: true, projectId, apiKey, root, botEmail, botPassword, show, low, every };
+  const site = String(input.site || '').trim() || old.site || DEFAULT_SITE;
+  const productLink = input.productLink !== undefined ? String(input.productLink || '').trim() : (old.productLink || '');
+  const cfg = { ...defaults(), connected: true, projectId, apiKey, root, site, productLink, botEmail, botPassword, show, low, every };
   try {
     tokenCache = { id: '', token: '', exp: 0 };
     if (botEmail) await botToken(cfg); // বটের তথ্য ভুল হলে এখানেই ধরা পড়বে
@@ -390,4 +482,4 @@ async function disconnect() {
   await saveCfg({ connected: false, botPassword: '', counts: null, lowItems: [], outItems: [], ordersInfo: null, lastSync: null });
 }
 
-module.exports = { connect, status, sync, disconnect, getAiContext, summarize, normProduct, fromFields, docOut };
+module.exports = { connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
