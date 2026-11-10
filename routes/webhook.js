@@ -12,6 +12,7 @@ const { sendOrderConfirmationEmail } = require('../services/email');
 const { notifyOwner } = require('../services/notify');
 const { sendInstagramMessage, sendInstagramImage, getInstagramProfile } = require('../services/instagram');
 const crypto = require('crypto');
+const shop = require('../services/shop');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
@@ -351,9 +352,10 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const ownerRules = (await store.getAiRules()).map(r => r.text);
   const ownerImages = await store.getAiImages();
   const stockList = (await store.getStockList()).map(e => ({ name: e.name, qty: e.qty }));
+  const shopContext = await shop.getAiContext(text); // ই-কমার্স ওয়েবসাইটের লাইভ প্রোডাক্ট/স্টক/অফার (সংযুক্ত না থাকলে ফাঁকা)
 
   const { reply, imageUrl, imageId, order, handoff } = await getAIReplyWithFallback({
-    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList
+    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext
   });
 
   // মালিকের আপলোড করা ছবি থাকলে সেটাকেই অগ্রাধিকার; না থাকলে শিটের ছবির লিংক
@@ -553,8 +555,9 @@ router.post('/ai-reply', async (req, res) => {
     const sheetContext = await getCombinedSheetContext(settings.sheetLink, settings.faqSheetLink, message);
     const ownerRules = (await store.getAiRules()).map(r => r.text);
     const stockList = (await store.getStockList()).map(e => ({ name: e.name, qty: e.qty }));
+    const shopContext = await shop.getAiContext(message);
     const { reply, handoff } = await getAIReplyWithFallback({
-      settings, customerMessage: message, history, sheetContext, businessInfo, ownerRules, stockList
+      settings, customerMessage: message, history, sheetContext, businessInfo, ownerRules, stockList, shopContext
     });
     if (handoff) {
       await notifyOwner({
