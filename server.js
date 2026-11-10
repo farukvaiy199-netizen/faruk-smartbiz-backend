@@ -5,6 +5,7 @@ const config = require('./config');
 const store = require('./services/store');
 const { runDueInstagramPosts } = require('./services/scheduler');
 const videoPosts = require('./services/videoPosts');
+const shop = require('./services/shop');
 
 const authRoutes = require('./routes/auth');
 const requireAuth = require('./middleware/auth');
@@ -59,6 +60,16 @@ app.get('/pmedia/:file', async (req, res) => {
     res.send(Buffer.from(m.b64, 'base64'));
   } catch (err) {
     res.sendStatus(500);
+  }
+});
+
+// ই-কমার্স ওয়েবসাইটের প্রোডাক্ট ছবি (ডেটাবেসে base64 থাকলে) — Messenger/WhatsApp/Instagram এই পাবলিক লিংক থেকে ছবি নেয়
+app.get('/shopimg/:file', async (req, res) => {
+  try {
+    const id = String(req.params.file).replace(/\.[a-z0-9]+$/i, '');
+    await shop.serveProductImage(id, res);
+  } catch (err) {
+    if (!res.headersSent) res.sendStatus(404);
   }
 });
 
