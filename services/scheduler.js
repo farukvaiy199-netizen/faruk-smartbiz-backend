@@ -6,6 +6,7 @@ const store = require('./store');
 const { publishInstagramPhoto } = require('./instagram');
 const { publishInstagramReel, deleteVideo } = require('./videoPosts');
 const { notifyOwner } = require('./notify');
+const shop = require('./shop');
 
 let running = false;
 
@@ -53,6 +54,7 @@ async function runDueInstagramPosts() {
   try {
     await store.failStuckIgPosts();
     await store.failStuckVideoPosts();
+    await shop.sync(false); // ই-কমার্স ওয়েবসাইটের স্টক/চ্যাট পরীক্ষা (এরর ছোঁড়ে না)
     for (let i = 0; i < 5; i++) {
       const job = await store.claimDueIgPost();
       if (!job) break;
