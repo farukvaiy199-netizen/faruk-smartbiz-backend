@@ -13,6 +13,8 @@ const { notifyOwner } = require('../services/notify');
 const { sendInstagramMessage, sendInstagramImage, getInstagramProfile } = require('../services/instagram');
 const crypto = require('crypto');
 const shop = require('../services/shop');
+const assistant = require('../services/assistant');
+const comments = require('../services/comments');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
@@ -79,6 +81,7 @@ function verifyMeta(secretOrList, label) {
     }
 
     if (ok) {
+      req.sigOk = true; // মালিক-সহকারী শুধু এমন রিকোয়েস্টেই চালু হয় যার সই সত্যিই মিলেছে
       if (!signatureOkLogged[label]) {
         console.log(`✅ ${label}: Meta-র সই মিলেছে`);
         signatureOkLogged[label] = true;
@@ -111,6 +114,9 @@ router.post('/facebook', verifyMeta(config.fbAppSecret, 'Facebook'), async (req,
   const entries = req.body.entry || [];
   console.log(`📩 Facebook ওয়েবহুক এসেছে: object=${req.body.object}, মেসেজ-ইভেন্ট=${entries.reduce((n, e) => n + ((e.messaging || []).length), 0)}`);
   for (const entry of entries) {
+    for (const change of (entry.changes || [])) {
+      comments.handleFacebookChange(entry, change).catch(err => console.error('FB কমেন্ট এরর:', err.message));
+    }
     const events = entry.messaging || [];
     for (const event of events) {
       const senderId = event.sender?.id;
@@ -139,7 +145,7 @@ router.post('/facebook', verifyMeta(config.fbAppSecret, 'Facebook'), async (req,
           continue;
         }
 
-        await handleIncomingMessage({ platform: 'facebook', platformId: senderId, text, imageBuffer, imageMime, audioBuffer });
+        await handleIncomingMessage({ platform: 'facebook', platformId: senderId, text, imageBuffer, imageMime, audioBuffer, sigOk: !!req.sigOk });
       } catch (err) {
         console.error('Facebook webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response?.data ? JSON.stringify(err.response.data) : err.message);
       }
@@ -188,7 +194,7 @@ router.post('/whatsapp', verifyMeta(config.waAppSecret, 'WhatsApp'), async (req,
         continue;
       }
 
-      await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from, imageBuffer, imageMime, audioBuffer });
+      await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from, imageBuffer, imageMime, audioBuffer, sigOk: !!req.sigOk });
     } catch (err) {
       console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response?.data ? JSON.stringify(err.response.data) : err.message);
     }
@@ -214,6 +220,9 @@ router.post('/instagram', verifyMeta([config.fbAppSecret, config.igAppSecret], '
   // Meta আদৌ Instagram ইভেন্ট পাঠাচ্ছে কিনা বোঝার জন্য প্রতিবার একটা লাইন লগে লিখি
   console.log(`📩 Instagram ওয়েবহুক এসেছে: object=${req.body.object}, entry=${entries.length}, মেসেজ-ইভেন্ট=${entries.reduce((n, e) => n + ((e.messaging || []).length), 0)}`);
   for (const entry of entries) {
+    for (const change of (entry.changes || [])) {
+      comments.handleInstagramChange(entry, change).catch(err => console.error('IG কমেন্ট এরর:', err.message));
+    }
     const events = entry.messaging || [];
     for (const event of events) {
       const senderId = event.sender && event.sender.id;
@@ -242,7 +251,7 @@ router.post('/instagram', verifyMeta([config.fbAppSecret, config.igAppSecret], '
           continue;
         }
 
-        await handleIncomingMessage({ platform: 'instagram', platformId: senderId, text, imageBuffer, imageMime, audioBuffer });
+        await handleIncomingMessage({ platform: 'instagram', platformId: senderId, text, imageBuffer, imageMime, audioBuffer, sigOk: !!req.sigOk });
       } catch (err) {
         console.error('Instagram webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response && err.response.data ? JSON.stringify(err.response.data) : err.message);
       }
@@ -273,7 +282,50 @@ async function ensureCustomer({ platform, platformId, name, phone }) {
   return { settings, customer };
 }
 
-async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer }) {
+// মালিক হলে (নিবন্ধিত নম্বর বা PIN দিয়ে বাঁধা অ্যাকাউন্ট) সহকারী উত্তর দেয়, কাস্টমারের পথে যায় না। true = সামলানো হয়েছে।
+async function ownerChannel({ platform, platformId, text, imageBuffer, audioBuffer, sigOk }) {
+  if (!sigOk) return false; // সই যাচাই ছাড়া কাউকে মালিক ধরা হয় না (নকল মেসেজ ঠেকাতে)
+  let linkReply = null;
+  if (text) linkReply = await assistant.tryLink({ platform, platformId, text });
+  const owner = linkReply ? true : await assistant.isOwner({ platform, platformId });
+  if (!owner) return false;
+
+  const settings = await store.getSettings();
+  const reply = async (msg, imgUrl) => {
+    if (platform === 'facebook' && settings.fbToken) {
+      await withRetry(() => sendFacebookMessage(platformId, msg, settings.fbToken));
+      if (imgUrl) await withRetry(() => sendFacebookImage(platformId, imgUrl, settings.fbToken)).catch(() => {});
+    } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
+      await withRetry(() => sendWhatsAppMessage(platformId, msg, settings.waPhoneNumberId, settings.waToken));
+      if (imgUrl) await withRetry(() => sendWhatsAppImage(platformId, imgUrl, settings.waPhoneNumberId, settings.waToken)).catch(() => {});
+    } else if (platform === 'instagram' && settings.fbToken) {
+      await withRetry(() => sendInstagramMessage(platformId, msg, settings.fbToken));
+      if (imgUrl) await withRetry(() => sendInstagramImage(platformId, imgUrl, settings.fbToken)).catch(() => {});
+    }
+  };
+  try {
+    if (linkReply) { await reply(linkReply); return true; }
+    if (!text && audioBuffer) {
+      const key = pickCapableKey(settings, isWhisperCapable);
+      if (!key) { await reply('ভয়েস শোনার মতো AI Key এখন নেই — লিখে বলুন।'); return true; }
+      try { text = await transcribeAudio({ apiKey: key.apiKey, provider: key.provider, audioBuffer }); }
+      catch (e) { await reply('ভয়েসটা বুঝতে পারিনি, লিখে বলবেন?'); return true; }
+    }
+    if (!text && !imageBuffer) return true;
+    const out = await assistant.handleOwnerMessage({
+      key: platform + ':' + platformId, text: text || 'এই ছবিটা দিয়ে পোস্ট বানাও।', settings,
+      imageB64: imageBuffer ? imageBuffer.toString('base64') : '', imageMime: 'image/jpeg'
+    });
+    await reply(out.reply, out.imageUrl);
+  } catch (err) {
+    console.error('মালিক-সহকারী এরর:', err.message);
+    await reply('দুঃখিত, এখন কাজটা করা গেল না। একটু পরে আবার বলুন।').catch(() => {});
+  }
+  return true;
+}
+
+async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer, sigOk }) {
+  if (await ownerChannel({ platform, platformId, text, imageBuffer, audioBuffer, sigOk })) return;
   const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone });
   console.log(`💬 মেসেজ প্রসেস হচ্ছে: ${platform} / ${platformId} (AI ${customer.ai ? 'চালু' : 'বন্ধ'})`);
 
