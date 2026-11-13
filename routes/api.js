@@ -247,8 +247,12 @@ router.post('/assistant/owner', async (req, res) => {
   try {
     const b = req.body || {};
     const out = await assistant.setOwner({ waNumber: b.waNumber, pin: b.pin ? String(b.pin) : '' });
+    let subNote = '';
     if (b.commentAuto === 'on' || b.commentAuto === 'off') await store.saveSettings({ commentAuto: b.commentAuto });
-    res.json({ ...out, commentAuto: b.commentAuto === 'on' || b.commentAuto === 'off' ? b.commentAuto : out.commentAuto });
+    if (b.commentAuto === 'on') {
+      try { await comments.ensureFeedSubscription(); } catch (e) { subNote = 'কমেন্ট সাবস্ক্রিপশন হয়নি: ' + e.message; }
+    }
+    res.json({ ...out, commentAuto: b.commentAuto === 'on' || b.commentAuto === 'off' ? b.commentAuto : out.commentAuto, subNote });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 router.post('/assistant/chat', async (req, res) => {
