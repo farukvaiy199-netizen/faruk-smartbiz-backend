@@ -81,6 +81,11 @@ async function handleComment({ platform, commentId, text, fromId, fromName, ownI
   try {
     if (await overCap()) { await finish(commentId, platform, { status: 'skipped', note: 'ঘণ্টার সীমা' }); return; }
     const c = await classify({ settings, text, who: fromName, platform });
+    if (c.intent === 'price') {
+      let site = '';
+      try { const st = await shop.status(); site = st && st.connected ? st.site : ''; } catch (e) { /* ঠিক আছে */ }
+      c.publicReply = 'ধন্যবাদ! বিষয়টি ইনবক্সে জানিয়ে দেওয়া হচ্ছে 📩 বিস্তারিত জানতে আমাদের ইনবক্সে মেসেজ দিন' + (site ? ' বা ওয়েবসাইটে ভিজিট করুন 🌐 ' + site : '।');
+    }
     let pub = '', priv = '', note = '';
     if (c.publicReply) {
       try { await send.public(c.publicReply); pub = 'ok'; } catch (e) { pub = 'fail'; note += 'পাবলিক: ' + errMsg(e) + ' '; }
@@ -109,6 +114,7 @@ async function handleComment({ platform, commentId, text, fromId, fromName, ownI
 /* ---------- Facebook: webhook entry.changes[field=feed, item=comment] ---------- */
 async function handleFacebookChange(entry, change) {
   const v = change && change.value;
+  console.log(`💬 FB ওয়েবহুক change: field=${change && change.field} item=${v && v.item} verb=${v && v.verb}`);
   if (!change || change.field !== 'feed' || !v || v.item !== 'comment' || v.verb !== 'add') return;
   if (v.parent_id && v.post_id && String(v.parent_id) !== String(v.post_id)) return; // কমেন্টের রিপ্লাই — শুধু মূল কমেন্টে সাড়া
   const settings = await store.getSettings();
@@ -126,6 +132,7 @@ async function handleFacebookChange(entry, change) {
 /* ---------- Instagram: webhook entry.changes[field=comments] ---------- */
 async function handleInstagramChange(entry, change) {
   const v = change && change.value;
+  console.log(`💬 IG ওয়েবহুক change: field=${change && change.field}`);
   if (!change || change.field !== 'comments' || !v || !v.id) return;
   if (v.parent_id) return; // রিপ্লাই — বাদ
   const settings = await store.getSettings();
@@ -140,10 +147,28 @@ async function handleInstagramChange(entry, change) {
   });
 }
 
+// পেজকে 'feed' (কমেন্ট) ইভেন্টে সাবস্ক্রাইব করে — আগের সাবস্ক্রিপশন বজায় রেখে
+async function ensureFeedSubscription() {
+  const settings = await store.getSettings();
+  if (!settings.fbToken || !settings.fbPageId) throw new Error('আগে Facebook পেজ সংযুক্ত করুন');
+  const url = `${GRAPH}/${settings.fbPageId}/subscribed_apps`;
+  let have = [];
+  try {
+    const r = await axios.get(url, { params: { access_token: settings.fbToken }, timeout: 15000 });
+    const me = (r.data.data || [])[0];
+    have = (me && (me.subscribed_fields || [])) || [];
+  } catch (e) { /* না পড়া গেলে ডিফল্ট দিয়ে চলবে */ }
+  const want = Array.from(new Set([...(have.length ? have : ['messages', 'messaging_postbacks']), 'feed']));
+  try {
+    await axios.post(url, null, { params: { subscribed_fields: want.join(','), access_token: settings.fbToken }, timeout: 15000 });
+  } catch (e) { throw new Error(errMsg(e)); }
+  return want;
+}
+
 async function recent(limit = 20) {
   const col = await logCol();
   return (await col.find({ status: { $in: ['done', 'error', 'skipped'] } }).sort({ at: -1 }).limit(limit).toArray())
     .map(d => ({ id: d._id, platform: d.platform, intent: d.intent || '', status: d.status, pub: d.pub || '', priv: d.priv || '', note: d.note || '', text: d.text || '', at: d.at }));
 }
 
-module.exports = { handleFacebookChange, handleInstagramChange, classify, recent };
+module.exports = { ensureFeedSubscription, handleFacebookChange, handleInstagramChange, classify, recent };
