@@ -168,6 +168,7 @@ async function ensureFeedSubscription() {
 // Webhook না এলে বিকল্প: নিয়মিত পেজের সাম্প্রতিক পোস্টের নতুন কমেন্ট নিজে তুলে আনা (cron থেকে চলে)।
 // একই কমেন্ট webhook ও poll দুইভাবে এলেও claim() এর কারণে একবারই সাড়া যায়।
 let polling = false;
+let lastPermWarn = 0;
 async function pollFacebook() {
   if (polling) return 0;
   polling = true;
@@ -188,7 +189,14 @@ async function pollFacebook() {
       try {
         const r = await axios.get(`${GRAPH}/${p.id}/comments`, { params: { fields: 'id,message,from,created_time,parent{id}', filter: 'toplevel', order: 'reverse_chronological', limit: 15, access_token: token }, timeout: 15000 });
         list = r.data.data || [];
-      } catch (e) { console.warn('কমেন্ট পোল ব্যর্থ:', errMsg(e)); continue; }
+      } catch (e) {
+        const code = e.response && e.response.data && e.response.data.error && e.response.data.error.code;
+        if (code === 10 || code === 200) { // অনুমতি নেই — প্রতিটা পোস্টে একই এরর না দেখিয়ে একবার জানিয়ে থামি
+          if (Date.now() - lastPermWarn > 3600000) { lastPermWarn = Date.now(); console.warn('কমেন্ট পোল: অনুমতি নেই (pages_read_user_content) — Settings থেকে Facebook আবার Connect করুন। ' + errMsg(e)); }
+          return handled;
+        }
+        console.warn('কমেন্ট পোল ব্যর্থ:', errMsg(e)); continue;
+      }
       for (const c of list.reverse()) {
         if (new Date(c.created_time).getTime() <= since) continue;
         if (c.parent) continue;
