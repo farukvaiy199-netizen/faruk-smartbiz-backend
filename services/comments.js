@@ -217,10 +217,47 @@ async function pollFacebook() {
   return handled;
 }
 
+// অ্যাপের "কমেন্ট পরীক্ষা" বাটন — টোকেন ও অনুমতির আসল অবস্থা বাংলায় বলে দেয়
+async function diagnose() {
+  const out = [];
+  const add = (ok, msg) => out.push({ ok, msg });
+  const settings = await store.getSettings();
+  if (!settings.fbToken) { add(false, 'Facebook পেজের টোকেন সংরক্ষিত নেই — Settings-এ Facebook Connect করুন'); return out; }
+  const token = settings.fbToken;
+  add(true, `টোকেন সংরক্ষিত আছে (দৈর্ঘ্য ${token.length} অক্ষর${token.startsWith('EAA') ? '' : ' — কিন্তু EAA দিয়ে শুরু হয়নি, ভুল জিনিস পেস্ট হতে পারে'})`);
+  add(settings.commentAuto === 'on', settings.commentAuto === 'on' ? 'কমেন্ট অটো-রিপ্লাই চালু আছে' : 'কমেন্ট অটো-রিপ্লাই বন্ধ — টিক দিয়ে সংরক্ষণ করুন');
+  let page = null;
+  try {
+    const r = await axios.get(`${GRAPH}/me`, { params: { fields: 'id,name', access_token: token }, timeout: 15000 });
+    page = r.data;
+    add(true, `টোকেন কাজ করছে — পেজ: ${page.name} (${page.id})`);
+  } catch (e) { add(false, 'টোকেন বাতিল/ভুল: ' + errMsg(e) + ' — নতুন করে Page Access Token বসান'); return out; }
+  try {
+    const r = await axios.get(`${GRAPH}/debug_token`, { params: { input_token: token, access_token: token }, timeout: 15000 });
+    const d = r.data.data || {};
+    const sc = d.scopes || [];
+    const need = ['pages_read_engagement', 'pages_read_user_content', 'pages_manage_engagement', 'pages_messaging'];
+    need.forEach(n => add(sc.includes(n), sc.includes(n) ? `অনুমতি আছে: ${n}` : `অনুমতি নেই: ${n}`));
+    if (d.expires_at === 0) add(true, 'টোকেনের মেয়াদ নেই (স্থায়ী)');
+    else if (d.expires_at) add(true, 'টোকেনের মেয়াদ শেষ হবে: ' + new Date(d.expires_at * 1000).toLocaleString('bn-BD'));
+  } catch (e) { add(false, 'অনুমতির তালিকা পড়া যায়নি: ' + errMsg(e)); }
+  try {
+    const r = await axios.get(`${GRAPH}/me/posts`, { params: { fields: 'id', limit: 1, access_token: token }, timeout: 15000 });
+    const p = (r.data.data || [])[0];
+    if (!p) add(false, 'পেজে কোনো পোস্ট পাওয়া যায়নি');
+    else {
+      add(true, 'পেজের পোস্ট পড়া যাচ্ছে');
+      try { await axios.get(`${GRAPH}/${p.id}/comments`, { params: { fields: 'id', limit: 1, access_token: token }, timeout: 15000 }); add(true, 'কমেন্ট পড়া যাচ্ছে ✅ — এখন নতুন কমেন্টে সাড়া দেওয়ার কথা'); }
+      catch (e) { add(false, 'কমেন্ট পড়া যাচ্ছে না: ' + errMsg(e)); }
+    }
+  } catch (e) { add(false, 'পোস্ট পড়া যাচ্ছে না: ' + errMsg(e)); }
+  return out;
+}
+
 async function recent(limit = 20) {
   const col = await logCol();
   return (await col.find({ status: { $in: ['done', 'error', 'skipped'] } }).sort({ at: -1 }).limit(limit).toArray())
     .map(d => ({ id: d._id, platform: d.platform, intent: d.intent || '', status: d.status, pub: d.pub || '', priv: d.priv || '', note: d.note || '', text: d.text || '', at: d.at }));
 }
 
-module.exports = { pollFacebook, ensureFeedSubscription, handleFacebookChange, handleInstagramChange, classify, recent };
+module.exports = { diagnose, pollFacebook, ensureFeedSubscription, handleFacebookChange, handleInstagramChange, classify, recent };
