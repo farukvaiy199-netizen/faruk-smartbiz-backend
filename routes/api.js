@@ -15,6 +15,8 @@ const { detectInstagramAccount, sendInstagramMessage, ensurePageSubscription } =
 const { publishIgJob } = require('../services/scheduler');
 const videoPosts = require('../services/videoPosts');
 const shop = require('../services/shop');
+const assistant = require('../services/assistant');
+const comments = require('../services/comments');
 const multer = require('multer');
 const os = require('os');
 const fs = require('fs');
@@ -235,6 +237,32 @@ const MAX_AI_IMAGES = 30;
 
 router.get('/ai-rules', async (req, res) => {
   res.json(await store.getAiRules());
+});
+
+/* ---------- মালিকের সহকারী ---------- */
+router.get('/assistant/owner', async (req, res) => {
+  res.json(await assistant.getPublicOwnerCfg());
+});
+router.post('/assistant/owner', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const out = await assistant.setOwner({ waNumber: b.waNumber, pin: b.pin ? String(b.pin) : '' });
+    if (b.commentAuto === 'on' || b.commentAuto === 'off') await store.saveSettings({ commentAuto: b.commentAuto });
+    res.json({ ...out, commentAuto: b.commentAuto === 'on' || b.commentAuto === 'off' ? b.commentAuto : out.commentAuto });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+router.post('/assistant/chat', async (req, res) => {
+  const text = String(req.body.message || '').trim().slice(0, 1500);
+  const m = String(req.body.imageData || '').match(/^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/);
+  if (!text && !m) return res.status(400).json({ error: 'মেসেজ খালি' });
+  if (m && m[1].length > 2500000) return res.status(400).json({ error: 'ছবিটা অনেক বড়' });
+  const settings = await store.getSettings();
+  if (!getSlots(settings).length) return res.status(400).json({ error: 'আগে Settings-এ AI Key সংযুক্ত করুন' });
+  const out = await assistant.handleOwnerMessage({ key: 'app', text: text || 'এই ছবিটা দিয়ে পোস্ট বানাও।', settings, imageB64: m ? m[1] : '', imageMime: 'image/jpeg' });
+  res.json(out);
+});
+router.get('/comments/recent', async (req, res) => {
+  res.json(await comments.recent(20));
 });
 
 router.post('/ai-rules/chat', async (req, res) => {
@@ -574,6 +602,7 @@ router.get('/settings', async (req, res) => {
     aiModel: s.aiModel, aiModel2: s.aiModel2, aiModel3: s.aiModel3,
     aiBaseUrl: s.aiBaseUrl, aiBaseUrl2: s.aiBaseUrl2, aiBaseUrl3: s.aiBaseUrl3,
     postNotes: s.postNotes,
+    commentAuto: s.commentAuto === 'on' ? 'on' : 'off',
     igUserId: s.igUserId, igUsername: s.igUsername,
     aiAutoReply: s.aiAutoReply,
     connected: s.connected,
