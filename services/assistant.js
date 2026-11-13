@@ -7,6 +7,8 @@ const store = require('./store');
 const shop = require('./shop');
 const { getJsonReply } = require('./ai');
 const { publishPagePhoto } = require('./facebook');
+const imagegen = require('./imagegen');
+const IG_RE = /ইনস্টা|ইন্সটা|ইনস্ট্যা|instagram|insta\b|আইজি/i;
 
 const BD = 6 * 3600 * 1000; // ঢাকা = UTC+6 (ডে-লাইট সেভিং নেই)
 const GRAPH = 'https://graph.facebook.com/v19.0';
@@ -227,7 +229,10 @@ async function generateCaption({ settings, hint, product, previous }) {
   const r = await getJsonReply({ settings, systemPrompt: system, userMessage: user });
   const caption = clip(r && r.caption, 2000).trim();
   if (!caption) throw new Error('AI ক্যাপশন বানাতে পারেনি');
-  return caption;
+  // [লিংক] ধরনের ফাঁকা বসানো অংশ রাখা চলবে না — আসল লিংক বসাই (না থাকলে বাদ)
+  let site = product && product.url;
+  if (!site) { try { const st = await shop.status(); site = st && st.connected ? st.site : ''; } catch (e) { site = ''; } }
+  return caption.replace(/\[[^\]]*(লিংক|link|url)[^\]]*\]/gi, site || '').replace(/[ \t]+\n/g, '\n').trim();
 }
 
 async function publishPageText({ token, caption, scheduledAtMs }) {
@@ -301,13 +306,13 @@ ${JSON.stringify(snapshot)}
 ${rules.length ? rules.map((r, i) => `${i + 1}) ${r.text}`).join('\n') : '(এখনো কোনোটা নেই)'}
 
 === চলমান পোস্টের খসড়া ===
-${pending ? `ক্যাপশন: ${pending.caption}\nছবি: ${pending.imageUrl || pending.imageB64 ? 'আছে' : 'নেই'}` : '(নেই)'}
+${pending ? `ক্যাপশন: ${pending.caption}\nইনস্টাগ্রামেও: ${pending.wantIg ? 'হ্যাঁ' : 'না'} | সময়: ${pending.postAt || 'এখনই'}\nছবি: ${pending.imageUrl || pending.imageB64 ? 'আছে' : 'নেই'}` : '(নেই)'}
 
 === তুমি যা করতে পারো ===
 ১) প্রশ্নের উত্তর দেওয়া — "action": null।
 ২) মালিক কাস্টমারদের সাথে কথা বলার নতুন নির্দেশনা/তথ্য দিলে (যেমন "মধু এখন স্টকে আছে", "ডেলিভারি ৭০ টাকা") — "action": {"type":"save_rule","text":"পরিষ্কার সংক্ষিপ্ত নিয়ম"}।
-৩) পোস্ট বানাতে বললে — "action": {"type":"post_draft","hint":"মালিকের কথা অনুযায়ী বিষয় ও সুর","product":"পণ্যের নাম বা null","noImage":false}। খসড়া থাকা অবস্থায় বদলাতে বললে আবার post_draft (hint-এ শুধু বদলের নির্দেশ)।
-৪) মালিক স্পষ্টভাবে পোস্ট করতে বললে ("পোস্ট করো", "হ্যাঁ দাও") এবং খসড়া থাকলে — "action": {"type":"post_publish","facebook":true,"instagram":false,"at":null}। ইনস্টাগ্রামে চাইলে "instagram":true। সময় বললে "at"-এ ISO সময় (যেমন "2026-11-14T10:00:00+06:00"), না বললে null।
+৩) পোস্ট বানাতে বললে — "action": {"type":"post_draft","hint":"মালিকের কথা অনুযায়ী বিষয় ও সুর","product":"পণ্যের নাম বা null","noImage":false,"instagram":true/false,"at":"ISO সময় বা null","generateImage":false,"imagePrompt":""}। মালিক ইনস্টাগ্রাম বা সময় (যেমন "১২টায়") বললে instagram/at অবশ্যই এই খসড়াতেই বসাও — পরে ভুলে যাবে না। মালিক ছবি তৈরি করে দিতে বললে (ছবি পাঠায়নি) generateImage:true ও ইংরেজিতে বিস্তারিত imagePrompt দাও। ক্যাপশনে [লিংক]-এর মতো ফাঁকা বসানো অংশ থাকবে না। খসড়া থাকা অবস্থায় বদলাতে বললে আবার post_draft (hint-এ শুধু বদলের নির্দেশ)।
+৪) মালিক স্পষ্টভাবে পোস্ট করতে বললে ("পোস্ট করো", "হ্যাঁ দাও") এবং খসড়া থাকলে — "action": {"type":"post_publish","facebook":true,"instagram":false,"at":null}। ইনস্টাগ্রামে চাইলে "instagram":true। খসড়াতে সময়/ইনস্টাগ্রাম আগেই ঠিক হয়ে থাকলে সেটাই চলবে। নতুন সময় বললে "at"-এ ISO সময় (যেমন "2026-11-14T10:00:00+06:00"), না বললে null।
 ৫) মালিক পোস্ট দরকার নেই/বাতিল বললে — "action": {"type":"post_cancel"}।
 
 === কঠোর নিয়ম ===
@@ -363,27 +368,43 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
       const product = action.product ? await shop.findProduct(String(action.product)).catch(() => null) : null;
       const caption = await generateCaption({ settings, hint, product, previous: pending ? pending.caption : '' });
       const next = { caption, productName: product ? product.name : (action.product ? clip(action.product, 120) : ''), imageUrl: '', imageB64: '', imageMime: '' };
+      next.wantIg = !!action.instagram || IG_RE.test(text) || !!(pending && pending.wantIg);
+      next.postAt = action.at || (pending && pending.postAt) || '';
+      let imgNote = '';
       if (imageB64) { next.imageB64 = imageB64; next.imageMime = imageMime || 'image/jpeg'; }
+      else if (action.generateImage) {
+        try {
+          const buf = await imagegen.generateImage({ settings, prompt: clip(action.imagePrompt || hint, 800) });
+          next.imageB64 = buf.toString('base64'); next.imageMime = 'image/jpeg';
+        } catch (e) { imgNote = '\n⚠️ ' + e.message; }
+      }
       else if (pending && (pending.imageUrl || pending.imageB64) && !product) { next.imageUrl = pending.imageUrl || ''; next.imageB64 = pending.imageB64 || ''; next.imageMime = pending.imageMime || ''; }
       else if (product && !action.noImage) { next.imageUrl = (await shop.getProductImage(product.id).catch(() => null)) || ''; }
       await setPending(key, next);
       pending = next;
       const hasImg = !!(next.imageUrl || next.imageB64);
-      result.reply = `📝 পোস্টের খসড়া:\n\n${caption}\n\n🖼️ ${hasImg ? 'ছবি সংযুক্ত আছে' : 'ছবি ছাড়া (শুধু লেখা)'}\n\nপোস্ট করব? "পোস্ট করো" বললে ফেসবুকে যাবে ("ইনস্টাগ্রামেও" বললে সেখানেও)। বদলাতে চাইলে বলুন, না চাইলে "দরকার নেই"।`;
+      const when = next.postAt && !isNaN(new Date(next.postAt).getTime()) ? `\n⏰ সময়: ${bdString(new Date(next.postAt).getTime())} (ঢাকা)` : '';
+      result.reply = `📝 পোস্টের খসড়া:\n\n${caption}\n\n🖼️ ${hasImg ? 'ছবি সংযুক্ত আছে' : 'ছবি ছাড়া (শুধু লেখা)'}${imgNote}\n📣 কোথায়: ফেসবুক${next.wantIg ? ' + ইনস্টাগ্রাম' : ''}${when}\n\nপোস্ট করব? "পোস্ট করো" বললে এখনই (বা উপরের সময়ে) যাবে। বদলাতে চাইলে বলুন, না চাইলে "দরকার নেই"।`;
       if (next.imageUrl) result.imageUrl = next.imageUrl;
+      else if (next.imageB64 && !imageB64) {
+        // AI-র বানানো ছবি দেখাতে অস্থায়ী পাবলিক লিংক (বিদ্যমান /pmedia রুট)
+        try { const mid = await store.addPostMedia({ mime: 'image/jpeg', b64: next.imageB64 }); result.imageUrl = `${require('../config').publicUrl}/pmedia/${mid}.jpg`; } catch (e) { /* প্রিভিউ ছাড়াই চলবে */ }
+      }
     } else if (action && action.type === 'post_publish') {
       if (!pending) {
         result.reply = 'এখন কোনো পোস্টের খসড়া নেই। আগে বলুন কী নিয়ে পোস্ট বানাব, আমি খসড়া দেখাই।';
       } else {
         let atMs = null;
-        if (action.at) {
-          atMs = new Date(action.at).getTime();
+        const atIn = action.at || pending.postAt;
+        if (atIn) {
+          atMs = new Date(atIn).getTime();
           if (isNaN(atMs)) { result.reply = 'সময়টা বুঝতে পারিনি — যেমন "কাল সকাল ১০টায়" বলুন।'; atMs = undefined; }
           else if (atMs < Date.now() + 11 * 60000) { result.reply = 'শিডিউলের জন্য অন্তত ১১ মিনিট পরের সময় লাগবে (ফেসবুকের নিয়ম)। সময়টা আবার বলুন।'; atMs = undefined; }
           else if (atMs > Date.now() + 29 * 86400000) { result.reply = 'সর্বোচ্চ ২৯ দিন পর পর্যন্ত শিডিউল করা যায়।'; atMs = undefined; }
         }
         if (atMs !== undefined) {
-          const r = await publishPending(settings, pending, { facebook: action.facebook !== false, instagram: !!action.instagram, atMs });
+          const wantIg = !!action.instagram || !!pending.wantIg || IG_RE.test(text);
+          const r = await publishPending(settings, pending, { facebook: action.facebook !== false, instagram: wantIg, atMs });
           await clearPending(key);
           const where = (action.facebook !== false ? 'ফেসবুকে' : '') + (r.igDone ? (action.facebook !== false ? ' ও ' : '') + 'ইনস্টাগ্রামে' : '');
           result.reply = atMs
