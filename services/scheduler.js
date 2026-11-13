@@ -55,6 +55,7 @@ async function runDueInstagramPosts() {
     await store.failStuckIgPosts();
     await store.failStuckVideoPosts();
     await shop.sync(false); // ই-কমার্স ওয়েবসাইটের স্টক/চ্যাট পরীক্ষা (এরর ছোঁড়ে না)
+    require('./comments').pollFacebook().catch(() => {}); // Webhook ছাড়াই Facebook কমেন্ট ধরা (ব্যাকগ্রাউন্ডে)
     for (let i = 0; i < 5; i++) {
       const job = await store.claimDueIgPost();
       if (!job) break;
