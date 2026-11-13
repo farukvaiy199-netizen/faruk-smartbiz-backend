@@ -137,6 +137,15 @@ async function findOrCreateCustomer({ platform, platformId, name, phone, photoUr
 async function getCustomers() {
   const db = await getDb();
   const list = await db.collection('customers').find().sort({ createdAt: -1 }).toArray();
+  // যে কাস্টমার সবশেষ মেসেজ দিয়েছে সে সবার আগে — পুরনো কাস্টমারদের জন্য কথোপকথন থেকে সময় বের করি
+  const convs = await db.collection('conversations').find({}, { projection: { customerId: 1, messages: { $slice: -6 } } }).toArray();
+  const lastUser = {};
+  convs.forEach(cv => {
+    const m = (cv.messages || []).filter(x => x.role === 'user' && x.ts).pop();
+    if (m) lastUser[cv.customerId] = m.ts;
+  });
+  const key = c => new Date(c.lastMessageAt || lastUser[c.id] || c.createdAt || 0).getTime() || 0;
+  list.sort((a, b) => key(b) - key(a));
   return list.map(stripId);
 }
 
@@ -176,6 +185,9 @@ async function appendMessage(customerId, role, text) {
     { $set: { messages: updated } },
     { upsert: true }
   );
+  if (role === 'user') {
+    await db.collection('customers').updateOne({ id: customerId }, { $set: { lastMessageAt: new Date().toISOString() } }).catch(() => {});
+  }
 }
 
 /* ---------- Orders ---------- */
