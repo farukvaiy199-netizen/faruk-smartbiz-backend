@@ -202,26 +202,43 @@ router.post('/broadcast', async (req, res) => {
   const settings = await store.getSettings();
   const customers = await store.getCustomers();
   let success = 0, failed = 0;
+  const reasons = {};
+  const why = (e) => {
+    const er = e && e.response && e.response.data && e.response.data.error;
+    if (er && (er.code === 10 || er.error_subcode === 2018278 || er.code === 551)) return '২৪ ঘণ্টার বাইরে/ব্লক (Meta অনুমতি দেয় না)';
+    if (er && er.code === 190) return 'টোকেন মেয়াদোত্তীর্ণ';
+    if (er && er.code === 200) return 'অনুমতি নেই';
+    return String((er && er.message) || (e && e.message) || 'অজানা').slice(0, 80);
+  };
+  // Messenger/Instagram: সফল ধরা হবে শুধু যখন Meta message_id ফেরত দেয় — নইলে মিথ্যা "সফল" দেখাত
+  const sendMeta = async (id) => {
+    const r = await axios.post('https://graph.facebook.com/v19.0/me/messages',
+      { recipient: { id }, messaging_type: 'RESPONSE', message: { text: message } },
+      { params: { access_token: settings.fbToken }, timeout: 15000 });
+    if (!r.data || !r.data.message_id) throw new Error('Meta মেসেজ-আইডি দেয়নি');
+  };
 
   for (const c of customers) {
     try {
-      if (c.platform === 'facebook' && settings.fbToken) {
-        await sendFacebookMessage(c.platformId, message, settings.fbToken);
+      if ((c.platform === 'facebook' || c.platform === 'instagram') && settings.fbToken) {
+        await sendMeta(c.platformId);
       } else if (c.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
         await sendWhatsAppMessage(c.platformId, message, settings.waPhoneNumberId, settings.waToken);
-      } else if (c.platform === 'instagram' && settings.fbToken) {
-        await sendInstagramMessage(c.platformId, message, settings.fbToken);
+      } else if (c.platform === 'website') {
+        throw new Error('ওয়েবসাইটের কাস্টমারকে এখান থেকে পাঠানো যায় না');
       } else {
-        throw new Error('platform not connected');
+        throw new Error('প্ল্যাটফর্ম সংযুক্ত নেই');
       }
       success++;
     } catch (e) {
       failed++;
+      const r = why(e); reasons[r] = (reasons[r] || 0) + 1;
     }
+    await new Promise(r => setTimeout(r, 120));
   }
 
   const record = await store.addBroadcast({
-    msg: message, total: customers.length, success, failed,
+    msg: message, total: customers.length, success, failed, reasons,
     date: new Date().toLocaleDateString('bn-BD')
   });
   res.json(record);
