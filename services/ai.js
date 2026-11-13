@@ -71,18 +71,35 @@ function getSlots(settings) {
   return slots;
 }
 
-// ক্রমানুসারে প্রতিটা ঘর চেষ্টা করে — একটা কোটা/রেট-লিমিট/এররে আটকালে পরেরটা
+// ক্রমানুসারে প্রতিটা ঘর চেষ্টা করে — একটা কোটা/রেট-লিমিট/এররে আটকালে পরেরটা।
+// যে ঘর সম্প্রতি আটকেছে সেটা কিছুক্ষণ বিশ্রামে (cooldown) থাকে, যাতে প্রতিটা মেসেজে আবার আটকে সময় নষ্ট না হয়।
+const slotCooldown = new Map(); // key -> ফেরত চালু হওয়ার সময় (ms)
+const slotKey = s => `${s.provider}|${s.model || ''}|${String(s.apiKey || '').slice(-8)}`;
+function cooldownFor(err) {
+  const st = err && err.response && err.response.status;
+  const txt = JSON.stringify((err && err.response && err.response.data) || '') + ' ' + ((err && err.message) || '');
+  if (st === 401 || st === 403) return 30 * 60000;            // Key ভুল/অনুমতি নেই
+  if (st === 402 || /quota|exceeded|insufficient|billing|daily/i.test(txt)) return 10 * 60000; // দৈনিক/টাকার সীমা
+  if (st === 429) return 60000;                                // সাময়িক রেট-লিমিট
+  if (st >= 500) return 30000;
+  return 0;
+}
 async function withSlots(settings, fn) {
-  const slots = getSlots(settings);
-  if (!slots.length) throw new Error('কোনো AI Key সংযুক্ত নেই');
+  const all = getSlots(settings);
+  if (!all.length) throw new Error('কোনো AI Key সংযুক্ত নেই');
+  const now = Date.now();
+  const ready = all.filter(sl => (slotCooldown.get(slotKey(sl)) || 0) <= now);
+  const slots = ready.length ? ready : all; // সবই বিশ্রামে থাকলে তবু সবগুলো চেষ্টা করি
   let lastErr;
   for (let i = 0; i < slots.length; i++) {
     try {
       return await fn(slots[i]);
     } catch (err) {
       lastErr = err;
+      const cd = cooldownFor(err);
+      if (cd) slotCooldown.set(slotKey(slots[i]), Date.now() + cd);
       const more = i < slots.length - 1;
-      console.warn(`AI Key #${i + 1} (${slots[i].provider}) ব্যর্থ: ${(err.response && err.response.status) || ''} ${err.message}${more ? ' — পরের Key চেষ্টা করা হচ্ছে' : ''}`);
+      console.warn(`AI Key (${slots[i].provider}) ব্যর্থ: ${(err.response && err.response.status) || ''} ${err.message}${cd ? ` — ${Math.round(cd / 1000)} সেকেন্ড বিশ্রামে` : ''}${more ? ' — পরের Key চেষ্টা করা হচ্ছে' : ''}`);
     }
   }
   throw lastErr;
