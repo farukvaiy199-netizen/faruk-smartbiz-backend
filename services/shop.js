@@ -482,4 +482,18 @@ async function disconnect() {
   await saveCfg({ connected: false, botPassword: '', counts: null, lowItems: [], outItems: [], ordersInfo: null, lastSync: null });
 }
 
-module.exports = { connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+
+// নাম মিলিয়ে একটা প্রোডাক্ট খোঁজে (পোস্টের খসড়ার জন্য) — না পেলে null
+async function findProduct(query) {
+  try {
+    const { cfg, snap: s } = await getSnapshot();
+    if (!s) return null;
+    const q = String(query || '').toLowerCase().trim();
+    if (!q) return null;
+    const act = activeProducts(s.products);
+    const hit = act.find(p => p.name.toLowerCase() === q) || act.find(p => p.name.toLowerCase().includes(q) || q.includes(p.name.toLowerCase()));
+    return hit ? { ...hit, url: productUrl(cfg, hit) } : null;
+  } catch (e) { return null; }
+}
+
+module.exports = { findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
