@@ -165,10 +165,54 @@ async function ensureFeedSubscription() {
   return want;
 }
 
+// Webhook না এলে বিকল্প: নিয়মিত পেজের সাম্প্রতিক পোস্টের নতুন কমেন্ট নিজে তুলে আনা (cron থেকে চলে)।
+// একই কমেন্ট webhook ও poll দুইভাবে এলেও claim() এর কারণে একবারই সাড়া যায়।
+let polling = false;
+async function pollFacebook() {
+  if (polling) return 0;
+  polling = true;
+  let handled = 0;
+  try {
+    const settings = await store.getSettings();
+    if (settings.commentAuto !== 'on' || !settings.fbToken) return 0;
+    const token = settings.fbToken;
+    const db = await store.getDb();
+    const st = await db.collection('meta').findOne({ _id: 'commentPoll' });
+    const since = st && st.since ? new Date(st.since).getTime() : Date.now(); // প্রথমবার: পুরনো কমেন্ট ধরা হবে না
+    const startedAt = Date.now();
+    const posts = await axios.get(`${GRAPH}/me/posts`, { params: { fields: 'id', limit: 6, access_token: token }, timeout: 15000 });
+    const pageId = String(settings.fbPageId || '');
+    for (const p of (posts.data.data || [])) {
+      if (handled >= 6) break;
+      let list = [];
+      try {
+        const r = await axios.get(`${GRAPH}/${p.id}/comments`, { params: { fields: 'id,message,from,created_time,parent{id}', filter: 'toplevel', order: 'reverse_chronological', limit: 15, access_token: token }, timeout: 15000 });
+        list = r.data.data || [];
+      } catch (e) { console.warn('কমেন্ট পোল ব্যর্থ:', errMsg(e)); continue; }
+      for (const c of list.reverse()) {
+        if (new Date(c.created_time).getTime() <= since) continue;
+        if (c.parent) continue;
+        handled++;
+        await handleComment({
+          platform: 'facebook', commentId: c.id, text: c.message, fromId: c.from && c.from.id, fromName: c.from && c.from.name, ownId: pageId,
+          send: {
+            public: async msg => { await axios.post(`${GRAPH}/${c.id}/comments`, null, { params: { message: msg, access_token: token }, timeout: 15000 }); },
+            private: async msg => { await axios.post(`${GRAPH}/${c.id}/private_replies`, null, { params: { message: msg, access_token: token }, timeout: 15000 }); }
+          }
+        });
+      }
+    }
+    await db.collection('meta').updateOne({ _id: 'commentPoll' }, { $set: { since: new Date(handled >= 6 ? since : startedAt - 60000) } }, { upsert: true });
+  } catch (err) {
+    console.warn('কমেন্ট পোল এরর:', errMsg(err));
+  } finally { polling = false; }
+  return handled;
+}
+
 async function recent(limit = 20) {
   const col = await logCol();
   return (await col.find({ status: { $in: ['done', 'error', 'skipped'] } }).sort({ at: -1 }).limit(limit).toArray())
     .map(d => ({ id: d._id, platform: d.platform, intent: d.intent || '', status: d.status, pub: d.pub || '', priv: d.priv || '', note: d.note || '', text: d.text || '', at: d.at }));
 }
 
-module.exports = { ensureFeedSubscription, handleFacebookChange, handleInstagramChange, classify, recent };
+module.exports = { pollFacebook, ensureFeedSubscription, handleFacebookChange, handleInstagramChange, classify, recent };
