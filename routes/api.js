@@ -282,6 +282,9 @@ router.post('/assistant/chat', async (req, res) => {
   const out = await assistant.handleOwnerMessage({ key: 'app', text: text || 'এই ছবিটা দিয়ে পোস্ট বানাও।', settings, imageB64: m ? m[1] : '', imageMime: 'image/jpeg' });
   res.json(out);
 });
+router.get('/comments/diagnose', async (req, res) => {
+  try { res.json(await comments.diagnose()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
 router.get('/comments/recent', async (req, res) => {
   res.json(await comments.recent(20));
 });
