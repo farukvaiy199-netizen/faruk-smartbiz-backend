@@ -75,14 +75,18 @@ async function connect({ token, channel }) {
   if (ch) {
     try {
       const chat = await call(token, 'getChat', { chat_id: ch });
+      if (chat.type === 'private') throw new Error('এটা চ্যানেল নয় (বট বা ব্যক্তির নাম দেওয়া হয়েছে) — নিজের Telegram চ্যানেলের @নাম দিন');
       const mem = await call(token, 'getChatMember', { chat_id: chat.id, user_id: me.id });
       if (mem.status !== 'administrator' && mem.status !== 'creator') note = 'চ্যানেলে বটকে Admin বানাতে হবে (পোস্ট করার অনুমতিসহ)।';
       else if (mem.can_post_messages === false) note = 'বটকে চ্যানেলে "Post messages" অনুমতি দিন।';
       patch.tgChannel = String(chat.id);
       patch.tgChannelTitle = chat.title || ch;
     } catch (e) {
-      patch.tgChannel = ch; patch.tgChannelTitle = ch;
-      note = 'চ্যানেলটা পাওয়া যায়নি (' + e.message + ') — নাম ঠিক আছে কিনা আর বট Admin কিনা দেখুন।';
+      if (/চ্যানেল নয়/.test(e.message)) { patch.tgChannel = ''; patch.tgChannelTitle = ''; note = e.message; }
+      else {
+        patch.tgChannel = ch; patch.tgChannelTitle = ch;
+        note = 'চ্যানেলটা পাওয়া যায়নি (' + e.message + ') — নাম ঠিক আছে কিনা আর বট Admin কিনা দেখুন।';
+      }
     }
   } else { patch.tgChannel = ''; patch.tgChannelTitle = ''; }
   await store.saveSettings(patch);
@@ -105,7 +109,8 @@ async function status() {
     out.checks.push({ ok: w.url === want, msg: w.url === want ? 'বট সার্ভারের সাথে যুক্ত' : 'ওয়েবহুক ঠিক নেই — আবার "সংযুক্ত করুন" চাপুন' });
     if (w.last_error_message) out.checks.push({ ok: false, msg: 'সর্বশেষ ত্রুটি: ' + clip(w.last_error_message, 120) });
   } catch (e) { out.checks.push({ ok: false, msg: 'টোকেন কাজ করছে না: ' + e.message }); }
-  if (s.tgChannel) {
+  if (s.tgChannel && Number(s.tgChannel) > 0) out.checks.push({ ok: false, msg: 'সংরক্ষিত ঠিকানাটা চ্যানেল নয় (বট/ব্যক্তি) — সঠিক চ্যানেলের @নাম দিয়ে আবার "সংযুক্ত করুন"' });
+  else if (s.tgChannel) {
     try {
       const mem = await call(s.tgToken, 'getChatMember', { chat_id: s.tgChannel, user_id: s.tgBotId });
       const ok = (mem.status === 'administrator' || mem.status === 'creator') && mem.can_post_messages !== false;
