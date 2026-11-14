@@ -217,6 +217,26 @@ async function getPending(key) {
 async function setPending(key, p) { await metaSet('assistantPending:' + key, { ...p, at: new Date() }); }
 async function clearPending(key) { await metaDel('assistantPending:' + key); }
 
+/* ---------- ওয়েবসাইটে নতুন পণ্য ---------- */
+async function getProdPending(key) {
+  const d = await metaGet('assistantProduct:' + key);
+  if (!d || !d.name) return null;
+  if (d.at && Date.now() - new Date(d.at).getTime() > PENDING_MS) { await metaDel('assistantProduct:' + key); return null; }
+  return d;
+}
+async function setProdPending(key, p) { await metaSet('assistantProduct:' + key, { ...p, at: new Date() }); }
+async function clearProdPending(key) { await metaDel('assistantProduct:' + key); }
+const taka = n => '৳' + Number(n).toLocaleString('bn-BD');
+
+async function productImageData(pend) {
+  if (!pend.imageB64) return '';
+  let buf = Buffer.from(pend.imageB64, 'base64');
+  try { buf = await imagegen.shrinkJpeg(buf, 900, 6); } catch (e) { /* ছোট করা না গেলে আসলটাই */ }
+  if (buf.length > 700 * 1024) buf = await imagegen.shrinkJpeg(buf, 640, 10).catch(() => buf);
+  if (buf.length > 800 * 1024) throw new Error('ছবিটা অনেক বড় — ছোট ছবি দিন');
+  return 'data:image/jpeg;base64,' + buf.toString('base64');
+}
+
 /* ---------- পোস্ট ---------- */
 async function generateCaption({ settings, hint, product, previous }) {
   const notes = settings.postNotes ? `\nদোকানের পোস্টের সাধারণ নির্দেশনা: ${settings.postNotes}` : '';
@@ -289,7 +309,7 @@ async function publishPending(settings, pending, { facebook, instagram, atMs }) 
 }
 
 /* ---------- AI-র নির্দেশ ---------- */
-function systemPromptFor({ snapshot, rules, pending }) {
+function systemPromptFor({ snapshot, rules, pending, prodPending, categories }) {
   return `
 তুমি "Faruk's SmartBiz"-এর মালিকের ব্যক্তিগত সহকারী। এখন যিনি কথা বলছেন তিনি দোকানের মালিক, কাস্টমার না।
 একজন বিশ্বস্ত, চটপটে মানব সহকারীর মতো বাংলায়, ছোট ছোট লাইনে, আন্তরিকভাবে কথা বলবে (এটা WhatsApp/Messenger-এর মেসেজ — লম্বা টেবিল নয়, ইমোজি চলবে)।
@@ -305,6 +325,12 @@ ${JSON.stringify(snapshot)}
 === কাস্টমারদের জন্য মালিকের আগের নির্দেশনা ===
 ${rules.length ? rules.map((r, i) => `${i + 1}) ${r.text}`).join('\n') : '(এখনো কোনোটা নেই)'}
 
+=== ওয়েবসাইটের বিদ্যমান বিভাগ ===
+${(categories || []).join(', ') || '(জানা নেই)'}
+
+=== চলমান পণ্য-খসড়া ===
+${prodPending ? `${prodPending.name} | ${taka(prodPending.price)} | স্টক ${prodPending.stock} | ${prodPending.category || 'বিভাগ ঠিক হয়নি'} | ছবি ${prodPending.imageB64 ? 'আছে' : 'নেই'}` : '(নেই)'}
+
 === চলমান পোস্টের খসড়া ===
 ${pending ? `ক্যাপশন: ${pending.caption}\nইনস্টাগ্রামেও: ${pending.wantIg ? 'হ্যাঁ' : 'না'} | সময়: ${pending.postAt || 'এখনই'}\nছবি: ${pending.imageUrl || pending.imageB64 ? 'আছে' : 'নেই'}` : '(নেই)'}
 
@@ -314,6 +340,8 @@ ${pending ? `ক্যাপশন: ${pending.caption}\nইনস্টাগ্
 ৩) পোস্ট বানাতে বললে — "action": {"type":"post_draft","hint":"মালিকের কথা অনুযায়ী বিষয় ও সুর","product":"পণ্যের নাম বা null","noImage":false,"instagram":true/false,"at":"ISO সময় বা null","generateImage":false,"imagePrompt":""}। মালিক ইনস্টাগ্রাম বা সময় (যেমন "১২টায়") বললে instagram/at অবশ্যই এই খসড়াতেই বসাও — পরে ভুলে যাবে না। মালিক ছবি তৈরি করে দিতে বললে (ছবি পাঠায়নি) generateImage:true ও ইংরেজিতে বিস্তারিত imagePrompt দাও। ক্যাপশনে [লিংক]-এর মতো ফাঁকা বসানো অংশ থাকবে না। খসড়া থাকা অবস্থায় বদলাতে বললে আবার post_draft (hint-এ শুধু বদলের নির্দেশ)।
 ৪) মালিক স্পষ্টভাবে পোস্ট করতে বললে ("পোস্ট করো", "হ্যাঁ দাও") এবং খসড়া থাকলে — "action": {"type":"post_publish","facebook":true,"instagram":false,"at":null}। ইনস্টাগ্রামে চাইলে "instagram":true। খসড়াতে সময়/ইনস্টাগ্রাম আগেই ঠিক হয়ে থাকলে সেটাই চলবে। নতুন সময় বললে "at"-এ ISO সময় (যেমন "2026-11-14T10:00:00+06:00"), না বললে null।
 ৫) মালিক পোস্ট দরকার নেই/বাতিল বললে — "action": {"type":"post_cancel"}।
+৬) ওয়েবসাইটে নতুন পণ্য যোগ করতে বললে — প্রথমে খসড়া: "action": {"type":"product_draft","name":"...","price":সংখ্যা,"oldPrice":সংখ্যা বা 0,"stock":সংখ্যা,"category":"বিদ্যমান বিভাগ থেকে বেছে (নিচে তালিকা)","desc":"মালিকের কথা থেকে সংক্ষিপ্ত বিবরণ"}। নাম বা দাম না বললে খসড়া বানাবে না — জিজ্ঞেস করবে (action: null)। স্টক না বললে জিজ্ঞেস করবে। মালিক ছবি পাঠালে সেটা পণ্যের ছবি হয়ে যাবে। খসড়ার সংশোধন চাইলে আবার product_draft (সব ঘর সহ)।
+৭) মালিক "যোগ করো/হ্যাঁ/ঠিক আছে" বললে এবং পণ্যের খসড়া থাকলে — "action": {"type":"product_confirm"}। বাতিল চাইলে {"type":"product_cancel"}।
 
 === কঠোর নিয়ম ===
 - মালিকের স্পষ্ট আদেশ ছাড়া post_publish দেবে না; খসড়া না থাকলে post_publish দেবে না। প্রথমে সবসময় খসড়া দেখাবে, মালিক অনুমতি দিলে তবেই পোস্ট।
@@ -333,6 +361,8 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
   settings = settings || await store.getSettings();
   const rules = await store.getAiRules();
   let pending = await getPending(key);
+  let prodPending = await getProdPending(key);
+  const categories = await shop.categoryNames().catch(() => []);
   const turns = await getTurns(key);
 
   let snapshot;
@@ -344,7 +374,7 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
 
   let out;
   try {
-    out = await getJsonReply({ settings, systemPrompt: systemPromptFor({ snapshot, rules, pending }), userMessage });
+    out = await getJsonReply({ settings, systemPrompt: systemPromptFor({ snapshot, rules, pending, prodPending, categories }), userMessage });
   } catch (err) {
     console.error('সহকারী AI এরর:', errMsg(err));
     return { reply: 'দুঃখিত, AI এই মুহূর্তে উত্তর দিতে পারছে না (কোটা শেষ হতে পারে)। একটু পরে আবার বলুন 🙏' };
@@ -413,6 +443,32 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
           if (r.igSkip) result.reply += `\n⚠️ ইনস্টাগ্রামে যায়নি: ${r.igSkip}।`;
         }
       }
+    } else if (action && action.type === 'product_draft') {
+      const price = Number(action.price);
+      if (!action.name || !String(action.name).trim() || isNaN(price) || price < 0) {
+        result.reply = 'পণ্যের নাম ও দাম জানালে খসড়া বানিয়ে দিই।';
+      } else {
+        const keepImg = prodPending && prodPending.imageB64 && !imageB64 ? prodPending.imageB64 : '';
+        const next = {
+          name: clip(action.name, 120).trim(), price, oldPrice: Number(action.oldPrice) || 0, stock: Math.max(0, Math.round(Number(action.stock) || 0)),
+          category: clip(action.category, 60), desc: clip(action.desc, 800), imageB64: imageB64 || keepImg
+        };
+        await setProdPending(key, next);
+        prodPending = next;
+        result.reply = `🛍️ নতুন পণ্যের খসড়া:\n\n• নাম: ${next.name}\n• দাম: ${taka(next.price)}${next.oldPrice ? ' (আগের দাম ' + taka(next.oldPrice) + ')' : ''}\n• স্টক: ${next.stock}টি\n• বিভাগ: ${next.category || '(ঠিক হয়নি)'}\n• বিবরণ: ${next.desc || '—'}\n• ছবি: ${next.imageB64 ? 'আছে' : 'নেই (ছবি পাঠালে যুক্ত হবে)'}\n\nসব ঠিক থাকলে "যোগ করো" বলুন। বদলাতে চাইলে বলুন।`;
+      }
+    } else if (action && action.type === 'product_confirm') {
+      if (!prodPending) {
+        result.reply = 'এখন যোগ করার মতো কোনো পণ্যের খসড়া নেই। পণ্যের নাম, দাম ও স্টক বলুন।';
+      } else {
+        const image = await productImageData(prodPending);
+        const p = await shop.addProduct({ ...prodPending, image });
+        await clearProdPending(key);
+        result.reply = `✅ "${p.name}" ওয়েবসাইটে যোগ হয়ে গেছে (${taka(p.price)}, স্টক ${p.stock})।${image ? '' : '\n⚠️ ছবি ছাড়া যোগ হয়েছে — অ্যাডমিন প্যানেল থেকে ছবি দিতে পারেন।'}`;
+      }
+    } else if (action && action.type === 'product_cancel') {
+      await clearProdPending(key);
+      result.reply = reply || 'ঠিক আছে, পণ্যটা যোগ করলাম না।';
     } else if (action && action.type === 'post_cancel') {
       await clearPending(key);
       result.reply = reply || 'ঠিক আছে, পোস্টটা বাতিল করলাম।';
