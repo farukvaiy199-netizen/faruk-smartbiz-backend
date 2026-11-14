@@ -125,7 +125,7 @@ function isVisionCapable(provider) {
  * কাস্টমারের মেসেজ পড়ে AI দিয়ে রিপ্লাই বানায়।
  * AI কে বলা হয় JSON আকারে ফেরত দিতে: { reply, order }
  */
-async function getAIReply({ apiKey, provider = 'groq', model = '', baseUrl = '', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [], stockList = [], shopContext = '' }) {
+async function getAIReply({ apiKey, provider = 'groq', model = '', baseUrl = '', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [], stockList = [], shopContext = '', customerMemory = '' }) {
   // অ্যাপের স্টক পেজ থেকে মালিকের বসানো বর্তমান স্টক — এটাই সবচেয়ে নির্ভরযোগ্য
   const stockBlock = stockList.length
     ? `\n=== বর্তমান স্টক (অ্যাপ থেকে, সবচেয়ে নির্ভরযোগ্য) ===\nনিচের তালিকায় যে প্রোডাক্ট আছে তার স্টক শুধু এখান থেকে বলবে (শিটের Stock কলামের চেয়ে এটা বেশি সঠিক)। ০ হলে "স্টকে নেই" বলবে, আর অর্ডার নেবে না:\n${stockList.map(e => `- ${e.name}: ${e.qty > 0 ? e.qty + 'টি আছে' : 'স্টক শেষ'}`).join('\n')}\n`
@@ -143,7 +143,11 @@ async function getAIReply({ apiKey, provider = 'groq', model = '', baseUrl = '',
 বাংলায়, সংক্ষেপে উত্তর দাও।
 ${businessInfo ? 'দোকানের তথ্য:\n' + businessInfo : ''}
 ${sheetContext ? sheetContext : ''}
-${rulesBlock}${imagesBlock}${stockBlock}${shopContext}
+${rulesBlock}${imagesBlock}${stockBlock}${shopContext}${customerMemory ? `
+=== এই কাস্টমার সম্পর্কে আগের স্মৃতি (আগের কথোপকথন ও অর্ডার থেকে) ===
+${customerMemory}
+এই তথ্য মনে রেখে কথা বলবে — যা আগেই জানা (নাম, ঠিকানা, পছন্দ, আগের অর্ডার) তা আবার জিজ্ঞেস করবে না; বরং "আগের ঠিকানাতেই পাঠাব?" ধরনের স্বাভাবিক কথা বলবে। স্মৃতিতে ভুল মনে হলে কাস্টমারের নতুন কথাই মানবে।
+` : ''}
 === স্টক ও প্রাপ্যতা ===
 কোনো প্রোডাক্ট আছে কি নেই — এটা শুধু বর্তমান শিটের তথ্য, ওয়েবসাইটের লাইভ তথ্য (থাকলে) আর মালিকের নির্দেশনা দেখে বলবে। আগের কথোপকথনে তুমি বা অন্য কেউ "স্টকে নেই" বলে থাকলেও সেটা পুরনো হতে পারে, তাই সেটার উপর ভরসা করে আবার "নেই" বলবে না।
 
@@ -242,9 +246,9 @@ ${rulesBlock}${imagesBlock}${stockBlock}${shopContext}
 }
 
 // প্রধান AI Key ব্যর্থ হলে (rate limit/quota/এরর) স্বয়ংক্রিয়ভাবে পরের ঘরের Key দিয়ে আবার চেষ্টা করে
-async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [], stockList = [], shopContext = '' }) {
+async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [], stockList = [], shopContext = '', customerMemory = '' }) {
   return withSlots(settings, (slot) => getAIReply({
-    ...slot, customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext
+    ...slot, customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext, customerMemory
   }));
 }
 
@@ -433,4 +437,13 @@ ${hasImage ? `
     : getOpenAiCompatibleReply({ ...slot, systemPrompt, customerMessage: message, history }));
 }
 
-module.exports = { getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply, getSlots, getJsonReply };
+// কাস্টমারের স্মৃতি নতুন করে সংক্ষেপে লেখে (পুরনো স্মৃতি + সাম্প্রতিক কথোপকথন থেকে)
+async function summarizeCustomerMemory({ settings, previous = '', history = [], orders = '' }) {
+  const convo = history.slice(-20).map(h => `${h.role === 'user' ? 'কাস্টমার' : 'দোকান'}: ${String(h.text).slice(0, 200)}`).join('\n');
+  const systemPrompt = `তুমি একটা দোকানের কাস্টমার-নোট লেখক। নিচের পুরনো স্মৃতি ও সাম্প্রতিক কথোপকথন মিলিয়ে এই কাস্টমার সম্পর্কে দরকারি তথ্য বাংলায় সর্বোচ্চ ৬০০ অক্ষরে লেখো: নাম, ফোন, ঠিকানা, কোন পণ্যে আগ্রহ/কী কিনেছেন, কোনো বিশেষ চাহিদা বা অভিযোগ, কী নিয়ে শেষ কথা হয়েছে। শুধু যা সত্যিই বলা হয়েছে তা লিখবে, অনুমান নয়। পুরনো তথ্য এখনো ঠিক থাকলে রাখবে, নতুন তথ্য দিলে বদলাবে। শুধু JSON: {"memory":"..."}`;
+  const userMessage = `পুরনো স্মৃতি: ${previous || '(নেই)'}\nঅর্ডার: ${orders || '(নেই)'}\n\nসাম্প্রতিক কথোপকথন:\n${convo}`;
+  const r = await getJsonReply({ settings, systemPrompt, userMessage });
+  return String((r && r.memory) || '').slice(0, 900).trim();
+}
+
+module.exports = { summarizeCustomerMemory, getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply, getSlots, getJsonReply };
