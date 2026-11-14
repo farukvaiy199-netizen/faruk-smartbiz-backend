@@ -393,7 +393,16 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
   }
 
   let reply = clip(out && out.reply, 1500).trim() || 'বুঝেছি।';
-  const action = out && out.action && typeof out.action === 'object' ? out.action : null;
+  let action = out && out.action && typeof out.action === 'object' ? out.action : null;
+  // AI ভুল করে "TikTok-এ পারি না" বললে নিজেরাই ঠিক পথে ঘুরিয়ে দিই (TikTok সংযুক্ত থাকলে)
+  if ((!action || !action.type) && settings.tkAccessToken && /tik\s*tok|টিক\s*টক|টিকটক/i.test(text) && /পারি না|পারব না|পারবো না|পারছি না|সম্ভব না/.test(reply)) {
+    if (imageB64 || pending || /করে দেন|করে দাও|করো|করুন|দাও|বানাও|বানিয়ে/.test(text)) {
+      action = { type: 'post_draft', hint: text };
+      reply = 'ঠিক আছে, খসড়া বানাচ্ছি।';
+    } else {
+      reply = 'হ্যাঁ, TikTok সংযুক্ত আছে ✅ ছবিসহ পোস্ট করলে ফেসবুকের সাথে TikTok-এও যাবে। ছবি পাঠিয়ে বলুন "এটা দিয়ে পোস্ট বানাও"।';
+    }
+  }
   const result = { reply };
 
   try {
