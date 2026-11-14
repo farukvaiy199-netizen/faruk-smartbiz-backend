@@ -36,7 +36,14 @@ async function ensurePageToken(settings, force) {
   try {
     const r = await axios.get(`${GRAPH}/me/accounts`, { params: { fields: 'id,name,access_token,instagram_business_account{id}', limit: 50, access_token: token }, timeout: 15000 });
     accounts = r.data.data || [];
-  } catch (e) { checkedToken = token; return { settings, changed: false }; } // Page টোকেনে এটা চলে না — মানে ঠিক আছে
+  } catch (e) {
+    // Page টোকেনে /me/accounts চলে না (ঠিক আছে)। কিন্তু ব্যক্তিগত টোকেনে চলার কথা — না চললে pages_show_list অনুমতি নেই
+    try {
+      const me = await axios.get(`${GRAPH}/me`, { params: { fields: 'id,name,category', access_token: token }, timeout: 15000 });
+      if (!me.data.category) throw new Error('এটা ব্যক্তিগত টোকেন, কিন্তু পেজের তালিকা পড়া যাচ্ছে না — Graph Explorer-এ pages_show_list অনুমতিও টিক দিয়ে আবার টোকেন বানান');
+    } catch (e2) { if (/ব্যক্তিগত/.test(e2.message)) throw e2; }
+    checkedToken = token; return { settings, changed: false };
+  }
   const cfg = require('../config');
   let userTok = token;
   const appId = settings.fbAppId || cfg.fbAppId;
@@ -201,7 +208,7 @@ async function handleInstagramChange(entry, change) {
 async function ensureFeedSubscription() {
   let settings = await store.getSettings();
   if (!settings.fbToken) throw new Error('আগে Facebook পেজের টোকেন সংযুক্ত করুন');
-  await ensurePageToken(settings).catch(() => {});
+  await ensurePageToken(settings).catch(e => { if (/ব্যক্তিগত|পেজ/.test(e.message)) throw e; });
   settings = await store.getSettings();
   const pid = await getPageId(settings);
   if (!pid) throw new Error('টোকেন থেকে পেজ চেনা যায়নি — টোকেন ঠিক আছে কিনা পরীক্ষা করুন');
