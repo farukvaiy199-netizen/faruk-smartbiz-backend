@@ -84,7 +84,9 @@ function computeConnected(s) {
     ai: !!s.aiKey,
     ai2: !!s.aiKey2,
     ai3: !!s.aiKey3,
-    ig: !!s.igUserId
+    ig: !!s.igUserId,
+    tg: !!s.tgToken,
+    tk: !!s.tkAccessToken
   };
 }
 
@@ -680,6 +682,43 @@ async function claimDueIgPost() {
   );
   return stripId(docOf(result));
 }
+// সময় হয়েছে এমন একটা Telegram চ্যানেল-পোস্ট আটকে নেয় (atomic)
+async function claimDueTgPost() {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const result = await db.collection('posts').findOneAndUpdate(
+    { tgStatus: 'pending', tgDueAt: { $lte: now } },
+    { $set: { tgStatus: 'publishing', tgClaimedAt: now } },
+    { sort: { tgDueAt: 1 }, returnDocument: 'after' }
+  );
+  return stripId(docOf(result));
+}
+async function claimDueTkPost() {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const result = await db.collection('posts').findOneAndUpdate(
+    { tkStatus: 'pending', tkDueAt: { $lte: now } },
+    { $set: { tkStatus: 'publishing', tkClaimedAt: now } },
+    { sort: { tkDueAt: 1 }, returnDocument: 'after' }
+  );
+  return stripId(docOf(result));
+}
+async function failStuckTkPosts() {
+  const db = await getDb();
+  const cutoff = new Date(Date.now() - 10 * 60000).toISOString();
+  await db.collection('posts').updateMany(
+    { tkStatus: 'publishing', tkClaimedAt: { $lt: cutoff } },
+    { $set: { tkStatus: 'failed', tkError: 'অনিশ্চিত অবস্থা — TikTok-এ গিয়ে দেখে নিন' } }
+  );
+}
+async function failStuckTgPosts() {
+  const db = await getDb();
+  const cutoff = new Date(Date.now() - 10 * 60000).toISOString();
+  await db.collection('posts').updateMany(
+    { tgStatus: 'publishing', tgClaimedAt: { $lt: cutoff } },
+    { $set: { tgStatus: 'failed', tgError: 'অনিশ্চিত অবস্থা — চ্যানেলে গিয়ে দেখে নিন' } }
+  );
+}
 // ১০ মিনিটের বেশি "চলছে" অবস্থায় আটকে থাকা কাজ আবার না চালিয়ে ব্যর্থ ধরি — নইলে দুইবার পোস্ট হয়ে যেতে পারে
 async function failStuckIgPosts() {
   const db = await getDb();
@@ -729,5 +768,5 @@ module.exports = {
   savePushSub, getPushSubs, deletePushSub, getVapidKeys,
   getStockList, setStock, findStockEntry, decrementStock, incrementStock,
   addPost, getPosts, getPostById, deletePostRecord,
-  addPostMedia, getPostMedia, deletePostMedia, updatePost, claimDueIgPost, failStuckIgPosts, getCronKey
+  addPostMedia, getPostMedia, deletePostMedia, updatePost, claimDueIgPost, failStuckIgPosts, claimDueTgPost, failStuckTgPosts, claimDueTkPost, failStuckTkPosts, getCronKey
 };
