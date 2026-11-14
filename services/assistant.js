@@ -316,7 +316,7 @@ async function publishPending(settings, pending, { facebook, instagram, atMs }) 
 }
 
 /* ---------- AI-র নির্দেশ ---------- */
-function systemPromptFor({ snapshot, rules, pending, prodPending, categories }) {
+function systemPromptFor({ snapshot, rules, pending, prodPending, categories, settings }) {
   return `
 তুমি "Faruk's SmartBiz"-এর মালিকের ব্যক্তিগত সহকারী। এখন যিনি কথা বলছেন তিনি দোকানের মালিক, কাস্টমার না।
 একজন বিশ্বস্ত, চটপটে মানব সহকারীর মতো বাংলায়, ছোট ছোট লাইনে, আন্তরিকভাবে কথা বলবে (এটা WhatsApp/Messenger-এর মেসেজ — লম্বা টেবিল নয়, ইমোজি চলবে)।
@@ -340,6 +340,11 @@ ${prodPending ? `${prodPending.name} | ${taka(prodPending.price)} | স্টক
 
 === চলমান পোস্টের খসড়া ===
 ${pending ? `ক্যাপশন: ${pending.caption}\nইনস্টাগ্রামেও: ${pending.wantIg ? 'হ্যাঁ' : 'না'} | সময়: ${pending.postAt || 'এখনই'}\nছবি: ${pending.imageUrl || pending.imageB64 ? 'আছে' : 'নেই'}` : '(নেই)'}
+
+=== পোস্ট যেসব জায়গায় যায় ===
+ফেসবুক: ${settings.fbToken ? 'সংযুক্ত' : 'নয়'} | ইনস্টাগ্রাম: ${settings.igUserId ? 'সংযুক্ত' : 'নয়'} | TikTok: ${settings.tkAccessToken ? 'সংযুক্ত' : 'নয়'} | টেলিগ্রাম চ্যানেল: ${settings.tgToken && settings.tgChannel ? 'সংযুক্ত' : 'নয়'}
+- পোস্ট বানাতে বললে (মালিক TikTok বা টেলিগ্রামের নাম বললেও) নিচের post_draft/post_publish ব্যবহার করবে। TikTok ও টেলিগ্রাম সংযুক্ত থাকলে পোস্ট করার সময় নিজে থেকেই সেখানেও যায় — আলাদা কিছু করতে হয় না। TikTok-এ শুধু ছবিসহ পোস্ট যায়, তাই ছবি না থাকলে ছবি পাঠাতে বা বানিয়ে নিতে বলবে।
+- কখনো বলবে না যে "আমি TikTok/টেলিগ্রামে পোস্ট করতে পারি না"। সংযুক্ত না থাকলে বলবে অ্যাপের সেটিংসে গিয়ে সংযুক্ত করতে হবে।
 
 === তুমি যা করতে পারো ===
 ১) প্রশ্নের উত্তর দেওয়া — "action": null।
@@ -381,7 +386,7 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
 
   let out;
   try {
-    out = await getJsonReply({ settings, systemPrompt: systemPromptFor({ snapshot, rules, pending, prodPending, categories }), userMessage });
+    out = await getJsonReply({ settings, systemPrompt: systemPromptFor({ snapshot, rules, pending, prodPending, categories, settings }), userMessage });
   } catch (err) {
     console.error('সহকারী AI এরর:', errMsg(err));
     return { reply: 'দুঃখিত, AI এই মুহূর্তে উত্তর দিতে পারছে না (কোটা শেষ হতে পারে)। একটু পরে আবার বলুন 🙏' };
@@ -421,7 +426,7 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
       pending = next;
       const hasImg = !!(next.imageUrl || next.imageB64);
       const when = next.postAt && !isNaN(new Date(next.postAt).getTime()) ? `\n⏰ সময়: ${bdString(new Date(next.postAt).getTime())} (ঢাকা)` : '';
-      result.reply = `📝 পোস্টের খসড়া:\n\n${caption}\n\n🖼️ ${hasImg ? 'ছবি সংযুক্ত আছে' : 'ছবি ছাড়া (শুধু লেখা)'}${imgNote}\n📣 কোথায়: ফেসবুক${next.wantIg ? ' + ইনস্টাগ্রাম' : ''}${when}\n\nপোস্ট করব? "পোস্ট করো" বললে এখনই (বা উপরের সময়ে) যাবে। বদলাতে চাইলে বলুন, না চাইলে "দরকার নেই"।`;
+      result.reply = `📝 পোস্টের খসড়া:\n\n${caption}\n\n🖼️ ${hasImg ? 'ছবি সংযুক্ত আছে' : 'ছবি ছাড়া (শুধু লেখা)'}${imgNote}\n📣 কোথায়: ফেসবুক${next.wantIg ? ' + ইনস্টাগ্রাম' : ''}${settings.tkAccessToken && settings.tkAutoPost !== false ? ' + TikTok' + (hasImg ? '' : ' (ছবি লাগবে)') : ''}${settings.tgToken && settings.tgChannel && settings.tgAutoPost !== false ? ' + টেলিগ্রাম চ্যানেল' : ''}${when}\n\nপোস্ট করব? "পোস্ট করো" বললে এখনই (বা উপরের সময়ে) যাবে। বদলাতে চাইলে বলুন, না চাইলে "দরকার নেই"।`;
       if (next.imageUrl) result.imageUrl = next.imageUrl;
       else if (next.imageB64 && !imageB64) {
         // AI-র বানানো ছবি দেখাতে অস্থায়ী পাবলিক লিংক (বিদ্যমান /pmedia রুট)
