@@ -243,6 +243,11 @@ async function saveConfig(b) {
   if (typeof b.autoPost === 'boolean') patch.tkAutoPost = b.autoPost;
   if (typeof b.audited === 'boolean') patch.tkAudited = b.audited;
   if (patch.tkVerifyName && !/^[\w.-]{3,120}$/.test(patch.tkVerifyName)) throw new Error('ভেরিফিকেশন ফাইলের নাম সঠিক না');
+  // Production ও Sandbox অ্যাপের যাচাই-ফাইল আলাদা — সবগুলো জমিয়ে রাখি, নতুনটা বসালে আগেরটা মুছে না
+  if (patch.tkVerifyName && patch.tkVerifyBody) {
+    const cur = await store.getSettings();
+    patch.tkVerifyFiles = { ...(cur.tkVerifyFiles || {}), [patch.tkVerifyName]: patch.tkVerifyBody };
+  }
   if (patch.tkSendUrl && !/^https:\/\//.test(patch.tkSendUrl)) throw new Error('Send URL https:// দিয়ে শুরু হতে হবে');
   await store.saveSettings(patch);
 }
@@ -253,7 +258,7 @@ async function status() {
   const out = {
     keysSet: !!(s.tkClientKey && s.tkClientSecret), postConnected: !!s.tkAccessToken, displayName: s.tkDisplayName || '',
     msgTokenSet: !!s.tkMsgToken, autoPost: s.tkAutoPost !== false, audited: !!s.tkAudited,
-    verifyName: s.tkVerifyName || '', sendUrl: s.tkSendUrl || '',
+    verifyName: s.tkVerifyName || '', verifyNames: Object.keys(s.tkVerifyFiles || {}), sendUrl: s.tkSendUrl || '',
     redirectUri: redirectUri(), webhookUrl: `${config.publicUrl}/webhook/tiktok/${key}`,
     verifyUrl: s.tkVerifyName ? `${config.publicUrl}/pmedia/${s.tkVerifyName}` : '', checks: []
   };
@@ -271,7 +276,14 @@ async function status() {
 
 async function disconnect() { await store.saveSettings({ tkAccessToken: '', tkRefreshToken: '', tkExpiresAt: 0, tkOpenId: '', tkDisplayName: '' }); }
 
+async function verifyBody(name) {
+  const s = await store.getSettings();
+  if (s.tkVerifyFiles && Object.prototype.hasOwnProperty.call(s.tkVerifyFiles, name)) return s.tkVerifyFiles[name];
+  if (s.tkVerifyName && s.tkVerifyName === name) return s.tkVerifyBody || '';
+  return null;
+}
+
 module.exports = {
-  authUrl, handleCallback, accessToken, postFields, publishTkJob, checkSubmitted, runDue, parseInbound, rememberConv, sendMessage,
+  verifyBody, authUrl, handleCallback, accessToken, postFields, publishTkJob, checkSubmitted, runDue, parseInbound, rememberConv, sendMessage,
   saveConfig, status, disconnect, hookKey, checkHookKey, redirectUri
 };
