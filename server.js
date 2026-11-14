@@ -85,16 +85,16 @@ app.use('/webhook', webhookRoutes);
 // TikTok ডোমেইন যাচাইয়ের ফাইল (যেমন /tiktokXXXX.txt) — অ্যাপে বসানো নাম মিললেই দেখায়
 app.get(/^\/([\w.-]+\.txt)$/, async (req, res, next) => {
   try {
-    const st = await store.getSettings();
-    if (st.tkVerifyName && req.params[0] === st.tkVerifyName) { res.type('text/plain'); return res.send(st.tkVerifyBody || ''); }
+    const vb = await require('./services/tiktok').verifyBody(req.params[0]);
+    if (vb !== null) { res.type('text/plain'); return res.send(vb); }
   } catch (e) { /* পরেরটায় যাক */ }
   next();
 });
 
 app.get('/pmedia/:file', async (req, res) => {
   try {
-    const st = await store.getSettings();
-    if (st.tkVerifyName && req.params.file === st.tkVerifyName) { res.type('text/plain'); return res.send(st.tkVerifyBody || ''); } // TikTok-এর ইউআরএল যাচাইয়ের ফাইল
+    const vb = /\.txt$/.test(req.params.file) ? await require('./services/tiktok').verifyBody(req.params.file) : null;
+    if (vb !== null) { res.type('text/plain'); return res.send(vb); } // TikTok-এর ইউআরএল যাচাইয়ের ফাইল
     const id = String(req.params.file).replace(/\.[a-z0-9]+$/i, '');
     const m = await store.getPostMedia(id);
     if (!m) return res.sendStatus(404);
