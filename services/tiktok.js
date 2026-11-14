@@ -20,6 +20,19 @@ function errMsg(err) {
   return clip((e && (e.message || e.error_description || e.description)) || (err && err.message) || err, 220);
 }
 
+// TikTok-এর ত্রুটির কোড/লেখা বুঝে সহজ বাংলা পরামর্শ
+function hint(err) {
+  const d = err && err.response && err.response.data;
+  const code = (err && err.tkCode) || (d && d.error && d.error.code) || '';
+  const raw = errMsg(err);
+  if (code === 'unaudited_client_can_only_post_to_private_accounts' || /content-sharing-guidelines/.test(raw))
+    return 'TikTok অ্যাকাউন্ট "Private" করুন — অডিট না হওয়া অ্যাপ শুধু প্রাইভেট অ্যাকাউন্টে পোস্ট করতে পারে (Settings and privacy → Privacy → Private account)। [' + (code || 'guidelines') + ']';
+  if (code === 'url_ownership_unverified') return 'ছবির ডোমেইন TikTok-এ যাচাই হয়নি — URL properties-এ https://faruk-smartbiz-backend-1.onrender.com/ Verify করুন (Sandbox অ্যাপেও)। [' + code + ']';
+  if (code === 'scope_not_authorized' || code === 'access_token_invalid') return 'অনুমতি/টোকেনে সমস্যা — Settings → TikTok থেকে আবার "অ্যাকাউন্ট যুক্ত করুন" চাপুন। [' + code + ']';
+  if (code === 'spam_risk_too_many_posts' || code === 'rate_limit_exceeded') return 'TikTok কিছুক্ষণ পোস্ট নিচ্ছে না — একটু পরে চেষ্টা করুন। [' + code + ']';
+  return code && !raw.includes(code) ? raw + ' [' + code + ']' : raw;
+}
+
 async function getDb() { return store.getDb(); }
 async function metaGet(id) { const db = await getDb(); const d = await db.collection('meta').findOne({ _id: id }); if (!d) return null; const { _id, ...r } = d; return r; }
 async function metaSet(id, patch) { const db = await getDb(); await db.collection('meta').updateOne({ _id: id }, { $set: patch }, { upsert: true }); }
@@ -91,9 +104,9 @@ async function api(path, body) {
   try {
     const r = await axios.post(OPEN + path, body || {}, { headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json; charset=UTF-8' }, timeout: 25000 });
     const d = r.data || {};
-    if (d.error && d.error.code && d.error.code !== 'ok') throw new Error(d.error.message || d.error.code);
+    if (d.error && d.error.code && d.error.code !== 'ok') { const e = new Error(d.error.message || d.error.code); e.tkCode = d.error.code; throw e; }
     return d.data || {};
-  } catch (err) { throw new Error(errMsg(err)); }
+  } catch (err) { const e = new Error(hint(err)); throw e; }
 }
 
 /* ---------- ছবির পোস্ট ---------- */
