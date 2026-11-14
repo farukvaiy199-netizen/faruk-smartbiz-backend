@@ -54,6 +54,8 @@ async function runDueInstagramPosts() {
   try {
     await store.failStuckIgPosts();
     await store.failStuckVideoPosts();
+    await store.failStuckTgPosts();
+    await store.failStuckTkPosts();
     await shop.sync(false); // ই-কমার্স ওয়েবসাইটের স্টক/চ্যাট পরীক্ষা (এরর ছোঁড়ে না)
     require('./comments').pollFacebook().catch(() => {}); // Webhook ছাড়াই Facebook কমেন্ট ধরা (ব্যাকগ্রাউন্ডে)
     for (let i = 0; i < 5; i++) {
@@ -63,6 +65,8 @@ async function runDueInstagramPosts() {
       const settings = await store.getSettings();
       await publishIgJob(job, settings, true);
     }
+    await require('./telegram').runDue(); // শিডিউল করা Telegram চ্যানেল-পোস্ট
+    await require('./tiktok').runDue().catch(e => console.error('TikTok শিডিউলার:', e.message)); // TikTok ছবির পোস্ট ও অবস্থা যাচাই
   } catch (err) {
     console.error('Instagram শিডিউলার এরর:', err.message);
   } finally {
