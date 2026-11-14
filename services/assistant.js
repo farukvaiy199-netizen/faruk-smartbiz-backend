@@ -298,9 +298,10 @@ async function publishPending(settings, pending, { facebook, instagram, atMs }) 
   }
   const tg = require('./telegram');
   const tgFields = await tg.postFields(settings, { buffer: img && img.buffer, whenMs: atMs }).catch(() => ({}));
+  const tkFields = await require('./tiktok').postFields(settings, { buffer: img && img.buffer, whenMs: atMs }).catch(() => ({}));
   const post = await store.addPost({
     caption: pending.caption, productName: pending.productName || '', thumb: '',
-    ...igFields, ...tgFields,
+    ...igFields, ...tgFields, ...tkFields,
     status: atMs ? 'scheduled' : 'published',
     scheduledAt: atMs ? new Date(atMs).toISOString() : null,
     fbPostId: fb.fbPostId, fbPhotoId: fb.fbPhotoId
@@ -310,7 +311,8 @@ async function publishPending(settings, pending, { facebook, instagram, atMs }) 
     await publishIgJob(post, settings, false);
   }
   if (tgFields.tgStatus === 'publishing') await tg.publishTgJob(post, settings);
-  return { igSkip, igDone: !!igFields.igStatus && igFields.igStatus !== 'skipped', tgDone: !!tgFields.tgStatus };
+  if (tkFields.tkStatus === 'publishing') await require('./tiktok').publishTkJob(post);
+  return { igSkip, igDone: !!igFields.igStatus && igFields.igStatus !== 'skipped', tgDone: !!tgFields.tgStatus, tkDone: !!tkFields.tkStatus && tkFields.tkStatus !== 'skipped', tkSkip: tkFields.tkStatus === 'skipped' ? tkFields.tkError : '' };
 }
 
 /* ---------- AI-র নির্দেশ ---------- */
@@ -441,11 +443,12 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
           const wantIg = !!action.instagram || !!pending.wantIg || IG_RE.test(text);
           const r = await publishPending(settings, pending, { facebook: action.facebook !== false, instagram: wantIg, atMs });
           await clearPending(key);
-          const where = (action.facebook !== false ? 'ফেসবুকে' : '') + (r.igDone ? (action.facebook !== false ? ' ও ' : '') + 'ইনস্টাগ্রামে' : '') + (r.tgDone ? ((where_ok(action, r)) ? ' ও ' : '') + 'টেলিগ্রাম চ্যানেলে' : '');
+          const where = (action.facebook !== false ? 'ফেসবুকে' : '') + (r.igDone ? (action.facebook !== false ? ' ও ' : '') + 'ইনস্টাগ্রামে' : '') + (r.tgDone ? ((where_ok(action, r)) ? ' ও ' : '') + 'টেলিগ্রাম চ্যানেলে' : '') + (r.tkDone ? ((where_ok(action, r) || r.tgDone) ? ' ও ' : '') + 'TikTok-এ' : '');
           result.reply = atMs
             ? `🗓️ ${where || 'পোস্ট'} শিডিউল করা হয়েছে — ${bdString(atMs)} (ঢাকার সময়)।`
             : `✅ ${where || 'পোস্ট'} পোস্ট হয়ে গেছে!`;
           if (r.igSkip) result.reply += `\n⚠️ ইনস্টাগ্রামে যায়নি: ${r.igSkip}।`;
+          if (r.tkSkip) result.reply += `\n⚠️ TikTok-এ যায়নি: ${r.tkSkip}।`;
         }
       }
     } else if (action && action.type === 'product_draft') {
