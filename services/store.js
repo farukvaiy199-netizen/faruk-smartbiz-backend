@@ -149,6 +149,17 @@ async function getCustomers() {
   return list.map(stripId);
 }
 
+// কাস্টমারের দীর্ঘমেয়াদি স্মৃতি (নাম, ঠিকানা, পছন্দ, আগের আলোচনার সারাংশ) — পুরনো মেসেজ বাদ গেলেও মনে থাকে
+async function getCustomerMemory(id) {
+  const db = await getDb();
+  const c = await db.collection('customers').findOne({ id }, { projection: { memory: 1 } });
+  return (c && c.memory) || '';
+}
+async function setCustomerMemory(id, memory) {
+  const db = await getDb();
+  await db.collection('customers').updateOne({ id }, { $set: { memory: String(memory || '').slice(0, 900), memoryAt: new Date().toISOString() } });
+}
+
 async function setCustomerAI(id, aiOn) {
   const db = await getDb();
   const col = db.collection('customers');
@@ -179,7 +190,7 @@ async function appendMessage(customerId, role, text) {
   const db = await getDb();
   const current = await getConversation(customerId);
   // সাম্প্রতিক ১৬টা মেসেজ রাখি — এতে প্রতিটা AI রিকোয়েস্টে কম টোকেন লাগে
-  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-16);
+  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-24);
   await db.collection('conversations').updateOne(
     { customerId },
     { $set: { messages: updated } },
@@ -707,7 +718,7 @@ module.exports = {
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
   createOrder, createWebsiteOrder, getOrders, getOrdersByCustomer, updateOrderStatus, attachEmailToLatestOrder,
-  addBroadcast, getBroadcasts,
+  addBroadcast, getBroadcasts, getCustomerMemory, setCustomerMemory,
   addEmailLog, getEmailLogs,
   getAiRules, addAiRule, deleteAiRule,
   addAiUsage, setAiRateInfo, setAiLastError, getAiUsage,
