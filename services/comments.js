@@ -27,6 +27,38 @@ async function fbPrivateReply(commentId, token, msg) {
   }
 }
 let pageIdCache = '';
+// ব্যবহারকারীর (User) টোকেন বসে গেলে সেটা থেকে পেজের স্থায়ী টোকেন বের করে সংরক্ষণ করে। Page টোকেন হলে কিছু করে না।
+let checkedToken = '';
+async function ensurePageToken(settings, force) {
+  const token = settings.fbToken;
+  if (!token || (!force && checkedToken === token)) return { settings, changed: false };
+  let accounts;
+  try {
+    const r = await axios.get(`${GRAPH}/me/accounts`, { params: { fields: 'id,name,access_token,instagram_business_account{id}', limit: 50, access_token: token }, timeout: 15000 });
+    accounts = r.data.data || [];
+  } catch (e) { checkedToken = token; return { settings, changed: false }; } // Page টোকেনে এটা চলে না — মানে ঠিক আছে
+  const cfg = require('../config');
+  let userTok = token;
+  const appId = settings.fbAppId || cfg.fbAppId;
+  if (appId && cfg.fbAppSecret) {
+    try {
+      const r = await axios.get(`${GRAPH}/oauth/access_token`, { params: { grant_type: 'fb_exchange_token', client_id: appId, client_secret: cfg.fbAppSecret, fb_exchange_token: token }, timeout: 15000 });
+      userTok = r.data.access_token || token;
+      const r2 = await axios.get(`${GRAPH}/me/accounts`, { params: { fields: 'id,name,access_token,instagram_business_account{id}', limit: 50, access_token: userTok }, timeout: 15000 });
+      if ((r2.data.data || []).length) accounts = r2.data.data; // দীর্ঘমেয়াদি টোকেন থেকে পাওয়া পেজ-টোকেন কখনো মেয়াদোত্তীর্ণ হয় না
+    } catch (e) { /* এক্সচেঞ্জ না হলেও পাওয়া টোকেন দিয়ে চলবে */ }
+  }
+  if (!accounts.length) throw new Error('এই অ্যাকাউন্টে কোনো পেজ পাওয়া যায়নি — Graph Explorer-এ পেজ নির্বাচন করে আবার টোকেন বানান');
+  const want = String(settings.fbPageId || '');
+  const page = accounts.find(a => want && a.id === want) || accounts.find(a => /sundarban|honey/i.test(a.name)) || (accounts.length === 1 ? accounts[0] : null);
+  if (!page) throw new Error('একাধিক পেজ পাওয়া গেছে (' + accounts.map(a => a.name).join(', ') + ') — কোনটা ব্যবহার হবে বোঝা যাচ্ছে না');
+  const patch = { fbToken: page.access_token, fbPageId: page.id };
+  if (!settings.igUserId && page.instagram_business_account) patch.igUserId = page.instagram_business_account.id;
+  await store.saveSettings(patch);
+  pageIdCache = page.id; checkedToken = page.access_token;
+  return { settings: { ...settings, ...patch }, changed: true, pageName: page.name };
+}
+
 async function getPageId(settings) {
   if (settings.fbPageId) return String(settings.fbPageId);
   if (pageIdCache) return pageIdCache;
@@ -167,8 +199,10 @@ async function handleInstagramChange(entry, change) {
 
 // পেজকে 'feed' (কমেন্ট) ইভেন্টে সাবস্ক্রাইব করে — আগের সাবস্ক্রিপশন বজায় রেখে
 async function ensureFeedSubscription() {
-  const settings = await store.getSettings();
+  let settings = await store.getSettings();
   if (!settings.fbToken) throw new Error('আগে Facebook পেজের টোকেন সংযুক্ত করুন');
+  await ensurePageToken(settings).catch(() => {});
+  settings = await store.getSettings();
   const pid = await getPageId(settings);
   if (!pid) throw new Error('টোকেন থেকে পেজ চেনা যায়নি — টোকেন ঠিক আছে কিনা পরীক্ষা করুন');
   const url = `${GRAPH}/${pid}/subscribed_apps`;
@@ -196,7 +230,8 @@ async function pollFacebook() {
   try {
     const settings = await store.getSettings();
     if (settings.commentAuto !== 'on' || !settings.fbToken) return 0;
-    const token = settings.fbToken;
+    try { await ensurePageToken(settings); } catch (e) { /* ঠিক আছে */ }
+    const token = (await store.getSettings()).fbToken;
     const db = await store.getDb();
     const st = await db.collection('meta').findOne({ _id: 'commentPoll' });
     const since = st && st.since ? new Date(st.since).getTime() : Date.now(); // প্রথমবার: পুরনো কমেন্ট ধরা হবে না
@@ -243,7 +278,11 @@ async function diagnose() {
   const add = (ok, msg) => out.push({ ok, msg });
   const settings = await store.getSettings();
   if (!settings.fbToken) { add(false, 'Facebook পেজের টোকেন সংরক্ষিত নেই — Settings-এ Facebook Connect করুন'); return out; }
-  const token = settings.fbToken;
+  let token = settings.fbToken;
+  try {
+    const fx = await ensurePageToken(settings, true);
+    if (fx.changed) { token = fx.settings.fbToken; add(true, `আপনার দেওয়া টোকেন ছিল ব্যক্তিগত (User) টোকেন — সেটা থেকে পেজ "${fx.pageName}"-এর স্থায়ী টোকেন নিজে বের করে সংরক্ষণ করেছি`); }
+  } catch (e) { add(false, e.message); return out; }
   add(true, `টোকেন সংরক্ষিত আছে (দৈর্ঘ্য ${token.length} অক্ষর${token.startsWith('EAA') ? '' : ' — কিন্তু EAA দিয়ে শুরু হয়নি, ভুল জিনিস পেস্ট হতে পারে'})`);
   add(settings.commentAuto === 'on', settings.commentAuto === 'on' ? 'কমেন্ট অটো-রিপ্লাই চালু আছে' : 'কমেন্ট অটো-রিপ্লাই বন্ধ — টিক দিয়ে সংরক্ষণ করুন');
   let page = null;
