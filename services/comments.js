@@ -16,6 +16,24 @@ function errMsg(err) {
   return clip((e && (e.message || e.error_user_msg)) || (err && err.message) || err, 200);
 }
 
+// Facebook কমেন্টে ইনবক্স (Private Reply): প্রথমে সরাসরি এন্ডপয়েন্ট, না হলে Send API (recipient.comment_id)
+async function fbPrivateReply(commentId, token, msg) {
+  try {
+    await axios.post(`${GRAPH}/${commentId}/private_replies`, null, { params: { message: msg, access_token: token }, timeout: 15000 });
+  } catch (e1) {
+    try {
+      await axios.post(`${GRAPH}/me/messages`, { recipient: { comment_id: commentId }, message: { text: msg }, messaging_type: 'RESPONSE' }, { params: { access_token: token }, timeout: 15000 });
+    } catch (e2) { throw new Error(errMsg(e2) + ' | আগের চেষ্টা: ' + errMsg(e1)); }
+  }
+}
+let pageIdCache = '';
+async function getPageId(settings) {
+  if (settings.fbPageId) return String(settings.fbPageId);
+  if (pageIdCache) return pageIdCache;
+  try { const r = await axios.get(`${GRAPH}/me`, { params: { fields: 'id', access_token: settings.fbToken }, timeout: 15000 }); pageIdCache = String(r.data.id || ''); } catch (e) { /* ঠিক আছে */ }
+  return pageIdCache;
+}
+
 async function logCol() { return (await store.getDb()).collection('comment_log'); }
 
 // একই কমেন্টে দুইবার সাড়া এড়াতে — আগে দাবি (claim) করে নিই; ফেরত true মানে এই প্রসেসই কাজটা করবে
@@ -119,12 +137,12 @@ async function handleFacebookChange(entry, change) {
   if (v.parent_id && v.post_id && String(v.parent_id) !== String(v.post_id)) return; // কমেন্টের রিপ্লাই — শুধু মূল কমেন্টে সাড়া
   const settings = await store.getSettings();
   const token = settings.fbToken;
-  const pageId = String(entry.id || settings.fbPageId || '');
+  const pageId = String(entry.id || await getPageId(settings) || '');
   await handleComment({
     platform: 'facebook', commentId: v.comment_id, text: v.message, fromId: v.from && v.from.id, fromName: v.from && v.from.name, ownId: pageId,
     send: {
       public: async msg => { await axios.post(`${GRAPH}/${v.comment_id}/comments`, null, { params: { message: msg, access_token: token }, timeout: 15000 }); },
-      private: async msg => { await axios.post(`${GRAPH}/${v.comment_id}/private_replies`, null, { params: { message: msg, access_token: token }, timeout: 15000 }); }
+      private: msg => fbPrivateReply(v.comment_id, token, msg)
     }
   });
 }
@@ -150,8 +168,10 @@ async function handleInstagramChange(entry, change) {
 // পেজকে 'feed' (কমেন্ট) ইভেন্টে সাবস্ক্রাইব করে — আগের সাবস্ক্রিপশন বজায় রেখে
 async function ensureFeedSubscription() {
   const settings = await store.getSettings();
-  if (!settings.fbToken || !settings.fbPageId) throw new Error('আগে Facebook পেজ সংযুক্ত করুন');
-  const url = `${GRAPH}/${settings.fbPageId}/subscribed_apps`;
+  if (!settings.fbToken) throw new Error('আগে Facebook পেজের টোকেন সংযুক্ত করুন');
+  const pid = await getPageId(settings);
+  if (!pid) throw new Error('টোকেন থেকে পেজ চেনা যায়নি — টোকেন ঠিক আছে কিনা পরীক্ষা করুন');
+  const url = `${GRAPH}/${pid}/subscribed_apps`;
   let have = [];
   try {
     const r = await axios.get(url, { params: { access_token: settings.fbToken }, timeout: 15000 });
@@ -182,7 +202,7 @@ async function pollFacebook() {
     const since = st && st.since ? new Date(st.since).getTime() : Date.now(); // প্রথমবার: পুরনো কমেন্ট ধরা হবে না
     const startedAt = Date.now();
     const posts = await axios.get(`${GRAPH}/me/posts`, { params: { fields: 'id', limit: 6, access_token: token }, timeout: 15000 });
-    const pageId = String(settings.fbPageId || '');
+    const pageId = await getPageId(settings);
     for (const p of (posts.data.data || [])) {
       if (handled >= 6) break;
       let list = [];
@@ -205,7 +225,7 @@ async function pollFacebook() {
           platform: 'facebook', commentId: c.id, text: c.message, fromId: c.from && c.from.id, fromName: c.from && c.from.name, ownId: pageId,
           send: {
             public: async msg => { await axios.post(`${GRAPH}/${c.id}/comments`, null, { params: { message: msg, access_token: token }, timeout: 15000 }); },
-            private: async msg => { await axios.post(`${GRAPH}/${c.id}/private_replies`, null, { params: { message: msg, access_token: token }, timeout: 15000 }); }
+            private: msg => fbPrivateReply(c.id, token, msg)
           }
         });
       }
@@ -238,6 +258,7 @@ async function diagnose() {
     const sc = d.scopes || [];
     const need = ['pages_read_engagement', 'pages_read_user_content', 'pages_manage_engagement', 'pages_messaging'];
     need.forEach(n => add(sc.includes(n), sc.includes(n) ? `অনুমতি আছে: ${n}` : `অনুমতি নেই: ${n}`));
+    ['instagram_manage_comments', 'instagram_manage_messages', 'instagram_basic'].forEach(n => add(sc.includes(n), sc.includes(n) ? `অনুমতি আছে: ${n}` : `অনুমতি নেই: ${n} (Instagram কমেন্ট/মেসেজের জন্য লাগে)`));
     if (d.expires_at === 0) add(true, 'টোকেনের মেয়াদ নেই (স্থায়ী)');
     else if (d.expires_at) add(true, 'টোকেনের মেয়াদ শেষ হবে: ' + new Date(d.expires_at * 1000).toLocaleString('bn-BD'));
   } catch (e) { add(false, 'অনুমতির তালিকা পড়া যায়নি: ' + errMsg(e)); }
