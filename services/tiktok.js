@@ -115,8 +115,11 @@ const connectedForPost = s => !!(s.tkAccessToken && s.tkAutoPost !== false);
 async function pickPrivacy() {
   const info = await api('/v2/post/publish/creator_info/query/', {});
   const opts = info.privacy_level_options || [];
-  // অনুমোদন (audit) না হওয়া অ্যাপে শুধু SELF_ONLY মেলে — তাই অপশন থেকেই বেছে নিই
-  return opts.includes('PUBLIC_TO_EVERYONE') ? 'PUBLIC_TO_EVERYONE' : (opts[0] || 'SELF_ONLY');
+  const s = await store.getSettings();
+  // TikTok-এর নিয়ম: অডিট না হওয়া অ্যাপের সব পোস্ট শুধু SELF_ONLY ("শুধু আমি") হতে হবে, নইলে ত্রুটি আসে।
+  // অডিট পাস হলে অ্যাপে টিক দিলে তখন PUBLIC_TO_EVERYONE যাবে।
+  if (s.tkAudited && opts.includes('PUBLIC_TO_EVERYONE')) return 'PUBLIC_TO_EVERYONE';
+  return 'SELF_ONLY';
 }
 
 async function postFields(settings, { buffer, whenMs } = {}) {
@@ -238,6 +241,7 @@ async function saveConfig(b) {
   }
   if (b.clear && typeof b.clear === 'string') patch[b.clear] = '';
   if (typeof b.autoPost === 'boolean') patch.tkAutoPost = b.autoPost;
+  if (typeof b.audited === 'boolean') patch.tkAudited = b.audited;
   if (patch.tkVerifyName && !/^[\w.-]{3,120}$/.test(patch.tkVerifyName)) throw new Error('ভেরিফিকেশন ফাইলের নাম সঠিক না');
   if (patch.tkSendUrl && !/^https:\/\//.test(patch.tkSendUrl)) throw new Error('Send URL https:// দিয়ে শুরু হতে হবে');
   await store.saveSettings(patch);
@@ -248,7 +252,7 @@ async function status() {
   const key = await hookKey();
   const out = {
     keysSet: !!(s.tkClientKey && s.tkClientSecret), postConnected: !!s.tkAccessToken, displayName: s.tkDisplayName || '',
-    msgTokenSet: !!s.tkMsgToken, autoPost: s.tkAutoPost !== false,
+    msgTokenSet: !!s.tkMsgToken, autoPost: s.tkAutoPost !== false, audited: !!s.tkAudited,
     verifyName: s.tkVerifyName || '', sendUrl: s.tkSendUrl || '',
     redirectUri: redirectUri(), webhookUrl: `${config.publicUrl}/webhook/tiktok/${key}`,
     verifyUrl: s.tkVerifyName ? `${config.publicUrl}/pmedia/${s.tkVerifyName}` : '', checks: []
@@ -259,7 +263,7 @@ async function status() {
     if (bad[0] && bad[0].tkError) out.checks.push({ ok: false, msg: 'সর্বশেষ TikTok পোস্টের ত্রুটি: ' + bad[0].tkError });
   } catch (e) { /* থাক */ }
   if (s.tkAccessToken) {
-    try { const p = await pickPrivacy(); out.checks.push({ ok: true, msg: 'পোস্টের অনুমতি ঠিক আছে' + (p === 'SELF_ONLY' ? ' (এখন শুধু "নিজে দেখা" মোডে — TikTok অ্যাপ অনুমোদনের পর সবার জন্য খুলবে)' : '') }); }
+    try { const p = await pickPrivacy(); out.checks.push({ ok: true, msg: 'পোস্টের অনুমতি ঠিক আছে' + (p === 'SELF_ONLY' ? ' (পোস্ট এখন "শুধু আমি" মোডে যাবে — TikTok অডিট পাস হলে সবার জন্য খুলবে)' : '') }); }
     catch (e) { out.checks.push({ ok: false, msg: e.message }); }
   }
   return out;
