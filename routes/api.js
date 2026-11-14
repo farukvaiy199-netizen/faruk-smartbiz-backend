@@ -6,6 +6,7 @@ const config = require('../config');
 const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
+const telegram = require('../services/telegram');
 const { getOwnerChatReply, getSlots } = require('../services/ai');
 const { notifyOwner, getPublicKey } = require('../services/notify');
 const { getSheetProducts } = require('../services/sheets');
@@ -98,6 +99,9 @@ router.patch('/orders/:id', async (req, res) => {
         notifyStatus = 'sent';
       } else if (customer && customer.platform === 'instagram' && settings.fbToken) {
         await sendInstagramMessage(customer.platformId, text, settings.fbToken);
+        notifyStatus = 'sent';
+      } else if (customer && customer.platform === 'telegram' && settings.tgToken) {
+        await telegram.sendMessage(settings.tgToken, customer.platformId, text);
         notifyStatus = 'sent';
       } else {
         notifyNote = customer ? 'ওয়েবসাইট কাস্টমার — মেসেজ পাঠানোর মাধ্যম নেই' : 'কাস্টমার পাওয়া যায়নি';
@@ -224,6 +228,8 @@ router.post('/broadcast', async (req, res) => {
         await sendMeta(c.platformId);
       } else if (c.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
         await sendWhatsAppMessage(c.platformId, message, settings.waPhoneNumberId, settings.waToken);
+      } else if (c.platform === 'telegram' && settings.tgToken) {
+        await telegram.sendMessage(settings.tgToken, c.platformId, message);
       } else if (c.platform === 'website') {
         throw new Error('ওয়েবসাইটের কাস্টমারকে এখান থেকে পাঠানো যায় না');
       } else {
@@ -254,6 +260,34 @@ const MAX_AI_IMAGES = 30;
 
 router.get('/ai-rules', async (req, res) => {
   res.json(await store.getAiRules());
+});
+
+/* ---------- Telegram ---------- */
+router.get('/telegram/status', async (req, res) => {
+  try { res.json(await telegram.status()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+router.post('/telegram/connect', async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.token && b.channel !== undefined) { // শুধু চ্যানেল/অপশন বদল — টোকেন আগেরটাই
+      const s = await store.getSettings();
+      if (!s.tgToken) return res.status(400).json({ error: 'আগে বটের টোকেন দিন' });
+      b.token = s.tgToken;
+    }
+    const out = await telegram.connect({ token: b.token, channel: b.channel });
+    if (typeof b.autoPost === 'boolean') await store.saveSettings({ tgAutoPost: b.autoPost });
+    res.json(out);
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/telegram/disconnect', async (req, res) => {
+  try { await telegram.disconnect(); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/telegram/autopost', async (req, res) => {
+  await store.saveSettings({ tgAutoPost: req.body && req.body.on !== false });
+  res.json({ ok: true });
+});
+router.post('/telegram/test', async (req, res) => {
+  try { await telegram.sendTest(); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 /* ---------- মালিকের সহকারী ---------- */
@@ -488,18 +522,18 @@ router.post('/posts', async (req, res) => {
         };
       }
     }
+    const tgFields = await telegram.postFields(settings, { buffer, whenMs }).catch(() => ({}));
     const post = await store.addPost({
       ...base,
-      ...igFields,
+      ...igFields, ...tgFields,
       status: whenMs ? 'scheduled' : 'published',
       scheduledAt: whenMs ? new Date(whenMs).toISOString() : null,
       fbPostId: r.fbPostId, fbPhotoId: r.fbPhotoId
     });
     // এখনই পোস্ট হলে Instagram-এও সাথে সাথে; শিডিউল হলে সময় এলে সার্ভার নিজে পোস্ট করবে
-    if (igFields.igStatus === 'publishing') {
-      await publishIgJob(post, settings, false);
-      return res.json(await store.getPostById(post.id));
-    }
+    if (igFields.igStatus === 'publishing') await publishIgJob(post, settings, false);
+    if (tgFields.tgStatus === 'publishing') await telegram.publishTgJob(post, settings);
+    if (igFields.igStatus === 'publishing' || tgFields.tgStatus === 'publishing') return res.json(await store.getPostById(post.id));
     res.json(post);
   } catch (err) {
     console.error('fb publish error:', err.message);
@@ -628,6 +662,7 @@ router.get('/settings', async (req, res) => {
     postNotes: s.postNotes,
     commentAuto: s.commentAuto === 'on' ? 'on' : 'off',
     igUserId: s.igUserId, igUsername: s.igUsername,
+    tgBotUsername: s.tgBotUsername || '', tgChannelTitle: s.tgChannelTitle || '', tgAutoPost: s.tgAutoPost !== false,
     aiAutoReply: s.aiAutoReply,
     connected: s.connected,
     sheetStorageConfigured: !!config.sheetScriptUrl,
