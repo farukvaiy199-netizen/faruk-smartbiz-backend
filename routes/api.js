@@ -7,6 +7,7 @@ const store = require('../services/store');
 const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
 const telegram = require('../services/telegram');
+const tiktok = require('../services/tiktok');
 const { getOwnerChatReply, getSlots } = require('../services/ai');
 const { notifyOwner, getPublicKey } = require('../services/notify');
 const { getSheetProducts } = require('../services/sheets');
@@ -99,6 +100,9 @@ router.patch('/orders/:id', async (req, res) => {
         notifyStatus = 'sent';
       } else if (customer && customer.platform === 'instagram' && settings.fbToken) {
         await sendInstagramMessage(customer.platformId, text, settings.fbToken);
+        notifyStatus = 'sent';
+      } else if (customer && customer.platform === 'tiktok' && settings.tkMsgToken) {
+        await tiktok.sendMessage(customer.platformId, text);
         notifyStatus = 'sent';
       } else if (customer && customer.platform === 'telegram' && settings.tgToken) {
         await telegram.sendMessage(settings.tgToken, customer.platformId, text);
@@ -228,6 +232,8 @@ router.post('/broadcast', async (req, res) => {
         await sendMeta(c.platformId);
       } else if (c.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
         await sendWhatsAppMessage(c.platformId, message, settings.waPhoneNumberId, settings.waToken);
+      } else if (c.platform === 'tiktok' && settings.tkMsgToken) {
+        await tiktok.sendMessage(c.platformId, message);
       } else if (c.platform === 'telegram' && settings.tgToken) {
         await telegram.sendMessage(settings.tgToken, c.platformId, message);
       } else if (c.platform === 'website') {
@@ -260,6 +266,20 @@ const MAX_AI_IMAGES = 30;
 
 router.get('/ai-rules', async (req, res) => {
   res.json(await store.getAiRules());
+});
+
+/* ---------- TikTok ---------- */
+router.get('/tiktok/status', async (req, res) => {
+  try { res.json(await tiktok.status()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+router.post('/tiktok/config', async (req, res) => {
+  try { await tiktok.saveConfig(req.body || {}); res.json(await tiktok.status()); } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.get('/tiktok/auth-url', async (req, res) => {
+  try { res.json({ url: await tiktok.authUrl() }); } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/tiktok/disconnect', async (req, res) => {
+  try { await tiktok.disconnect(); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 /* ---------- Telegram ---------- */
@@ -523,9 +543,10 @@ router.post('/posts', async (req, res) => {
       }
     }
     const tgFields = await telegram.postFields(settings, { buffer, whenMs }).catch(() => ({}));
+    const tkFields = await tiktok.postFields(settings, { buffer, whenMs }).catch(() => ({}));
     const post = await store.addPost({
       ...base,
-      ...igFields, ...tgFields,
+      ...igFields, ...tgFields, ...tkFields,
       status: whenMs ? 'scheduled' : 'published',
       scheduledAt: whenMs ? new Date(whenMs).toISOString() : null,
       fbPostId: r.fbPostId, fbPhotoId: r.fbPhotoId
@@ -533,7 +554,8 @@ router.post('/posts', async (req, res) => {
     // এখনই পোস্ট হলে Instagram-এও সাথে সাথে; শিডিউল হলে সময় এলে সার্ভার নিজে পোস্ট করবে
     if (igFields.igStatus === 'publishing') await publishIgJob(post, settings, false);
     if (tgFields.tgStatus === 'publishing') await telegram.publishTgJob(post, settings);
-    if (igFields.igStatus === 'publishing' || tgFields.tgStatus === 'publishing') return res.json(await store.getPostById(post.id));
+    if (tkFields.tkStatus === 'publishing') await tiktok.publishTkJob(post);
+    if (igFields.igStatus === 'publishing' || tgFields.tgStatus === 'publishing' || tkFields.tkStatus === 'publishing') return res.json(await store.getPostById(post.id));
     res.json(post);
   } catch (err) {
     console.error('fb publish error:', err.message);
