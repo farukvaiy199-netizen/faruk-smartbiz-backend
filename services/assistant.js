@@ -310,9 +310,10 @@ async function publishPending(settings, pending, { facebook, instagram, atMs }) 
     const { publishIgJob } = require('./scheduler'); // দেরিতে require — গোলাকার নির্ভরতা এড়াতে
     await publishIgJob(post, settings, false);
   }
-  if (tgFields.tgStatus === 'publishing') await tg.publishTgJob(post, settings);
-  if (tkFields.tkStatus === 'publishing') await require('./tiktok').publishTkJob(post);
-  return { igSkip, igDone: !!igFields.igStatus && igFields.igStatus !== 'skipped', tgDone: !!tgFields.tgStatus, tkDone: !!tkFields.tkStatus && tkFields.tkStatus !== 'skipped', tkSkip: tkFields.tkStatus === 'skipped' ? tkFields.tkError : '' };
+  let tgRes = null, tkRes = null;
+  if (tgFields.tgStatus === 'publishing') tgRes = await tg.publishTgJob(post, settings);
+  if (tkFields.tkStatus === 'publishing') tkRes = await require('./tiktok').publishTkJob(post);
+  return { igSkip, igDone: !!igFields.igStatus && igFields.igStatus !== 'skipped', tgDone: !!tgFields.tgStatus && !(tgRes && !tgRes.ok), tgErr: tgRes && !tgRes.ok ? tgRes.error : '', tkDone: !!tkFields.tkStatus && tkFields.tkStatus !== 'skipped' && !(tkRes && !tkRes.ok), tkErr: tkRes && !tkRes.ok ? tkRes.error : '', tkSkip: tkFields.tkStatus === 'skipped' ? tkFields.tkError : '' };
 }
 
 /* ---------- AI-র নির্দেশ ---------- */
@@ -463,6 +464,8 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
             : `✅ ${where || 'পোস্ট'} পোস্ট হয়ে গেছে!`;
           if (r.igSkip) result.reply += `\n⚠️ ইনস্টাগ্রামে যায়নি: ${r.igSkip}।`;
           if (r.tkSkip) result.reply += `\n⚠️ TikTok-এ যায়নি: ${r.tkSkip}।`;
+          if (r.tkErr) result.reply += `\n⚠️ TikTok-এ যায়নি: ${r.tkErr}`;
+          if (r.tgErr) result.reply += `\n⚠️ টেলিগ্রাম চ্যানেলে যায়নি: ${r.tgErr}`;
         }
       }
     } else if (action && action.type === 'product_draft') {
