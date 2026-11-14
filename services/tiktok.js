@@ -240,6 +240,11 @@ async function status() {
     redirectUri: redirectUri(), webhookUrl: `${config.publicUrl}/webhook/tiktok/${key}`,
     verifyUrl: s.tkVerifyName ? `${config.publicUrl}/pmedia/${s.tkVerifyName}` : '', checks: []
   };
+  try {
+    const db = await getDb();
+    const bad = await db.collection('posts').find({ tkStatus: 'failed' }).sort({ createdAt: -1 }).limit(1).toArray();
+    if (bad[0] && bad[0].tkError) out.checks.push({ ok: false, msg: 'সর্বশেষ TikTok পোস্টের ত্রুটি: ' + bad[0].tkError });
+  } catch (e) { /* থাক */ }
   if (s.tkAccessToken) {
     try { const p = await pickPrivacy(); out.checks.push({ ok: true, msg: 'পোস্টের অনুমতি ঠিক আছে' + (p === 'SELF_ONLY' ? ' (এখন শুধু "নিজে দেখা" মোডে — TikTok অ্যাপ অনুমোদনের পর সবার জন্য খুলবে)' : '') }); }
     catch (e) { out.checks.push({ ok: false, msg: e.message }); }
