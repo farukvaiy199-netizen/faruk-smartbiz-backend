@@ -17,6 +17,7 @@ const assistant = require('../services/assistant');
 const { summarizeCustomerMemory } = require('../services/ai');
 const comments = require('../services/comments');
 const telegram = require('../services/telegram');
+const tiktok = require('../services/tiktok');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
@@ -292,6 +293,39 @@ router.post('/telegram', async (req, res) => {
   }
 });
 
+/* =============== TIKTOK =============== */
+// অ্যাকাউন্ট যুক্ত করার পর TikTok এখানে ফেরত পাঠায় (পাবলিক পেজ)
+router.get('/tiktok/callback', async (req, res) => {
+  const page = (ok, msg) => res.status(ok ? 200 : 400).send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:sans-serif;text-align:center;padding:48px 20px"><h2>${ok ? '✅' : '❌'} ${msg}</h2><p>${ok ? 'এখন অ্যাপে ফিরে যান।' : 'অ্যাপে ফিরে আবার চেষ্টা করুন।'}</p></body>`);
+  try {
+    await tiktok.handleCallback({ code: req.query.code, state: req.query.state, error: req.query.error_description || req.query.error });
+    page(true, 'TikTok যুক্ত হয়েছে');
+  } catch (e) { page(false, String(e.message).replace(/[<>&]/g, '')); }
+});
+
+// মেসেজ ওয়েবহুক — লিংকের গোপন অংশ মিললে তবেই গ্রহণ। কাঁচা পেলোড শেষ ১০টা রাখি, যাতে ডকের সাথে মেলানো যায়।
+const tkSeen = [];
+router.post('/tiktok/:key', async (req, res) => {
+  if (!(await tiktok.checkHookKey(req.params.key))) return res.sendStatus(403);
+  res.sendStatus(200);
+  try {
+    const db = await store.getDb();
+    await db.collection('meta').updateOne({ _id: 'tkraw' }, { $push: { items: { $each: [{ at: new Date().toISOString(), body: JSON.stringify(req.body || {}).slice(0, 3000) }], $slice: -10 } } }, { upsert: true });
+    const m = tiktok.parseInbound(req.body || {});
+    if (!m.userId || (!m.text && !m.imageUrl)) return;
+    if (m.messageId) { if (tkSeen.includes(m.messageId)) return; tkSeen.push(m.messageId); if (tkSeen.length > 300) tkSeen.shift(); }
+    const s = await store.getSettings();
+    if (s.tkMsgBusinessId && String(m.userId) === String(s.tkMsgBusinessId)) return; // নিজের পাঠানো মেসেজ
+    await tiktok.rememberConv(m.userId, m.conversationId);
+    let imageBuffer;
+    if (m.imageUrl && !m.text) imageBuffer = await require('axios').get(m.imageUrl, { responseType: 'arraybuffer', timeout: 15000, maxContentLength: 8e6 }).then(r => Buffer.from(r.data)).catch(() => undefined);
+    if (!m.text && !imageBuffer) return;
+    await handleIncomingMessage({ platform: 'tiktok', platformId: String(m.userId), text: m.text, imageBuffer, imageMime: 'image/jpeg', sigOk: false });
+  } catch (err) {
+    console.error('TikTok webhook error:', err.message);
+  }
+});
+
 /* =============== SHARED HANDLER =============== */
 
 // যেকোনো ধরনের মেসেজ (স্টিকার, লাইক, ভিডিও ইত্যাদিও) এলে কাস্টমারকে তালিকায় যোগ করি,
@@ -398,6 +432,8 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
         try { await withRetry(() => sendInstagramImage(platformId, imgUrl, settings.fbToken)); }
         catch (err) { console.error('ছবি পাঠাতে ব্যর্থ (Instagram):', err.message); }
       }
+    } else if (platform === 'tiktok' && settings.tkMsgToken) {
+      await withRetry(() => tiktok.sendMessage(platformId, imgUrl ? replyText + '\n' + imgUrl : replyText));
     } else if (platform === 'telegram' && settings.tgToken) {
       await withRetry(() => telegram.sendMessage(settings.tgToken, platformId, replyText));
       if (imgUrl) {
@@ -578,7 +614,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
         product: order.product,
         qty: wantQty,
         price: order.price || 0,
-        source: platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : 'WhatsApp',
+        source: platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : platform === 'tiktok' ? 'TikTok' : 'WhatsApp',
         stockItem: reservedStock ? reservedStock.name : ''
       });
     } catch (err) {
