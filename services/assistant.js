@@ -269,6 +269,8 @@ async function downloadImage(url) {
   return { buffer: Buffer.from(r.data), mime: String(r.headers['content-type'] || 'image/jpeg').split(';')[0] };
 }
 
+function where_ok(action, r) { return action.facebook !== false || r.igDone; }
+
 async function publishPending(settings, pending, { facebook, instagram, atMs }) {
   if (!settings.fbToken) throw new Error('Facebook পেজ সংযুক্ত নেই');
   let img = null;
@@ -294,9 +296,11 @@ async function publishPending(settings, pending, { facebook, instagram, atMs }) 
   } else if (wantIg) {
     igFields = { igStatus: 'skipped', igError: igSkip };
   }
+  const tg = require('./telegram');
+  const tgFields = await tg.postFields(settings, { buffer: img && img.buffer, whenMs: atMs }).catch(() => ({}));
   const post = await store.addPost({
     caption: pending.caption, productName: pending.productName || '', thumb: '',
-    ...igFields,
+    ...igFields, ...tgFields,
     status: atMs ? 'scheduled' : 'published',
     scheduledAt: atMs ? new Date(atMs).toISOString() : null,
     fbPostId: fb.fbPostId, fbPhotoId: fb.fbPhotoId
@@ -305,7 +309,8 @@ async function publishPending(settings, pending, { facebook, instagram, atMs }) 
     const { publishIgJob } = require('./scheduler'); // দেরিতে require — গোলাকার নির্ভরতা এড়াতে
     await publishIgJob(post, settings, false);
   }
-  return { igSkip, igDone: !!igFields.igStatus && igFields.igStatus !== 'skipped' };
+  if (tgFields.tgStatus === 'publishing') await tg.publishTgJob(post, settings);
+  return { igSkip, igDone: !!igFields.igStatus && igFields.igStatus !== 'skipped', tgDone: !!tgFields.tgStatus };
 }
 
 /* ---------- AI-র নির্দেশ ---------- */
@@ -436,7 +441,7 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
           const wantIg = !!action.instagram || !!pending.wantIg || IG_RE.test(text);
           const r = await publishPending(settings, pending, { facebook: action.facebook !== false, instagram: wantIg, atMs });
           await clearPending(key);
-          const where = (action.facebook !== false ? 'ফেসবুকে' : '') + (r.igDone ? (action.facebook !== false ? ' ও ' : '') + 'ইনস্টাগ্রামে' : '');
+          const where = (action.facebook !== false ? 'ফেসবুকে' : '') + (r.igDone ? (action.facebook !== false ? ' ও ' : '') + 'ইনস্টাগ্রামে' : '') + (r.tgDone ? ((where_ok(action, r)) ? ' ও ' : '') + 'টেলিগ্রাম চ্যানেলে' : '');
           result.reply = atMs
             ? `🗓️ ${where || 'পোস্ট'} শিডিউল করা হয়েছে — ${bdString(atMs)} (ঢাকার সময়)।`
             : `✅ ${where || 'পোস্ট'} পোস্ট হয়ে গেছে!`;
