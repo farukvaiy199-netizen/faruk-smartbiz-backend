@@ -496,4 +496,49 @@ async function findProduct(query) {
   } catch (e) { return null; }
 }
 
-module.exports = { findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+function toValue(v) {
+  if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  return { stringValue: String(v) };
+}
+
+// ওয়েবসাইটে নতুন পণ্য যোগ (অ্যাডমিন প্যানেলের মতো একই ঘরে) — বটের লেখার অনুমতি (Firestore Rules) লাগে
+async function addProduct(input) {
+  const cfg = await getCfg();
+  if (!cfg.connected) throw new Error('ওয়েবসাইট সংযুক্ত নেই');
+  if (!cfg.botEmail || !cfg.botPassword) throw new Error('বটের ইমেইল/পাসওয়ার্ড দেওয়া নেই — Settings → ই-কমার্স ওয়েবসাইটে দিন');
+  const name = String(input.name || '').trim().slice(0, 120);
+  if (!name) throw new Error('পণ্যের নাম দরকার');
+  const price = Number(input.price);
+  if (!(price >= 0) || isNaN(price)) throw new Error('দাম দরকার');
+  const data = {
+    name,
+    category: String(input.category || '').slice(0, 60),
+    emoji: String(input.emoji || '📦').slice(0, 4),
+    image: String(input.image || ''),
+    price,
+    oldPrice: Number(input.oldPrice) || 0,
+    stock: Math.max(0, Math.round(Number(input.stock) || 0)),
+    sku: String(input.sku || ''),
+    desc: String(input.desc || '').slice(0, 1000),
+    status: 'active',
+    rating: 4
+  };
+  const id = 'p' + Date.now();
+  const fields = {};
+  Object.entries(data).forEach(([k, v]) => { fields[k] = toValue(v); });
+  const token = await botToken(cfg);
+  try {
+    await axios.patch(baseUrl(cfg) + '/products/' + id, { fields }, {
+      params: { key: cfg.apiKey }, headers: { Authorization: 'Bearer ' + token }, timeout: 25000, maxBodyLength: Infinity
+    });
+  } catch (err) { throw new Error(explain(err)); }
+  snap = null; // পরের রিপ্লাইয়ে নতুন পণ্য সাথে সাথে দেখা যাবে
+  return { id, ...data, url: productUrl(cfg, { id, name }) };
+}
+
+async function categoryNames() {
+  const { snap: s } = await getSnapshot();
+  return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
+}
+
+module.exports = { addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
