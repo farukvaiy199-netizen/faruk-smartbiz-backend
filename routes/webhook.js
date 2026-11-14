@@ -16,6 +16,7 @@ const shop = require('../services/shop');
 const assistant = require('../services/assistant');
 const { summarizeCustomerMemory } = require('../services/ai');
 const comments = require('../services/comments');
+const telegram = require('../services/telegram');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
 
@@ -260,6 +261,37 @@ router.post('/instagram', verifyMeta([config.fbAppSecret, config.igAppSecret], '
   }
 });
 
+/* =============== TELEGRAM বট =============== */
+const tgSeen = [];
+router.post('/telegram', async (req, res) => {
+  let settings;
+  try { settings = await store.getSettings(); } catch (e) { return res.sendStatus(500); }
+  if (!settings.tgToken || !telegram.checkSecret(settings.tgToken, req.get('x-telegram-bot-api-secret-token'))) return res.sendStatus(403);
+  res.sendStatus(200); // Telegram দ্রুত "ঠিক আছে" চায়, নইলে একই মেসেজ বারবার পাঠায়
+  try {
+    const upd = req.body || {};
+    if (tgSeen.includes(upd.update_id)) return;
+    tgSeen.push(upd.update_id); if (tgSeen.length > 300) tgSeen.shift();
+    const m = upd.message;
+    if (!m || !m.chat || m.chat.type !== 'private' || (m.from && m.from.is_bot)) return;
+    const chatId = String(m.chat.id);
+    let text = m.text || m.caption || '';
+    if (/^\/start\b/i.test(text)) {
+      await telegram.sendMessage(settings.tgToken, chatId, 'আসসালামু আলাইকুম! 😊 আমি আপনার অর্ডার ও পণ্যের তথ্যে সাহায্য করব। কী জানতে চান লিখুন।');
+      text = '';
+      return;
+    }
+    const name = [m.from && m.from.first_name, m.from && m.from.last_name].filter(Boolean).join(' ') || (m.from && m.from.username) || '';
+    let imageBuffer, audioBuffer;
+    if (m.photo && m.photo.length) imageBuffer = await telegram.downloadFile(settings.tgToken, m.photo[m.photo.length - 1].file_id).catch(() => undefined);
+    else if (m.voice || m.audio) audioBuffer = await telegram.downloadFile(settings.tgToken, (m.voice || m.audio).file_id).catch(() => undefined);
+    if (!text && !imageBuffer && !audioBuffer) return;
+    await handleIncomingMessage({ platform: 'telegram', platformId: chatId, text, name, imageBuffer, imageMime: 'image/jpeg', audioBuffer, sigOk: true });
+  } catch (err) {
+    console.error('Telegram webhook error:', err.message);
+  }
+});
+
 /* =============== SHARED HANDLER =============== */
 
 // যেকোনো ধরনের মেসেজ (স্টিকার, লাইক, ভিডিও ইত্যাদিও) এলে কাস্টমারকে তালিকায় যোগ করি,
@@ -301,6 +333,9 @@ async function ownerChannel({ platform, platformId, text, imageBuffer, audioBuff
     } else if (platform === 'instagram' && settings.fbToken) {
       await withRetry(() => sendInstagramMessage(platformId, msg, settings.fbToken));
       if (imgUrl) await withRetry(() => sendInstagramImage(platformId, imgUrl, settings.fbToken)).catch(() => {});
+    } else if (platform === 'telegram' && settings.tgToken) {
+      await withRetry(() => telegram.sendMessage(settings.tgToken, platformId, msg));
+      if (imgUrl) await withRetry(() => telegram.sendPhoto(settings.tgToken, platformId, imgUrl, '')).catch(() => {});
     }
   };
   try {
@@ -326,6 +361,7 @@ async function ownerChannel({ platform, platformId, text, imageBuffer, audioBuff
 
 // Messenger/Instagram-এ "লিখছে..." সংকেত (ব্যর্থ হলেও সমস্যা নেই)
 function typingOn(platform, platformId, settings) {
+  if (platform === 'telegram' && settings.tgToken) return telegram.typing(settings.tgToken, platformId);
   if ((platform === 'facebook' || platform === 'instagram') && settings.fbToken) {
     require('axios').post('https://graph.facebook.com/v19.0/me/messages', { recipient: { id: platformId }, sender_action: 'typing_on' },
       { params: { access_token: settings.fbToken }, timeout: 5000 }).catch(() => {});
@@ -361,6 +397,12 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       if (imgUrl) {
         try { await withRetry(() => sendInstagramImage(platformId, imgUrl, settings.fbToken)); }
         catch (err) { console.error('ছবি পাঠাতে ব্যর্থ (Instagram):', err.message); }
+      }
+    } else if (platform === 'telegram' && settings.tgToken) {
+      await withRetry(() => telegram.sendMessage(settings.tgToken, platformId, replyText));
+      if (imgUrl) {
+        try { await withRetry(() => telegram.sendPhoto(settings.tgToken, platformId, imgUrl, '')); }
+        catch (err) { console.error('ছবি পাঠাতে ব্যর্থ (Telegram):', err.message); }
       }
     }
   };
@@ -536,7 +578,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
         product: order.product,
         qty: wantQty,
         price: order.price || 0,
-        source: platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : 'WhatsApp',
+        source: platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : 'WhatsApp',
         stockItem: reservedStock ? reservedStock.name : ''
       });
     } catch (err) {
