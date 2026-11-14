@@ -14,6 +14,7 @@ const { sendInstagramMessage, sendInstagramImage, getInstagramProfile } = requir
 const crypto = require('crypto');
 const shop = require('../services/shop');
 const assistant = require('../services/assistant');
+const { summarizeCustomerMemory } = require('../services/ai');
 const comments = require('../services/comments');
 
 const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
@@ -267,17 +268,16 @@ async function ensureCustomer({ platform, platformId, name, phone }) {
   const settings = await store.getSettings();
   const customer = await store.findOrCreateCustomer({ platform, platformId, name, phone });
 
+  // প্রোফাইল (নাম/ছবি) আনা উত্তরের পথ আটকায় না — পেছনে চলে, উত্তর দ্রুত যায়
   if (platform === 'facebook' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
-    const profile = await getFacebookProfile(platformId, settings.fbToken);
-    if (profile.name || profile.photoUrl) {
-      await store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
-    }
+    getFacebookProfile(platformId, settings.fbToken).then(profile => {
+      if (profile.name || profile.photoUrl) return store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
+    }).catch(() => {});
   }
   if (platform === 'instagram' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
-    const profile = await getInstagramProfile(platformId, settings.fbToken);
-    if (profile.name || profile.photoUrl || profile.username) {
-      await store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl, username: profile.username });
-    }
+    getInstagramProfile(platformId, settings.fbToken).then(profile => {
+      if (profile.name || profile.photoUrl || profile.username) return store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl, username: profile.username });
+    }).catch(() => {});
   }
   return { settings, customer };
 }
@@ -322,6 +322,14 @@ async function ownerChannel({ platform, platformId, text, imageBuffer, audioBuff
     await reply('দুঃখিত, এখন কাজটা করা গেল না। একটু পরে আবার বলুন।').catch(() => {});
   }
   return true;
+}
+
+// Messenger/Instagram-এ "লিখছে..." সংকেত (ব্যর্থ হলেও সমস্যা নেই)
+function typingOn(platform, platformId, settings) {
+  if ((platform === 'facebook' || platform === 'instagram') && settings.fbToken) {
+    require('axios').post('https://graph.facebook.com/v19.0/me/messages', { recipient: { id: platformId }, sender_action: 'typing_on' },
+      { params: { access_token: settings.fbToken }, timeout: 5000 }).catch(() => {});
+  }
 }
 
 async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer, sigOk }) {
@@ -409,16 +417,26 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
 
   await store.appendMessage(customer.id, 'user', text);
 
-  const sheetContext = await getSheetCtx(settings, text);
-  const fullHistory = await store.getConversation(customer.id);
+  typingOn(platform, platformId, settings); // "লিখছে..." দেখালে কাস্টমারের অপেক্ষা ছোট লাগে
+  // সবকিছু একসাথে আনি (আগে একটার পর একটা আনা হতো — ধীর ছিল)
+  const [sheetContext, fullHistory, rulesRaw, ownerImages, stockRaw, shopContext, memory, pastOrders] = await Promise.all([
+    getSheetCtx(settings, text),
+    store.getConversation(customer.id),
+    store.getAiRules(),
+    store.getAiImages(),
+    store.getStockList(),
+    shop.getAiContext(text), // ই-কমার্স ওয়েবসাইটের লাইভ প্রোডাক্ট/স্টক/অফার (সংযুক্ত না থাকলে ফাঁকা)
+    store.getCustomerMemory(customer.id).catch(() => ''),
+    store.getOrdersByCustomer(customer.id).catch(() => [])
+  ]);
   const history = fullHistory.slice(0, -1);
-  const ownerRules = (await store.getAiRules()).map(r => r.text);
-  const ownerImages = await store.getAiImages();
-  const stockList = (await store.getStockList()).map(e => ({ name: e.name, qty: e.qty }));
-  const shopContext = await shop.getAiContext(text); // ই-কমার্স ওয়েবসাইটের লাইভ প্রোডাক্ট/স্টক/অফার (সংযুক্ত না থাকলে ফাঁকা)
+  const ownerRules = rulesRaw.map(r => r.text);
+  const stockList = stockRaw.map(e => ({ name: e.name, qty: e.qty }));
+  const orderLine = pastOrders.slice(0, 3).map(o => `${o.product} ×${o.qty} (${o.status})`).join('; ');
+  const customerMemory = [memory, orderLine ? 'আগের অর্ডার: ' + orderLine : ''].filter(Boolean).join('\n');
 
   const { reply, imageUrl, imageId, shopProductId, order, handoff } = await getAIReplyWithFallback({
-    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext
+    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext, customerMemory
   });
 
   // মালিকের আপলোড করা ছবি থাকলে সেটাকেই অগ্রাধিকার; না থাকলে শিটের ছবির লিংক
@@ -431,8 +449,15 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     finalImageUrl = await shop.getProductImage(shopProductId);
   }
 
+  await send(reply, finalImageUrl); // আগে কাস্টমারকে পাঠাই, তারপর খাতায় লিখি
   await store.appendMessage(customer.id, 'assistant', reply);
-  await send(reply, finalImageUrl);
+
+  // প্রতি ৫টা মেসেজে কাস্টমারের স্মৃতি নতুন করে লেখা (পেছনে — উত্তরের গতি কমায় না)
+  const userCount = fullHistory.filter(h => h.role === 'user').length;
+  if (userCount > 0 && userCount % 5 === 0) {
+    summarizeCustomerMemory({ settings, previous: memory, history: [...fullHistory, { role: 'assistant', text: reply }], orders: orderLine })
+      .then(m => m && store.setCustomerMemory(customer.id, m)).catch(() => {});
+  }
 
   // AI আটকে গেছে বা কাস্টমার রাগ করছে — মালিককে পুশ পাঠাই (AI চালুই থাকে), কাস্টমারের পাশে লাল ট্যাগ বসে
   if (handoff && !customer.needsHuman) {
