@@ -44,4 +44,19 @@ async function generateImage({ settings, prompt, baseImage }) {
   return toJpeg(Buffer.from(d.data, 'base64'));
 }
 
-module.exports = { generateImage, hasGemini };
+// ছবি ছোট করে (সর্বোচ্চ maxPx) JPEG বানায় — ওয়েবসাইটের ডেটাবেসে রাখার জন্য (১MB সীমার নিচে)
+function shrinkJpeg(buf, maxPx = 900, q = 6) {
+  return new Promise((resolve, reject) => {
+    let bin;
+    try { bin = require('ffmpeg-static'); } catch (e) { return reject(new Error('ffmpeg নেই')); }
+    const p = spawn(bin, ['-v', 'error', '-i', 'pipe:0', '-vf', `scale='min(${maxPx},iw)':'min(${maxPx},ih)':force_original_aspect_ratio=decrease`, '-frames:v', '1', '-q:v', String(q), '-f', 'mjpeg', 'pipe:1']);
+    const out = []; let err = '';
+    p.stdout.on('data', d => out.push(d)); p.stderr.on('data', d => { err += d; });
+    p.on('error', reject);
+    p.on('close', code => code === 0 && out.length ? resolve(Buffer.concat(out)) : reject(new Error('ছবি ছোট করা যায়নি: ' + err.slice(0, 100))));
+    p.stdin.on('error', () => {});
+    p.stdin.end(buf);
+  });
+}
+
+module.exports = { generateImage, hasGemini, shrinkJpeg };
