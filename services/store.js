@@ -54,7 +54,7 @@ function stripId(doc) {
 }
 
 function defaultSettings() {
-  return {
+  const d = {
     fbToken: '', fbPageId: '', fbAppId: '',
     waToken: '', waPhoneNumberId: '', waBusinessId: '', waConfigId: '', waAppId: '',
     sheetLink: '', faqSheetLink: '',
@@ -74,10 +74,13 @@ function defaultSettings() {
     // পেজের সাথে যুক্ত Instagram অ্যাকাউন্ট (Facebook কানেক্টের সময় নিজে থেকে খুঁজে বের হয়)
     igUserId: '', igUsername: ''
   };
+  // বাড়তি AI Key-র ঘর (৪ থেকে ৮) — একই Key-তে আলাদা মডেল দিয়েও ঘর বানানো যায়
+  for (let n = 4; n <= 8; n++) { d['aiKey' + n] = ''; d['aiProvider' + n] = 'groq'; d['aiModel' + n] = ''; d['aiBaseUrl' + n] = ''; }
+  return d;
 }
 
 function computeConnected(s) {
-  return {
+  const c = {
     fb: !!s.fbToken,
     wa: !!(s.waToken && s.waPhoneNumberId),
     sheet: !!s.sheetLink,
@@ -88,6 +91,8 @@ function computeConnected(s) {
     tg: !!s.tgToken,
     tk: !!s.tkAccessToken
   };
+  for (let n = 4; n <= 8; n++) c['ai' + n] = !!s['aiKey' + n];
+  return c;
 }
 
 /* ---------- Settings ---------- */
