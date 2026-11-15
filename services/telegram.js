@@ -131,8 +131,9 @@ async function sendToChannel(settings, caption, photoUrl) {
 }
 
 // পোস্টের রেকর্ডে বসানোর ক্ষেত্র। চ্যানেল সংযুক্ত না থাকলে {} — কিছুই বদলায় না।
-async function postFields(settings, { buffer, whenMs } = {}) {
-  if (!settings.tgToken || !settings.tgChannel || settings.tgAutoPost === false) return {};
+async function postFields(settings, { buffer, whenMs, force } = {}) {
+  // force = মালিক পোস্টের সময় নিজে টিক দিয়েছেন, তাই "অটো-পোস্ট" বন্ধ থাকলেও যাবে
+  if (!settings.tgToken || !settings.tgChannel || (settings.tgAutoPost === false && !force)) return {};
   let tgMediaId = '';
   if (buffer) tgMediaId = await store.addPostMedia({ mime: 'image/jpeg', b64: buffer.toString('base64') });
   return { tgStatus: whenMs ? 'pending' : 'publishing', tgDueAt: new Date(whenMs || Date.now()).toISOString(), tgMediaId };
