@@ -4,7 +4,7 @@ const axios = require('axios');
 
 const config = require('../config');
 const store = require('../services/store');
-const { sendFacebookMessage } = require('../services/facebook');
+const { sendFacebookMessage, getFacebookProfile } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
 const telegram = require('../services/telegram');
 const tiktok = require('../services/tiktok');
@@ -13,12 +13,13 @@ const { notifyOwner, getPublicKey } = require('../services/notify');
 const { getSheetProducts } = require('../services/sheets');
 const { generatePostDraft } = require('../services/content');
 const { publishPagePhoto, deleteFbPost } = require('../services/facebook');
-const { detectInstagramAccount, sendInstagramMessage, ensurePageSubscription } = require('../services/instagram');
+const { detectInstagramAccount, sendInstagramMessage, ensurePageSubscription, getInstagramProfile } = require('../services/instagram');
 const { publishIgJob } = require('../services/scheduler');
 const videoPosts = require('../services/videoPosts');
 const shop = require('../services/shop');
 const assistant = require('../services/assistant');
 const comments = require('../services/comments');
+const emailSvc = require('../services/email');
 const multer = require('multer');
 const os = require('os');
 const fs = require('fs');
@@ -107,6 +108,9 @@ router.patch('/orders/:id', async (req, res) => {
       } else if (customer && customer.platform === 'telegram' && settings.tgToken) {
         await telegram.sendMessage(settings.tgToken, customer.platformId, text);
         notifyStatus = 'sent';
+      } else if (customer && customer.platform === 'email' && emailSvc.isEmailConfigured(settings)) {
+        await emailSvc.sendReply(customer.platformId, text);
+        notifyStatus = 'sent';
       } else {
         notifyNote = customer ? 'ওয়েবসাইট কাস্টমার — মেসেজ পাঠানোর মাধ্যম নেই' : 'কাস্টমার পাওয়া যায়নি';
       }
@@ -137,7 +141,21 @@ router.get('/orders/export', async (req, res) => {
 
 /* ---------- Customers ---------- */
 router.get('/customers', async (req, res) => {
-  res.json(await store.getCustomers());
+  const list = await store.getCustomers();
+  res.json(list);
+  // নাম/ছবি এখনো আসেনি এমন Facebook/Instagram কাস্টমারের প্রোফাইল পেছনে এনে রাখি (পরের বার লিস্টে দেখা যাবে)
+  try {
+    const settings = await store.getSettings();
+    if (!settings.fbToken) return;
+    const missing = list.filter(c => (c.platform === 'facebook' || c.platform === 'instagram')
+      && (!c.name || c.name === 'অজানা কাস্টমার') && !c._profTried).slice(0, 5);
+    for (const c of missing) {
+      const fn = c.platform === 'facebook' ? getFacebookProfile : getInstagramProfile;
+      fn(c.platformId, settings.fbToken).then(p => {
+        if (p && (p.name || p.photoUrl || p.username)) return store.updateCustomerContact(c.id, { name: p.name, photoUrl: p.photoUrl, username: p.username });
+      }).catch(() => {});
+    }
+  } catch (e) { /* গুরুত্বপূর্ণ নয় */ }
 });
 
 router.patch('/customers/:id/ai', async (req, res) => {
@@ -236,6 +254,8 @@ router.post('/broadcast', async (req, res) => {
         await tiktok.sendMessage(c.platformId, message);
       } else if (c.platform === 'telegram' && settings.tgToken) {
         await telegram.sendMessage(settings.tgToken, c.platformId, message);
+      } else if (c.platform === 'email' && emailSvc.isEmailConfigured(settings)) {
+        await emailSvc.sendReply(c.platformId, message);
       } else if (c.platform === 'website') {
         throw new Error('ওয়েবসাইটের কাস্টমারকে এখান থেকে পাঠানো যায় না');
       } else {
@@ -721,8 +741,35 @@ router.get('/settings', async (req, res) => {
     aiAutoReply: s.aiAutoReply,
     connected: s.connected,
     sheetStorageConfigured: !!config.sheetScriptUrl,
-    emailConfigured: !!config.resendApiKey
+    emailConfigured: emailSvc.isEmailConfigured(s),
+    emailAiReply: s.emailAiReply === 'on'
   });
+});
+
+
+/* ---------- ইমেইল (Gmail ব্রিজ) ---------- */
+router.get('/email/status', async (req, res) => {
+  try { res.json(await emailSvc.status()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+router.get('/email/script', async (req, res) => {
+  try { res.json({ script: await emailSvc.getScript() }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+router.post('/email/connect', async (req, res) => {
+  try { res.json({ ok: true, ...(await emailSvc.connect(req.body && req.body.url)) }); } catch (e) { res.status(400).json({ error: e.message }); }
+});
+router.post('/email/disconnect', async (req, res) => {
+  try { await emailSvc.disconnect(); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+router.post('/email/ai-reply', async (req, res) => {
+  await store.saveSettings({ emailAiReply: req.body && req.body.on ? 'on' : 'off' });
+  res.json({ ok: true });
+});
+router.post('/email/test', async (req, res) => {
+  const to = String((req.body && req.body.to) || '').trim();
+  if (!emailSvc.isEmail(to)) return res.status(400).json({ error: 'ইমেইল ঠিকানা সঠিক নয়' });
+  const r = await emailSvc.sendMail({ to, subject: "টেস্ট — Faruk's SmartBiz", text: 'এই ইমেইলটা এলে ইমেইল সংযোগ ঠিকঠাক কাজ করছে ✅', html: '<p>এই ইমেইলটা এলে ইমেইল সংযোগ ঠিকঠাক কাজ করছে ✅</p>' });
+  if (!r.sent) return res.status(400).json({ error: r.reason });
+  res.json({ ok: true });
 });
 
 router.post('/settings', async (req, res) => {
