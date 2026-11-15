@@ -8,7 +8,7 @@ const { sendFacebookMessage } = require('../services/facebook');
 const { sendWhatsAppMessage } = require('../services/whatsapp');
 const telegram = require('../services/telegram');
 const tiktok = require('../services/tiktok');
-const { getOwnerChatReply, getSlots } = require('../services/ai');
+const { getOwnerChatReply, getSlots, testSlot } = require('../services/ai');
 const { notifyOwner, getPublicKey } = require('../services/notify');
 const { getSheetProducts } = require('../services/sheets');
 const { generatePostDraft } = require('../services/content');
@@ -418,8 +418,24 @@ router.get('/ai-usage', async (req, res) => {
     limits: settings.aiLimits || {},
     primary: settings.aiKey ? settings.aiProvider : null,
     backup: settings.aiKey2 ? settings.aiProvider2 : null,
-    backup2: settings.aiKey3 ? settings.aiProvider3 : null
+    backup2: settings.aiKey3 ? settings.aiProvider3 : null,
+    more: [4, 5, 6, 7, 8].filter(n => settings['aiKey' + n]).map(n => settings['aiProvider' + n] || 'groq')
   });
+});
+
+// এক ঘরের Key কাজ করছে কিনা যাচাই — { slot: '' | '2' … '8' }
+router.post('/ai/test', async (req, res) => {
+  const sfx = String(req.body.slot || '');
+  if (!/^([2-8])?$/.test(sfx)) return res.status(400).json({ error: 'ঘরের নম্বর সঠিক না' });
+  const settings = await store.getSettings();
+  try {
+    res.json(await testSlot(settings, sfx));
+  } catch (err) {
+    const d = err.response && err.response.data;
+    const e = d && (d.error || d.message);
+    const msg = (e && (typeof e === 'string' ? e : (e.message || JSON.stringify(e)))) || err.message || 'অজানা ত্রুটি';
+    res.json({ ok: false, status: (err.response && err.response.status) || null, error: String(msg).slice(0, 300) });
+  }
 });
 
 /* ---------- নোটিফিকেশন ও পুশ (নতুন) ---------- */
@@ -504,7 +520,14 @@ router.post('/posts/generate', async (req, res) => {
 
 router.post('/posts', async (req, res) => {
   const settings = await store.getSettings();
-  if (!settings.fbToken) return res.status(400).json({ error: 'আগে Settings থেকে Facebook পেজ সংযুক্ত করুন' });
+  // কোথায় কোথায় যাবে — অ্যাপের টিক চিহ্ন। পুরনো অ্যাপ এসব পাঠায় না: তখন আগের মতোই Facebook-এ যায় আর Telegram/TikTok নিজেদের অটো-পোস্ট সেটিং মেনে চলে।
+  const wantFb = req.body.postToFacebook !== false;
+  const tgWant = typeof req.body.postToTelegram === 'boolean' ? req.body.postToTelegram : undefined; // true=জোর করে, false=বাদ, undefined=অটো সেটিং
+  const tkWant = typeof req.body.postToTiktok === 'boolean' ? req.body.postToTiktok : undefined;
+  if (!wantFb && req.body.postToInstagram !== true && tgWant !== true && tkWant !== true) {
+    return res.status(400).json({ error: 'অন্তত একটা জায়গা বেছে নিন (Facebook, Instagram, TikTok বা Telegram)' });
+  }
+  if (!settings.fbToken && (wantFb || req.body.postToInstagram === true)) return res.status(400).json({ error: 'আগে Settings থেকে Facebook পেজ সংযুক্ত করুন' });
 
   const caption = String(req.body.caption || '').trim().slice(0, 2000);
   if (!caption) return res.status(400).json({ error: 'ক্যাপশন খালি' });
@@ -526,7 +549,8 @@ router.post('/posts', async (req, res) => {
   const base = { caption, productName: String(req.body.productName || '').slice(0, 120), thumb };
 
   try {
-    const r = await publishPagePhoto({ token: settings.fbToken, caption, buffer, scheduledAtMs: whenMs });
+    // Facebook বাদ দিলে পেজে কিছু যায় না (শুধু বাকি টিক-করা জায়গায় যায়)
+    const r = wantFb ? await publishPagePhoto({ token: settings.fbToken, caption, buffer, scheduledAtMs: whenMs }) : { fbPostId: '', fbPhotoId: '' };
     // Instagram-এও পোস্ট করার অনুরোধ থাকলে ছবি ডেটাবেসে রাখি (Instagram পাবলিক লিংক থেকে ছবি নেয়)
     const wantIg = req.body.postToInstagram === true;
     let igFields = {};
@@ -542,8 +566,14 @@ router.post('/posts', async (req, res) => {
         };
       }
     }
-    const tgFields = await telegram.postFields(settings, { buffer, whenMs }).catch(() => ({}));
-    const tkFields = await tiktok.postFields(settings, { buffer, whenMs }).catch(() => ({}));
+    // Telegram/TikTok: টিক দিলে অটো-পোস্ট বন্ধ থাকলেও যায় (force); টিক না দিলে একদমই যায় না; অ্যাপ পুরনো হলে আগের অটো সেটিং
+    let tgFields = {}, tkFields = {};
+    if (tgWant === false) tgFields = {};
+    else if (tgWant === true && !(settings.tgToken && settings.tgChannel)) tgFields = { tgStatus: 'skipped', tgError: 'Telegram চ্যানেল সংযুক্ত নেই' };
+    else tgFields = await telegram.postFields(settings, { buffer, whenMs, force: tgWant === true }).catch(() => ({}));
+    if (tkWant === false) tkFields = {};
+    else if (tkWant === true && !settings.tkAccessToken) tkFields = { tkStatus: 'skipped', tkError: 'TikTok অ্যাকাউন্ট সংযুক্ত নেই' };
+    else tkFields = await tiktok.postFields(settings, { buffer, whenMs, force: tkWant === true }).catch(() => ({}));
     const post = await store.addPost({
       ...base,
       ...igFields, ...tgFields, ...tkFields,
@@ -634,6 +664,8 @@ router.delete('/posts/:id', async (req, res) => {
     if (post.mediaType === 'video') await videoPosts.deleteVideo(post.mediaId);
     else await store.deletePostMedia(post.mediaId);
   }
+  // Telegram/TikTok-এর অপেক্ষমাণ ছবিও মুছে দিই — না হলে ডেটাবেসে জায়গা নষ্ট হয়
+  for (const k of ['tgMediaId', 'tkMediaId']) if (post[k]) await store.deletePostMedia(post[k]).catch(() => {});
   await store.deletePostRecord(post.id);
   res.json({ ok: true });
 });
@@ -681,6 +713,7 @@ router.get('/settings', async (req, res) => {
     aiProvider3: s.aiProvider3,
     aiModel: s.aiModel, aiModel2: s.aiModel2, aiModel3: s.aiModel3,
     aiBaseUrl: s.aiBaseUrl, aiBaseUrl2: s.aiBaseUrl2, aiBaseUrl3: s.aiBaseUrl3,
+    ...Object.fromEntries([4, 5, 6, 7, 8].flatMap(n => [['aiProvider' + n, s['aiProvider' + n]], ['aiModel' + n, s['aiModel' + n]], ['aiBaseUrl' + n, s['aiBaseUrl' + n]]])),
     postNotes: s.postNotes,
     commentAuto: s.commentAuto === 'on' ? 'on' : 'off',
     igUserId: s.igUserId, igUsername: s.igUsername,
@@ -778,10 +811,6 @@ router.post('/shop/connect', async (req, res) => {
 router.post('/shop/sync', async (req, res) => {
   try { res.json((await shop.sync(true)) || (await shop.status())); }
   catch (err) { res.status(400).json({ error: err.message }); }
-});
-router.post('/shop/disconnect', async (req, res) => {
-  try { await shop.disconnect(); res.json({ ok: true }); }
-  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 module.exports = router;
