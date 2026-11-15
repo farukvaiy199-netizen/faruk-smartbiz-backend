@@ -195,7 +195,7 @@ function walk(o, fn, depth = 0) {
   }
 }
 function parseInbound(body) {
-  const out = { text: '', userId: '', conversationId: '', messageId: '', imageUrl: '', fromBusiness: false };
+  const out = { text: '', userId: '', conversationId: '', messageId: '', imageUrl: '', fromBusiness: false, name: '', username: '' };
   walk(body, (k, v) => {
     const key = k.toLowerCase();
     if (typeof v === 'string' || typeof v === 'number') {
@@ -204,6 +204,8 @@ function parseInbound(body) {
       else if (!out.userId && /^(from_user_id|sender_id|user_id|tiktok_unique_identifier|from|sender|open_id)$/.test(key)) out.userId = sv;
       else if (!out.conversationId && /^(conversation_id|conversationid)$/.test(key)) out.conversationId = sv;
       else if (!out.messageId && /^(message_id|messageid|msg_id)$/.test(key)) out.messageId = sv;
+      else if (!out.name && /^(display_name|nickname|nick_name|user_name|sender_name|from_name)$/.test(key) && typeof v === 'string') out.name = sv;
+      else if (!out.username && /^(username|unique_id|tiktok_username|handle)$/.test(key) && typeof v === 'string') out.username = sv.replace(/^@/, '');
       else if (!out.imageUrl && /^(image_url|imageurl|url)$/.test(key) && /^https?:/.test(sv) && /(jpe?g|png|webp|image)/i.test(sv)) out.imageUrl = sv;
     }
   });
