@@ -122,8 +122,9 @@ async function pickPrivacy() {
   return 'SELF_ONLY';
 }
 
-async function postFields(settings, { buffer, whenMs } = {}) {
-  if (!connectedForPost(settings)) return {};
+async function postFields(settings, { buffer, whenMs, force } = {}) {
+  // force = মালিক পোস্টের সময় নিজে টিক দিয়েছেন, তাই "অটো-পোস্ট" বন্ধ থাকলেও যাবে (অ্যাকাউন্ট যুক্ত থাকতে হবে)
+  if (!(force ? settings.tkAccessToken : connectedForPost(settings))) return {};
   if (!buffer) return { tkStatus: 'skipped', tkError: 'TikTok-এ ছবি লাগে' };
   const tkMediaId = await store.addPostMedia({ mime: 'image/jpeg', b64: buffer.toString('base64') });
   return { tkStatus: whenMs ? 'pending' : 'publishing', tkDueAt: new Date(whenMs || Date.now()).toISOString(), tkMediaId };
