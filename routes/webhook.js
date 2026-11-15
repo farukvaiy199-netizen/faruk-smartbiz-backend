@@ -8,7 +8,8 @@ const { transcribeAudio, isWhisperCapable } = require('../services/speech');
 const { getCombinedSheetContext, getProductStock, writeOrderToSheet, writeCustomerToSheet } = require('../services/sheets');
 const { sendFacebookMessage, sendFacebookImage, getFacebookProfile, downloadMedia } = require('../services/facebook');
 const { sendWhatsAppMessage, sendWhatsAppImage, getWhatsAppMediaBuffer } = require('../services/whatsapp');
-const { sendOrderConfirmationEmail } = require('../services/email');
+const emailSvc = require('../services/email');
+const { sendOrderConfirmationEmail } = emailSvc;
 const { notifyOwner } = require('../services/notify');
 const { sendInstagramMessage, sendInstagramImage, getInstagramProfile } = require('../services/instagram');
 const crypto = require('crypto');
@@ -287,7 +288,7 @@ router.post('/telegram', async (req, res) => {
     if (m.photo && m.photo.length) imageBuffer = await telegram.downloadFile(settings.tgToken, m.photo[m.photo.length - 1].file_id).catch(() => undefined);
     else if (m.voice || m.audio) audioBuffer = await telegram.downloadFile(settings.tgToken, (m.voice || m.audio).file_id).catch(() => undefined);
     if (!text && !imageBuffer && !audioBuffer) return;
-    await handleIncomingMessage({ platform: 'telegram', platformId: chatId, text, name, imageBuffer, imageMime: 'image/jpeg', audioBuffer, sigOk: true });
+    await handleIncomingMessage({ platform: 'telegram', platformId: chatId, text, name, username: (m.from && m.from.username) || '', imageBuffer, imageMime: 'image/jpeg', audioBuffer, sigOk: true });
   } catch (err) {
     console.error('Telegram webhook error:', err.message);
   }
@@ -320,9 +321,35 @@ router.post('/tiktok/:key', async (req, res) => {
     let imageBuffer;
     if (m.imageUrl && !m.text) imageBuffer = await require('axios').get(m.imageUrl, { responseType: 'arraybuffer', timeout: 15000, maxContentLength: 8e6 }).then(r => Buffer.from(r.data)).catch(() => undefined);
     if (!m.text && !imageBuffer) return;
-    await handleIncomingMessage({ platform: 'tiktok', platformId: String(m.userId), text: m.text, imageBuffer, imageMime: 'image/jpeg', sigOk: false });
+    await handleIncomingMessage({ platform: 'tiktok', platformId: String(m.userId), text: m.text, name: m.name, username: m.username, imageBuffer, imageMime: 'image/jpeg', sigOk: false });
   } catch (err) {
     console.error('TikTok webhook error:', err.message);
+  }
+});
+
+// ইমেইল ওয়েবহুক — Gmail ব্রিজ (Apps Script) নতুন ইমেইল এখানে পাঠায়। লিংকের গোপন অংশ মিললে তবেই গ্রহণ।
+const emSeen = [];
+const emRate = new Map(); // প্রেরক -> সময়ের তালিকা (লুপ/স্প্যাম ঠেকাতে ঘণ্টায় সর্বোচ্চ ১০টা)
+router.post('/email/:key', async (req, res) => {
+  const settings = await store.getSettings();
+  if (!emailSvc.checkHookKey(settings, req.params.key)) return res.sendStatus(403);
+  const b = req.body || {};
+  const addr = String(b.from || '').trim().toLowerCase();
+  if (!emailSvc.isEmail(addr) || !String(b.text || '').trim()) return res.sendStatus(200);
+  res.sendStatus(200);
+  try {
+    if (settings.emailAiReply !== 'on') return;
+    if (b.messageId) { if (emSeen.includes(b.messageId)) return; emSeen.push(b.messageId); if (emSeen.length > 300) emSeen.shift(); }
+    const now = Date.now();
+    const hits = (emRate.get(addr) || []).filter(t => now - t < 3600e3);
+    if (hits.length >= 10) return;
+    hits.push(now); emRate.set(addr, hits);
+    await emailSvc.rememberThread(addr, { threadId: b.threadId, subject: b.subject });
+    const subj = String(b.subject || '').trim();
+    const text = (subj && !/^(re|fwd?):/i.test(subj) ? 'বিষয়: ' + subj + '\n' : '') + String(b.text).slice(0, 3000);
+    await handleIncomingMessage({ platform: 'email', platformId: addr, text, name: String(b.name || '').slice(0, 80), email: addr, sigOk: false });
+  } catch (err) {
+    console.error('Email webhook error:', err.message);
   }
 });
 
@@ -330,9 +357,18 @@ router.post('/tiktok/:key', async (req, res) => {
 
 // যেকোনো ধরনের মেসেজ (স্টিকার, লাইক, ভিডিও ইত্যাদিও) এলে কাস্টমারকে তালিকায় যোগ করি,
 // আর Facebook হলে নাম/ছবি আনার চেষ্টা করি
-async function ensureCustomer({ platform, platformId, name, phone }) {
+async function ensureCustomer({ platform, platformId, name, phone, username, email }) {
   const settings = await store.getSettings();
-  const customer = await store.findOrCreateCustomer({ platform, platformId, name, phone });
+  let customer = await store.findOrCreateCustomer({ platform, platformId, name, phone });
+  // প্ল্যাটফর্ম থেকে আসল নাম/ইউজারনেম পাওয়া গেলে আগের ফাঁকা বা "অজানা" নাম বদলে দিই
+  const placeholder = !customer.name || customer.name === 'অজানা কাস্টমার';
+  const patch = {};
+  if (name && placeholder) patch.name = name;
+  if (username && customer.username !== username) patch.username = username;
+  if (email && customer.email !== email) patch.email = email;
+  if (Object.keys(patch).length) {
+    try { customer = await store.updateCustomerContact(customer.id, patch); } catch (e) { /* নাম না বদলালেও চলবে */ }
+  }
 
   // প্রোফাইল (নাম/ছবি) আনা উত্তরের পথ আটকায় না — পেছনে চলে, উত্তর দ্রুত যায়
   if (platform === 'facebook' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
@@ -370,6 +406,8 @@ async function ownerChannel({ platform, platformId, text, imageBuffer, audioBuff
     } else if (platform === 'telegram' && settings.tgToken) {
       await withRetry(() => telegram.sendMessage(settings.tgToken, platformId, msg));
       if (imgUrl) await withRetry(() => telegram.sendPhoto(settings.tgToken, platformId, imgUrl, '')).catch(() => {});
+    } else if (platform === 'email') {
+      await emailSvc.sendReply(platformId, imgUrl ? msg + '\n' + imgUrl : msg);
     }
   };
   try {
@@ -402,9 +440,9 @@ function typingOn(platform, platformId, settings) {
   }
 }
 
-async function handleIncomingMessage({ platform, platformId, text, name, phone, imageBuffer, imageMime, audioBuffer, sigOk }) {
+async function handleIncomingMessage({ platform, platformId, text, name, phone, username, email, imageBuffer, imageMime, audioBuffer, sigOk }) {
   if (await ownerChannel({ platform, platformId, text, imageBuffer, audioBuffer, sigOk })) return;
-  const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone });
+  const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone, username, email });
   console.log(`💬 মেসেজ প্রসেস হচ্ছে: ${platform} / ${platformId} (AI ${customer.ai ? 'চালু' : 'বন্ধ'})`);
 
   if (!customer.ai) return;
