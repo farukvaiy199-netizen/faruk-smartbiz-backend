@@ -41,7 +41,12 @@ const ENDPOINTS = {
   openai: 'https://api.openai.com/v1/chat/completions',
   openrouter: 'https://openrouter.ai/api/v1/chat/completions',
   deepseek: 'https://api.deepseek.com/chat/completions',
-  mistral: 'https://api.mistral.ai/v1/chat/completions'
+  mistral: 'https://api.mistral.ai/v1/chat/completions',
+  // ফ্রি টোকেন দেয় এমন আরও কিছু AI (সবই OpenAI-র মতো chat/completions)
+  cerebras: 'https://api.cerebras.ai/v1/chat/completions',
+  sambanova: 'https://api.sambanova.ai/v1/chat/completions',
+  nvidia: 'https://integrate.api.nvidia.com/v1/chat/completions',
+  github: 'https://models.github.ai/inference/chat/completions'
   // gemini আলাদাভাবে হ্যান্ডেল হয়, নিচে দেখুন। "custom" এর ঠিকানা মালিক নিজে দেন।
 };
 
@@ -51,14 +56,21 @@ const MODELS = {
   openrouter: 'openai/gpt-4o-mini',
   gemini: 'gemini-2.0-flash',
   deepseek: 'deepseek-chat',
-  mistral: 'mistral-small-latest'
+  mistral: 'mistral-small-latest',
+  // মডেলের নাম প্রোভাইডাররা মাঝে মাঝে বদলায় — ডিফল্ট কাজ না করলে অ্যাপে মডেলের নাম নিজে বসিয়ে "টেস্ট" চাপুন
+  cerebras: 'llama3.1-8b',
+  sambanova: 'Meta-Llama-3.3-70B-Instruct',
+  nvidia: 'meta/llama-3.3-70b-instruct',
+  github: 'openai/gpt-4o-mini'
 };
+const EXTRA_PROVIDERS = new Set(['cerebras', 'sambanova', 'nvidia', 'github']);
+const MAX_SLOTS = 8;
 
-// সেটিংসে তিনটা AI Key-র ঘর আছে (aiKey, aiKey2, aiKey3)। যেগুলোতে Key বসানো আছে সেগুলো ক্রমানুসারে সাজিয়ে দেয়।
+// সেটিংসে আটটা AI Key-র ঘর আছে (aiKey, aiKey2 … aiKey8)। যেগুলোতে Key বসানো আছে সেগুলো ক্রমানুসারে সাজিয়ে দেয়।
 // প্রতিটা ঘরে প্রোভাইডার, ঐচ্ছিক মডেলের নাম আর (custom হলে) Base URL থাকে।
 function getSlots(settings) {
   const slots = [];
-  for (const sfx of ['', '2', '3']) {
+  for (const sfx of ['', ...Array.from({ length: MAX_SLOTS - 1 }, (_, i) => String(i + 2))]) {
     const apiKey = settings['aiKey' + sfx];
     if (!apiKey) continue;
     slots.push({
@@ -332,8 +344,8 @@ async function getOpenAiCompatibleReply({ apiKey, provider, model = '', baseUrl 
   try {
     res = await postTracked(provider, endpoint, body, { headers, timeout: 20000 });
   } catch (err) {
-    // কাস্টম প্রোভাইডার অনেক সময় response_format বোঝে না (400) — ওটা ছাড়া আরেকবার চেষ্টা
-    if (provider === 'custom' && err.response && err.response.status === 400) {
+    // কাস্টম/নতুন প্রোভাইডার অনেক সময় response_format বোঝে না (400) — ওটা ছাড়া আরেকবার চেষ্টা
+    if ((provider === 'custom' || EXTRA_PROVIDERS.has(provider)) && err.response && err.response.status === 400) {
       const { response_format, ...plain } = body;
       res = await postTracked(provider, endpoint, plain, { headers, timeout: 20000 });
     } else {
@@ -446,4 +458,19 @@ async function summarizeCustomerMemory({ settings, previous = '', history = [], 
   return String((r && r.memory) || '').slice(0, 900).trim();
 }
 
-module.exports = { summarizeCustomerMemory, getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply, getSlots, getJsonReply };
+// এক ঘরের Key কাজ করছে কিনা যাচাই (অ্যাপের "টেস্ট" বাটন) — খুব ছোট একটা মেসেজ পাঠিয়ে দেখে
+async function testSlot(settings, sfx) {
+  const apiKey = settings['aiKey' + sfx];
+  if (!apiKey) throw new Error('এই ঘরে API Key বসানো নেই');
+  const slot = {
+    apiKey,
+    provider: settings['aiProvider' + sfx] || 'groq',
+    model: (settings['aiModel' + sfx] || '').trim(),
+    baseUrl: (settings['aiBaseUrl' + sfx] || '').trim()
+  };
+  const t0 = Date.now();
+  const r = await getAIReply({ ...slot, customerMessage: 'হ্যালো', history: [] });
+  return { ok: true, ms: Date.now() - t0, provider: slot.provider, model: slot.model || MODELS[slot.provider] || '', reply: String(r.reply || '').slice(0, 120) };
+}
+
+module.exports = { testSlot, summarizeCustomerMemory, getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply, getSlots, getJsonReply };
