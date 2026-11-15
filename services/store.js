@@ -174,7 +174,7 @@ async function setCustomerAI(id, aiOn) {
   return stripId(await col.findOne({ id }));
 }
 
-async function updateCustomerContact(id, { name, phone, photoUrl, username }) {
+async function updateCustomerContact(id, { name, phone, photoUrl, username, email }) {
   const db = await getDb();
   const col = db.collection('customers');
   const set = {};
@@ -182,6 +182,7 @@ async function updateCustomerContact(id, { name, phone, photoUrl, username }) {
   if (phone && phone.trim()) set.phone = phone.trim();
   if (photoUrl) set.photoUrl = photoUrl;
   if (username) set.username = username;
+  if (email) set.email = email;
   if (Object.keys(set).length) await col.updateOne({ id }, { $set: set });
   return stripId(await col.findOne({ id }));
 }
