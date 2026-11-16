@@ -147,11 +147,12 @@ const MAX_SLOTS = 8;
 
 // সেটিংসে আটটা AI Key-র ঘর আছে (aiKey, aiKey2 … aiKey8)। যেগুলোতে Key বসানো আছে সেগুলো ক্রমানুসারে সাজিয়ে দেয়।
 // প্রতিটা ঘরে প্রোভাইডার, ঐচ্ছিক মডেলের নাম আর (custom হলে) Base URL থাকে।
-function getSlots(settings) {
+function getSlots(settings, includeImageOnly = false) {
   const slots = [];
   for (const sfx of ['', ...Array.from({ length: MAX_SLOTS - 1 }, (_, i) => String(i + 2))]) {
     const apiKey = settings['aiKey' + sfx];
     if (!apiKey) continue;
+    if (!includeImageOnly && settings['aiProvider' + sfx] === 'fal') continue; // fal.ai শুধু ছবির জন্য, চ্যাটে নয়
     slots.push({
       apiKey,
       provider: settings['aiProvider' + sfx] || 'groq',
@@ -427,6 +428,8 @@ async function openAiCompatibleCall({ apiKey, provider, model = '', baseUrl = ''
   }
 
   const body = { model: useModel, messages, temperature: 0.15, response_format: { type: 'json_object' } };
+  // OpenRouter ডিফল্টে অনেক বড় max_tokens ধরে নেয় — ক্রেডিট কম থাকলে 402 দেয়। উত্তর ছোট, তাই সীমা বেঁধে দিই
+  if (provider === 'openrouter') body.max_tokens = 1500;
   let res;
   try {
     res = await postTracked(provider, endpoint, body, { headers, timeout: 20000 });
@@ -557,6 +560,7 @@ async function testSlot(settings, sfx) {
     model: (settings['aiModel' + sfx] || '').trim(),
     baseUrl: (settings['aiBaseUrl' + sfx] || '').trim()
   };
+  if (slot.provider === 'fal') return { ok: true, ms: 0, provider: 'fal', model: 'ছবি তৈরি', reply: 'এটা শুধু ছবি বানানোর Key — চ্যাটে ব্যবহার হয় না। আসল পরীক্ষা: সহকারীকে ছবি বানাতে বলুন।' };
   const t0 = Date.now();
   const r = await getAIReply({ ...slot, customerMessage: 'হ্যালো', history: [] });
   return { ok: true, ms: Date.now() - t0, provider: slot.provider, model: healed.get(slot.provider + '|' + (slot.model || MODELS[slot.provider] || '')) || slot.model || MODELS[slot.provider] || '', reply: String(r.reply || '').slice(0, 120) };
