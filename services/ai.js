@@ -48,6 +48,12 @@ function isModelError(err) {
   return /model/.test(msg) && /(not found|no longer|does not exist|not exist|unsupported|deprecated|invalid model|not available|unavailable|decommission|retired|not supported)/.test(msg);
 }
 
+function isOverloaded(err) {
+  const st = err && err.response && err.response.status;
+  const msg = JSON.stringify((err && err.response && err.response.data) || '').toLowerCase();
+  return st === 503 || /high demand|overloaded|unavailable/.test(msg) && st !== 404 && st !== 400;
+}
+
 async function listModels(provider, apiKey, baseUrl) {
   if (provider === 'gemini') {
     const r = await axios.get('https://generativelanguage.googleapis.com/v1beta/models', { params: { key: apiKey, pageSize: 200 }, timeout: 10000 });
@@ -79,6 +85,14 @@ async function heal(provider, apiKey, baseUrl, model, fn) {
   try {
     return await fn(start);
   } catch (err) {
+    // সার্ভার সাময়িক ব্যস্ত (503) — একটু থেমে আবার; তাতেও না হলে Gemini-র হালকা মডেলে একবার
+    if (isOverloaded(err)) {
+      await new Promise(r => setTimeout(r, 1500));
+      try { return await fn(start); } catch (e2) {
+        if (!isOverloaded(e2) || provider !== 'gemini') throw e2;
+        return await fn('gemini-flash-lite-latest');
+      }
+    }
     if (!isModelError(err)) throw err;
     let ids;
     try { ids = await listModels(provider, apiKey, baseUrl); } catch (e) { throw err; }
