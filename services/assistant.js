@@ -350,7 +350,7 @@ ${pending ? `ক্যাপশন: ${pending.caption}\nইনস্টাগ্
 === তুমি যা করতে পারো ===
 ১) প্রশ্নের উত্তর দেওয়া — "action": null।
 ২) মালিক কাস্টমারদের সাথে কথা বলার নতুন নির্দেশনা/তথ্য দিলে (যেমন "মধু এখন স্টকে আছে", "ডেলিভারি ৭০ টাকা") — "action": {"type":"save_rule","text":"পরিষ্কার সংক্ষিপ্ত নিয়ম"}।
-৩) পোস্ট বানাতে বললে — "action": {"type":"post_draft","hint":"মালিকের কথা অনুযায়ী বিষয় ও সুর","product":"পণ্যের নাম বা null","noImage":false,"instagram":true/false,"at":"ISO সময় বা null","generateImage":false,"imagePrompt":""}। মালিক ইনস্টাগ্রাম বা সময় (যেমন "১২টায়") বললে instagram/at অবশ্যই এই খসড়াতেই বসাও — পরে ভুলে যাবে না। মালিক ছবি তৈরি করে দিতে বললে (ছবি পাঠায়নি) generateImage:true ও ইংরেজিতে বিস্তারিত imagePrompt দাও। ক্যাপশনে [লিংক]-এর মতো ফাঁকা বসানো অংশ থাকবে না। খসড়া থাকা অবস্থায় বদলাতে বললে আবার post_draft (hint-এ শুধু বদলের নির্দেশ)।
+৩) পোস্ট বানাতে বললে — "action": {"type":"post_draft","hint":"মালিকের কথা অনুযায়ী বিষয় ও সুর","product":"পণ্যের নাম বা null","noImage":false,"instagram":true/false,"at":"ISO সময় বা null","generateImage":false,"imagePrompt":""}। মালিক ইনস্টাগ্রাম বা সময় (যেমন "১২টায়") বললে instagram/at অবশ্যই এই খসড়াতেই বসাও — পরে ভুলে যাবে না। মালিক ছবি তৈরি করে দিতে বললে (ছবি পাঠায়নি) generateImage:true ও ইংরেজিতে বিস্তারিত imagePrompt দাও (পণ্য/বিষয়, পরিবেশ, আলো, রং, ফ্রেমিং; ছবিতে লেখা বা মানুষ চাইলে তবেই রাখবে)। মালিক নিজে ছবির বিবরণ দিলে সেটাই হুবহু ইংরেজিতে অনুবাদ করে imagePrompt-এ দাও, নিজে বদলাবে না। ছবি পছন্দ না হলে নতুন বিবরণসহ আবার generateImage:true দাও। ক্যাপশনে [লিংক]-এর মতো ফাঁকা বসানো অংশ থাকবে না। খসড়া থাকা অবস্থায় বদলাতে বললে আবার post_draft (hint-এ শুধু বদলের নির্দেশ)।
 ৪) মালিক স্পষ্টভাবে পোস্ট করতে বললে ("পোস্ট করো", "হ্যাঁ দাও") এবং খসড়া থাকলে — "action": {"type":"post_publish","facebook":true,"instagram":false,"at":null}। ইনস্টাগ্রামে চাইলে "instagram":true। খসড়াতে সময়/ইনস্টাগ্রাম আগেই ঠিক হয়ে থাকলে সেটাই চলবে। নতুন সময় বললে "at"-এ ISO সময় (যেমন "2026-11-14T10:00:00+06:00"), না বললে null।
 ৫) মালিক পোস্ট দরকার নেই/বাতিল বললে — "action": {"type":"post_cancel"}।
 ৬) ওয়েবসাইটে নতুন পণ্য যোগ করতে বললে — প্রথমে খসড়া: "action": {"type":"product_draft","name":"...","price":সংখ্যা,"oldPrice":সংখ্যা বা 0,"stock":সংখ্যা,"category":"বিদ্যমান বিভাগ থেকে বেছে (নিচে তালিকা)","desc":"মালিকের কথা থেকে সংক্ষিপ্ত বিবরণ"}। নাম বা দাম না বললে খসড়া বানাবে না — জিজ্ঞেস করবে (action: null)। স্টক না বললে জিজ্ঞেস করবে। মালিক ছবি পাঠালে সেটা পণ্যের ছবি হয়ে যাবে। খসড়ার সংশোধন চাইলে আবার product_draft (সব ঘর সহ)।
@@ -428,6 +428,7 @@ async function handleOwnerMessage({ key, text, settings, imageB64, imageMime }) 
         try {
           const buf = await imagegen.generateImage({ settings, prompt: clip(action.imagePrompt || hint, 800) });
           next.imageB64 = buf.toString('base64'); next.imageMime = 'image/jpeg';
+          if (buf.failed && buf.failed.length) imgNote = '\nℹ️ ছবি এসেছে ' + buf.source + ' থেকে — আগের চেষ্টা ব্যর্থ: ' + buf.failed.join(' | ');
         } catch (e) { imgNote = '\n⚠️ ' + e.message; }
       }
       else if (pending && (pending.imageUrl || pending.imageB64) && !product) { next.imageUrl = pending.imageUrl || ''; next.imageB64 = pending.imageB64 || ''; next.imageMime = pending.imageMime || ''; }
