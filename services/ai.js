@@ -48,6 +48,8 @@ function isModelError(err) {
   return /model/.test(msg) && /(not found|no longer|does not exist|not exist|unsupported|deprecated|invalid model|not available|unavailable|decommission|retired|not supported)/.test(msg);
 }
 
+function isTimeout(err) { return !!err && (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT' || /timeout/i.test(err.message || '')); }
+
 function isOverloaded(err) {
   const st = err && err.response && err.response.status;
   const msg = JSON.stringify((err && err.response && err.response.data) || '').toLowerCase();
@@ -86,6 +88,9 @@ async function heal(provider, apiKey, baseUrl, model, fn) {
     return await fn(start);
   } catch (err) {
     // সার্ভার সাময়িক ব্যস্ত (503) — একটু থেমে আবার; তাতেও না হলে Gemini-র হালকা মডেলে একবার
+    if (isTimeout(err) && provider === 'gemini' && !/lite/.test(start)) {
+      return await fn('gemini-flash-lite-latest'); // ধীর/ব্যস্ত — হালকা ও দ্রুত মডেলে সরাসরি
+    }
     if (isOverloaded(err)) {
       await new Promise(r => setTimeout(r, 1500));
       try { return await fn(start); } catch (e2) {
@@ -461,7 +466,7 @@ async function geminiCall({ apiKey, model, systemPrompt, customerMessage, histor
       systemInstruction: { parts: [{ text: systemPrompt }] },
       generationConfig: { temperature: 0.15, responseMimeType: 'application/json' }
     },
-    { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+    { headers: { 'Content-Type': 'application/json' }, timeout: 12000 }
   );
 
   const raw = res.data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
