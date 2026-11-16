@@ -58,6 +58,23 @@ async function viaTogether(slot, prompt) {
   }
 }
 
+// fal.ai — FLUX (fal.ai-র Key বসানো থাকলে; সাইনআপে কিছু ফ্রি ক্রেডিট দেয়)
+async function viaFal(slot, prompt) {
+  const model = String(slot.model || 'fal-ai/flux/schnell').replace(/^\/+|\/+$/g, '');
+  try {
+    const r = await axios.post('https://fal.run/' + model, { prompt: String(prompt).slice(0, 1000), image_size: 'square_hd', num_images: 1 },
+      { headers: { Authorization: 'Key ' + slot.apiKey, 'Content-Type': 'application/json' }, timeout: 60000 });
+    const img = r.data && r.data.images && r.data.images[0];
+    if (!img || !img.url) throw new Error('ছবি আসেনি');
+    const dl = await axios.get(img.url, { responseType: 'arraybuffer', timeout: 30000, maxContentLength: 12 * 1024 * 1024 });
+    return Buffer.from(dl.data);
+  } catch (err) {
+    const d = err.response && err.response.data;
+    const m = d && (d.detail && (typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail)) || d.message || d.error);
+    throw new Error(String(m || err.message).slice(0, 150));
+  }
+}
+
 // Pollinations — Key ছাড়া বিনামূল্যে ছবি (FLUX)। শুধু বর্ণনা থেকে বানায়।
 async function viaPollinations(prompt) {
   const url = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(String(prompt).slice(0, 800))
@@ -71,14 +88,16 @@ async function viaPollinations(prompt) {
 }
 
 // baseImage থাকলে (Buffer) সেটা বদলে/সাজিয়ে নতুন ছবি বানায়; না থাকলে শুধু বর্ণনা থেকে।
-// ক্রম: Gemini (Key + ছবির কোটা থাকলে) → Together ফ্রি FLUX → Pollinations (Key লাগে না)
+// ক্রম: Gemini (Key + ছবির কোটা থাকলে) → fal.ai (Key থাকলে) → Together ফ্রি FLUX → Pollinations (Key লাগে না)
 async function generateImage({ settings, prompt, baseImage }) {
-  const slots = getSlots(settings);
+  const slots = getSlots(settings, true);
+  const fal = slots.find(s => s.provider === 'fal');
   const gem = slots.find(s => s.provider === 'gemini');
   const tog = slots.find(s => s.provider === 'together');
   const errors = [];
   const attempts = [];
   if (gem) attempts.push(['Gemini', () => viaGemini(gem, prompt, baseImage)]);
+  if (fal && !baseImage) attempts.push(['fal.ai', () => viaFal(fal, prompt)]);
   if (!baseImage) {
     if (tog) attempts.push(['Together', () => viaTogether(tog, prompt)]);
     attempts.push(['Pollinations', () => viaPollinations(prompt)]);
