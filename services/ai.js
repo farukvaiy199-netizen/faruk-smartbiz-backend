@@ -36,6 +36,60 @@ async function postTracked(provider, url, body, cfg) {
   return res;
 }
 
+/* ---------- মডেলের নাম নিজে ঠিক করে নেওয়া ----------
+   প্রোভাইডাররা পুরনো মডেল বন্ধ করে দেয় (যেমন gemini-2.0-flash)। তখন "মডেল নেই" ধরনের এরর এলে
+   প্রোভাইডারের নিজের মডেল-তালিকা থেকে একটা চালু মডেল বেছে আবার চেষ্টা করি, আর মনে রাখি। */
+const healed = new Map(); // "provider|পুরনো মডেল" -> চালু মডেল
+
+function isModelError(err) {
+  const st = err && err.response && err.response.status;
+  if (st !== 404 && st !== 400) return false;
+  const msg = JSON.stringify((err.response && err.response.data) || err.message || '').toLowerCase();
+  return /model/.test(msg) && /(not found|no longer|does not exist|not exist|unsupported|deprecated|invalid model|not available|unavailable|decommission|retired|not supported)/.test(msg);
+}
+
+async function listModels(provider, apiKey, baseUrl) {
+  if (provider === 'gemini') {
+    const r = await axios.get('https://generativelanguage.googleapis.com/v1beta/models', { params: { key: apiKey, pageSize: 200 }, timeout: 10000 });
+    return (r.data.models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => String(m.name).replace(/^models\//, ''));
+  }
+  const ep = resolveEndpoint(provider, baseUrl).replace(/\/chat\/completions\/?$/, '');
+  const r = await axios.get(ep + '/models', { headers: { Authorization: 'Bearer ' + apiKey }, timeout: 10000 });
+  const arr = r.data.data || r.data.models || (Array.isArray(r.data) ? r.data : []);
+  return arr.map(m => (typeof m === 'string' ? m : m.id || m.name)).filter(Boolean);
+}
+
+function pickModel(provider, ids, bad) {
+  const skip = /embed|tts|audio|image|imagen|veo|whisper|guard|moderation|aqa|robotics|live|realtime|transcri|rerank|search|computer-use|learnlm/i;
+  let pool = ids.filter(id => id !== bad && !skip.test(id));
+  if (!pool.length) return '';
+  if (provider === 'gemini') {
+    if (pool.includes('gemini-flash-latest')) return 'gemini-flash-latest';
+    const flash = pool.filter(id => /^gemini-[\d.]+-flash$/.test(id) || /^gemini-[\d.]+-flash-\d+$/.test(id));
+    const ver = id => parseFloat((id.match(/^gemini-([\d.]+)/) || [0, 0])[1]) || 0;
+    const list = (flash.length ? flash : pool.filter(id => /flash/.test(id) && !/lite|8b/.test(id))).sort((a, b) => ver(b) - ver(a));
+    if (list.length) return list[0];
+  }
+  const cheap = pool.filter(id => /mini|small|flash|instant|haiku|versatile|lite|8b|turbo/i.test(id));
+  return (cheap.length ? cheap : pool)[0];
+}
+
+async function heal(provider, apiKey, baseUrl, model, fn) {
+  const start = healed.get(provider + '|' + model) || model;
+  try {
+    return await fn(start);
+  } catch (err) {
+    if (!isModelError(err)) throw err;
+    let ids;
+    try { ids = await listModels(provider, apiKey, baseUrl); } catch (e) { throw err; }
+    const next = pickModel(provider, ids, start);
+    if (!next) throw err;
+    console.log(`AI মডেল বদলানো হলো (${provider}): ${start} → ${next}`);
+    healed.set(provider + '|' + model, next);
+    return await fn(next);
+  }
+}
+
 const ENDPOINTS = {
   groq: 'https://api.groq.com/openai/v1/chat/completions',
   openai: 'https://api.openai.com/v1/chat/completions',
@@ -46,7 +100,10 @@ const ENDPOINTS = {
   cerebras: 'https://api.cerebras.ai/v1/chat/completions',
   sambanova: 'https://api.sambanova.ai/v1/chat/completions',
   nvidia: 'https://integrate.api.nvidia.com/v1/chat/completions',
-  github: 'https://models.github.ai/inference/chat/completions'
+  github: 'https://models.github.ai/inference/chat/completions',
+  anthropic: 'https://api.anthropic.com/v1/chat/completions',
+  xai: 'https://api.x.ai/v1/chat/completions',
+  together: 'https://api.together.xyz/v1/chat/completions'
   // gemini আলাদাভাবে হ্যান্ডেল হয়, নিচে দেখুন। "custom" এর ঠিকানা মালিক নিজে দেন।
 };
 
@@ -54,16 +111,19 @@ const MODELS = {
   groq: 'llama-3.3-70b-versatile',
   openai: 'gpt-4o-mini',
   openrouter: 'openai/gpt-4o-mini',
-  gemini: 'gemini-2.0-flash',
+  gemini: 'gemini-flash-latest',
   deepseek: 'deepseek-chat',
   mistral: 'mistral-small-latest',
   // মডেলের নাম প্রোভাইডাররা মাঝে মাঝে বদলায় — ডিফল্ট কাজ না করলে অ্যাপে মডেলের নাম নিজে বসিয়ে "টেস্ট" চাপুন
   cerebras: 'llama3.1-8b',
   sambanova: 'Meta-Llama-3.3-70B-Instruct',
   nvidia: 'meta/llama-3.3-70b-instruct',
-  github: 'openai/gpt-4o-mini'
+  github: 'openai/gpt-4o-mini',
+  anthropic: 'claude-haiku-5-5',
+  xai: 'grok-4',
+  together: 'meta-llama/Llama-3.3-70B-Instruct-Turbo'
 };
-const EXTRA_PROVIDERS = new Set(['cerebras', 'sambanova', 'nvidia', 'github']);
+const EXTRA_PROVIDERS = new Set(['cerebras', 'sambanova', 'nvidia', 'github', 'anthropic', 'xai', 'together']);
 const MAX_SLOTS = 8;
 
 // সেটিংসে আটটা AI Key-র ঘর আছে (aiKey, aiKey2 … aiKey8)। যেগুলোতে Key বসানো আছে সেগুলো ক্রমানুসারে সাজিয়ে দেয়।
@@ -265,7 +325,11 @@ async function getAIReplyWithFallback({ settings, customerMessage, history, shee
 }
 
 /* ---------- ছবি দেখে প্রোডাক্ট মেলানো (নতুন) ---------- */
-async function getVisionReply({ apiKey, provider, imageBase64, mimeType, sheetContext = '', businessInfo = '' }) {
+async function getVisionReply(args) {
+  const base = args.provider === 'gemini' ? MODELS.gemini : (args.provider === 'openrouter' ? MODELS.openrouter : MODELS.openai);
+  return heal(args.provider, args.apiKey, '', base, m => visionCall({ ...args, _model: m }));
+}
+async function visionCall({ apiKey, provider, imageBase64, mimeType, sheetContext = '', businessInfo = '', _model }) {
   const visionPrompt = `
 তুমি "Faruk's SmartBiz" দোকানের সহকারী। কাস্টমার একটা প্রোডাক্টের ছবি পাঠিয়েছে।
 ${businessInfo ? 'দোকানের তথ্য:\n' + businessInfo : ''}
@@ -284,7 +348,7 @@ ${sheetContext || 'দোকানের কোনো প্রোডাক্�
 `.trim();
 
   if (provider === 'gemini') {
-    const model = MODELS.gemini;
+    const model = _model;
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
     const res = await postTracked('gemini', endpoint, {
       contents: [{
@@ -301,7 +365,7 @@ ${sheetContext || 'দোকানের কোনো প্রোডাক্�
   }
 
   const endpoint = ENDPOINTS[provider] || ENDPOINTS.openai;
-  const model = provider === 'openrouter' ? MODELS.openrouter : MODELS.openai;
+  const model = _model;
   const res = await postTracked(provider, endpoint, {
     model,
     messages: [
@@ -319,10 +383,14 @@ ${sheetContext || 'দোকানের কোনো প্রোডাক্�
 }
 
 /* ---------- Groq / OpenAI / OpenRouter / DeepSeek / Mistral / Custom (একই ফরম্যাট) ---------- */
-async function getOpenAiCompatibleReply({ apiKey, provider, model = '', baseUrl = '', systemPrompt, customerMessage, history, rawJson = false }) {
-  const endpoint = resolveEndpoint(provider, baseUrl);
-  const useModel = model || MODELS[provider] || (provider === 'custom' ? '' : MODELS.groq);
+async function getOpenAiCompatibleReply(args) {
+  const useModel = args.model || MODELS[args.provider] || (args.provider === 'custom' ? '' : MODELS.groq);
   if (!useModel) throw new Error('Custom AI-র মডেলের নাম দেওয়া নেই');
+  return heal(args.provider, args.apiKey, args.baseUrl, useModel, m => openAiCompatibleCall({ ...args, model: m }));
+}
+async function openAiCompatibleCall({ apiKey, provider, model = '', baseUrl = '', systemPrompt, customerMessage, history, rawJson = false }) {
+  const endpoint = resolveEndpoint(provider, baseUrl);
+  const useModel = model;
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -358,8 +426,10 @@ async function getOpenAiCompatibleReply({ apiKey, provider, model = '', baseUrl 
 }
 
 /* ---------- Google Gemini (আলাদা ফরম্যাট) ---------- */
-async function getGeminiReply({ apiKey, model: modelOverride = '', systemPrompt, customerMessage, history, rawJson = false }) {
-  const model = modelOverride || MODELS.gemini;
+async function getGeminiReply(args) {
+  return heal('gemini', args.apiKey, '', args.model || MODELS.gemini, m => geminiCall({ ...args, model: m }));
+}
+async function geminiCall({ apiKey, model, systemPrompt, customerMessage, history, rawJson = false }) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const contents = [
@@ -470,7 +540,7 @@ async function testSlot(settings, sfx) {
   };
   const t0 = Date.now();
   const r = await getAIReply({ ...slot, customerMessage: 'হ্যালো', history: [] });
-  return { ok: true, ms: Date.now() - t0, provider: slot.provider, model: slot.model || MODELS[slot.provider] || '', reply: String(r.reply || '').slice(0, 120) };
+  return { ok: true, ms: Date.now() - t0, provider: slot.provider, model: healed.get(slot.provider + '|' + (slot.model || MODELS[slot.provider] || '')) || slot.model || MODELS[slot.provider] || '', reply: String(r.reply || '').slice(0, 120) };
 }
 
 module.exports = { testSlot, summarizeCustomerMemory, getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply, getSlots, getJsonReply };
