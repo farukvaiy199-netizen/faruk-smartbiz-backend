@@ -22,10 +22,9 @@ function toJpeg(buf) {
 
 function hasGemini(settings) { return getSlots(settings).some(s => s.provider === 'gemini'); }
 
-// baseImage থাকলে (Buffer) সেটা বদলে/সাজিয়ে নতুন ছবি বানায়; না থাকলে শুধু বর্ণনা থেকে
-async function generateImage({ settings, prompt, baseImage }) {
-  const slot = getSlots(settings).find(s => s.provider === 'gemini');
-  if (!slot) throw new Error('ছবি তৈরির জন্য Settings-এ একটা Gemini API Key লাগবে (Google AI Studio থেকে বিনামূল্যে পাওয়া যায়)');
+const short = e => String(e && e.message || e).replace(/^ছবি তৈরি হয়নি: /, '').slice(0, 140);
+
+async function viaGemini(slot, prompt, baseImage) {
   const parts = [{ text: String(prompt).slice(0, 1500) }];
   if (baseImage) parts.push({ inlineData: { mimeType: 'image/jpeg', data: baseImage.toString('base64') } });
   let res;
@@ -35,13 +34,62 @@ async function generateImage({ settings, prompt, baseImage }) {
       { headers: { 'Content-Type': 'application/json' }, timeout: 60000 });
   } catch (err) {
     const m = err.response && err.response.data && err.response.data.error && err.response.data.error.message;
-    throw new Error('ছবি তৈরি হয়নি: ' + String(m || err.message).slice(0, 150));
+    throw new Error(String(m || err.message).slice(0, 150));
   }
   const ps = (res.data.candidates && res.data.candidates[0] && res.data.candidates[0].content && res.data.candidates[0].content.parts) || [];
   const img = ps.find(p => (p.inlineData || p.inline_data));
   const d = img && (img.inlineData || img.inline_data);
-  if (!d || !d.data) throw new Error('AI ছবি দেয়নি (এই Key-তে ছবি তৈরি চালু নাও থাকতে পারে)');
-  return toJpeg(Buffer.from(d.data, 'base64'));
+  if (!d || !d.data) throw new Error('AI ছবি দেয়নি');
+  return Buffer.from(d.data, 'base64');
+}
+
+// Together AI-র ফ্রি FLUX মডেল (Together-এর Key বসানো থাকলে)
+async function viaTogether(slot, prompt) {
+  try {
+    const r = await axios.post('https://api.together.xyz/v1/images/generations',
+      { model: 'black-forest-labs/FLUX.1-schnell-Free', prompt: String(prompt).slice(0, 1000), width: 1024, height: 1024, steps: 4, n: 1, response_format: 'b64_json' },
+      { headers: { Authorization: 'Bearer ' + slot.apiKey, 'Content-Type': 'application/json' }, timeout: 60000 });
+    const d = r.data && r.data.data && r.data.data[0];
+    if (!d || !d.b64_json) throw new Error('ছবি আসেনি');
+    return Buffer.from(d.b64_json, 'base64');
+  } catch (err) {
+    const m = err.response && err.response.data && (err.response.data.error && (err.response.data.error.message || err.response.data.error));
+    throw new Error(String(m || err.message).slice(0, 150));
+  }
+}
+
+// Pollinations — Key ছাড়া বিনামূল্যে ছবি (FLUX)। শুধু বর্ণনা থেকে বানায়।
+async function viaPollinations(prompt) {
+  const url = 'https://image.pollinations.ai/prompt/' + encodeURIComponent(String(prompt).slice(0, 800))
+    + '?width=1024&height=1024&nologo=true&model=flux&seed=' + Math.floor(Math.random() * 1e6);
+  try {
+    const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 70000, maxContentLength: 12 * 1024 * 1024 });
+    const ct = String(r.headers['content-type'] || '');
+    if (!/^image\//.test(ct)) throw new Error('ছবির বদলে অন্য কিছু এসেছে');
+    return Buffer.from(r.data);
+  } catch (err) { throw new Error(String(err.message).slice(0, 150)); }
+}
+
+// baseImage থাকলে (Buffer) সেটা বদলে/সাজিয়ে নতুন ছবি বানায়; না থাকলে শুধু বর্ণনা থেকে।
+// ক্রম: Gemini (Key + ছবির কোটা থাকলে) → Together ফ্রি FLUX → Pollinations (Key লাগে না)
+async function generateImage({ settings, prompt, baseImage }) {
+  const slots = getSlots(settings);
+  const gem = slots.find(s => s.provider === 'gemini');
+  const tog = slots.find(s => s.provider === 'together');
+  const errors = [];
+  const attempts = [];
+  if (gem) attempts.push(['Gemini', () => viaGemini(gem, prompt, baseImage)]);
+  if (!baseImage) {
+    if (tog) attempts.push(['Together', () => viaTogether(tog, prompt)]);
+    attempts.push(['Pollinations', () => viaPollinations(prompt)]);
+  }
+  for (const [name, run] of attempts) {
+    try {
+      const raw = await run();
+      return await toJpeg(raw);
+    } catch (e) { errors.push(name + ': ' + short(e)); }
+  }
+  throw new Error('ছবি তৈরি হয়নি — ' + errors.join(' | '));
 }
 
 // ছবি ছোট করে (সর্বোচ্চ maxPx) JPEG বানায় — ওয়েবসাইটের ডেটাবেসে রাখার জন্য (১MB সীমার নিচে)
