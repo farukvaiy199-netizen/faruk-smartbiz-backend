@@ -102,10 +102,17 @@ async function generateImage({ settings, prompt, baseImage }) {
     if (tog) attempts.push(['Together', () => viaTogether(tog, prompt)]);
     attempts.push(['Pollinations', () => viaPollinations(prompt)]);
   }
+  // বর্ণনা থেকে নতুন ছবি বানাতে মান ও পরিষ্কার ছবির নির্দেশ জুড়ে দিই (মালিকের বর্ণনা অক্ষত থাকে)
+  if (!baseImage && !/photo|realistic|illustration|render|painting|style/i.test(prompt)) {
+    prompt = String(prompt).trim() + ', professional product photography, soft natural light, sharp focus, high detail, clean composition';
+  }
+  if (!baseImage) prompt = String(prompt).trim() + ', no text, no watermark, no logo';
   for (const [name, run] of attempts) {
     try {
       const raw = await run();
-      return await toJpeg(raw);
+      const jpg = await toJpeg(raw);
+      jpg.source = name; jpg.failed = errors.slice(); // কোনটা থেকে এলো আর আগেরগুলো কেন ব্যর্থ
+      return jpg;
     } catch (e) { errors.push(name + ': ' + short(e)); }
   }
   throw new Error('ছবি তৈরি হয়নি — ' + errors.join(' | '));
