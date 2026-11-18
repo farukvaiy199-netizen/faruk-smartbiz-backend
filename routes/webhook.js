@@ -652,7 +652,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
         product: order.product,
         qty: wantQty,
         price: order.price || 0,
-        source: platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : platform === 'tiktok' ? 'TikTok' : 'WhatsApp',
+        source: platform === 'email' ? 'Email' : platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : platform === 'tiktok' ? 'TikTok' : 'WhatsApp',
         stockItem: reservedStock ? reservedStock.name : ''
       });
     } catch (err) {
