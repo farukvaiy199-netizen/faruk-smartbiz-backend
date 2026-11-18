@@ -237,6 +237,7 @@ async function createOrder({ customerId, name, phone, address, product, qty, pri
     email: email || '',
     product, qty: qty || 1, price: price || 0,
     status: 'Pending', source,
+    callStatus: '', callNote: '', callAt: '', remindAt: '', callAttempts: 0, fsSynced: false,
     stockItem: stockItem || '', stockRestored: false,
     createdAt: new Date().toISOString()
   };
@@ -303,10 +304,13 @@ async function createWebsiteOrder(payload = {}) {
     id,
     customerId: customer ? customer.id : null,
     name: payload.customer || (customer ? customer.name : 'ওয়েবসাইট কাস্টমার'),
+    phone: payload.phone || (customer ? customer.phone : '') || '',
     product: productSummary, qty, price,
     status: 'Pending', source: 'Bazaar Admin',
     address: payload.address || '', email: payload.email || '',
     payment: payload.payment || '', transactionId: payload.transactionId || '',
+    callStatus: '', callNote: '', callAt: '', remindAt: '', callAttempts: 0,
+    fsSynced: true, // ওয়েবসাইটের অর্ডার আগে থেকেই অ্যাডমিন প্যানেলে (Firestore-এ) থাকে
     createdAt: payload.date ? new Date(payload.date).toISOString() : new Date().toISOString()
   };
   await db.collection('orders').insertOne(order);
