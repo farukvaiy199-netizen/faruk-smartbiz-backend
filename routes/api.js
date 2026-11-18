@@ -20,6 +20,7 @@ const shop = require('../services/shop');
 const assistant = require('../services/assistant');
 const comments = require('../services/comments');
 const emailSvc = require('../services/email');
+const orderSync = require('../services/orderSync');
 const multer = require('multer');
 const os = require('os');
 const fs = require('fs');
@@ -55,7 +56,17 @@ router.get('/dashboard/summary', async (req, res) => {
 
 /* ---------- Orders ---------- */
 router.get('/orders', async (req, res) => {
+  // অ্যাডমিন প্যানেলে (Firestore) যা বদলেছে সেটা আগে টেনে আনি (২০ সেকেন্ডের মধ্যে একবারের বেশি নয়, এরর হলেও তালিকা যায়)
+  await orderSync.pullAll({ force: req.query.sync === '1', minGapMs: 45000 }).catch(() => {});
   res.json(await store.getOrders());
+});
+
+// অ্যাডমিন প্যানেলের সাথে মেলানোর অবস্থা (অ্যাপের ব্যানারের জন্য)
+router.get('/orders/sync-status', async (req, res) => {
+  try {
+    const r = await orderSync.status();
+    res.json(r);
+  } catch (err) { res.json({ ready: false, reason: String(err.message || err).slice(0, 120) }); }
 });
 
 // স্ট্যাটাস বদলালে কাস্টমারকে যে মেসেজ যাবে
@@ -65,6 +76,66 @@ const STATUS_MESSAGES = {
   Cancelled: id => `দুঃখিত, আপনার অর্ডার ${id} বাতিল করা হয়েছে। কোনো প্রশ্ন থাকলে আমাদের জানান।`
 };
 
+// বাতিল করলে স্টক ফেরত যায়, বাতিল থেকে আবার চালু করলে স্টক আবার কমে
+async function applyStockForStatus(before, status) {
+  if (!before.stockItem) return null;
+  const qty = Number(before.qty) || 1;
+  if (status === 'Cancelled' && before.status !== 'Cancelled' && !before.stockRestored) {
+    await store.incrementStock(before.stockItem, qty);
+    return store.setOrderFields(before.id, { stockRestored: true });
+  }
+  if (before.status === 'Cancelled' && status !== 'Cancelled' && before.stockRestored) {
+    const dec = await store.decrementStock(before.stockItem, qty);
+    if (dec.ok) return store.setOrderFields(before.id, { stockRestored: false });
+  }
+  return null;
+}
+
+// কাস্টমারকে জানানো (Messenger/WhatsApp-এ কাস্টমারের শেষ মেসেজের ২৪ ঘণ্টার মধ্যে হলে তবেই যায়)
+async function notifyCustomerStatus(before, status) {
+  let notifyStatus = 'skipped', notifyNote = '';
+  if (!STATUS_MESSAGES[status]) return { notifyStatus, notifyNote };
+  const customer = before.customerId ? await store.getCustomerById(before.customerId) : null;
+  const settings = await store.getSettings();
+  const text = STATUS_MESSAGES[status](before.id);
+  try {
+    if (customer && customer.platform === 'facebook' && settings.fbToken) {
+      await sendFacebookMessage(customer.platformId, text, settings.fbToken);
+      notifyStatus = 'sent';
+    } else if (customer && customer.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
+      await sendWhatsAppMessage(customer.platformId, text, settings.waPhoneNumberId, settings.waToken);
+      notifyStatus = 'sent';
+    } else if (customer && customer.platform === 'instagram' && settings.fbToken) {
+      await sendInstagramMessage(customer.platformId, text, settings.fbToken);
+      notifyStatus = 'sent';
+    } else if (customer && customer.platform === 'tiktok' && settings.tkMsgToken) {
+      await tiktok.sendMessage(customer.platformId, text);
+      notifyStatus = 'sent';
+    } else if (customer && customer.platform === 'telegram' && settings.tgToken) {
+      await telegram.sendMessage(settings.tgToken, customer.platformId, text);
+      notifyStatus = 'sent';
+    } else if (customer && customer.platform === 'email' && emailSvc.isEmailConfigured(settings)) {
+      await emailSvc.sendReply(customer.platformId, text);
+      notifyStatus = 'sent';
+    } else {
+      notifyNote = customer ? 'ওয়েবসাইট কাস্টমার — মেসেজ পাঠানোর মাধ্যম নেই' : 'কাস্টমার পাওয়া যায়নি';
+    }
+  } catch (err) {
+    notifyStatus = 'failed';
+    const m = String((err.response && err.response.data && err.response.data.error && err.response.data.error.message) || err.message);
+    notifyNote = /window|24|outside|allowed|session/i.test(m) ? '২৪ ঘণ্টা পেরিয়ে গেছে — কাস্টমারকে নিজে জানান' : m.slice(0, 120);
+  }
+  return { notifyStatus, notifyNote };
+}
+
+// অ্যাডমিন প্যানেলে স্ট্যাটাস বদলালে চ্যাট-কাস্টমারকে জানানো (ওয়েবসাইট কাস্টমারের মাধ্যম নেই, তাই বাদ)
+orderSync.setNotifier(async (o, status, prevStatus) => {
+  if (status === prevStatus || !STATUS_MESSAGES[status] || o.source === 'Bazaar Admin' || o.notifiedStatus === status || o.notReceived) return;
+  const r = await notifyCustomerStatus(o, status);
+  await store.setOrderFields(o.id, { notifiedStatus: status, notifyStatus: r.notifyStatus, notifyNote: r.notifyNote, notifyAt: new Date().toISOString() });
+});
+orderSync.start(notifyOwner);
+
 router.patch('/orders/:id', async (req, res) => {
   const { status, notify } = req.body;
   const valid = ['Pending', 'Processing', 'Delivered', 'Cancelled'];
@@ -73,55 +144,61 @@ router.patch('/orders/:id', async (req, res) => {
   const before = await store.getOrderById(req.params.id);
   if (!before) return res.status(404).json({ error: 'অর্ডার পাওয়া যায়নি' });
   let order = await store.updateOrderStatus(req.params.id, status);
+  order = (await applyStockForStatus(before, status)) || order;
 
-  // বাতিল করলে স্টক ফেরত যায়, বাতিল থেকে আবার চালু করলে স্টক আবার কমে
-  if (before.stockItem) {
-    const qty = Number(before.qty) || 1;
-    if (status === 'Cancelled' && before.status !== 'Cancelled' && !before.stockRestored) {
-      await store.incrementStock(before.stockItem, qty);
-      order = await store.setOrderFields(before.id, { stockRestored: true });
-    } else if (before.status === 'Cancelled' && status !== 'Cancelled' && before.stockRestored) {
-      const dec = await store.decrementStock(before.stockItem, qty);
-      if (dec.ok) order = await store.setOrderFields(before.id, { stockRestored: false });
-    }
-  }
-
-  // কাস্টমারকে জানানো (Messenger/WhatsApp-এ কাস্টমারের শেষ মেসেজের ২৪ ঘণ্টার মধ্যে হলে তবেই যায়)
   let notifyStatus = 'skipped', notifyNote = '';
-  if (notify !== false && status !== before.status && STATUS_MESSAGES[status]) {
-    const customer = before.customerId ? await store.getCustomerById(before.customerId) : null;
-    const settings = await store.getSettings();
-    const text = STATUS_MESSAGES[status](before.id);
-    try {
-      if (customer && customer.platform === 'facebook' && settings.fbToken) {
-        await sendFacebookMessage(customer.platformId, text, settings.fbToken);
-        notifyStatus = 'sent';
-      } else if (customer && customer.platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) {
-        await sendWhatsAppMessage(customer.platformId, text, settings.waPhoneNumberId, settings.waToken);
-        notifyStatus = 'sent';
-      } else if (customer && customer.platform === 'instagram' && settings.fbToken) {
-        await sendInstagramMessage(customer.platformId, text, settings.fbToken);
-        notifyStatus = 'sent';
-      } else if (customer && customer.platform === 'tiktok' && settings.tkMsgToken) {
-        await tiktok.sendMessage(customer.platformId, text);
-        notifyStatus = 'sent';
-      } else if (customer && customer.platform === 'telegram' && settings.tgToken) {
-        await telegram.sendMessage(settings.tgToken, customer.platformId, text);
-        notifyStatus = 'sent';
-      } else if (customer && customer.platform === 'email' && emailSvc.isEmailConfigured(settings)) {
-        await emailSvc.sendReply(customer.platformId, text);
-        notifyStatus = 'sent';
-      } else {
-        notifyNote = customer ? 'ওয়েবসাইট কাস্টমার — মেসেজ পাঠানোর মাধ্যম নেই' : 'কাস্টমার পাওয়া যায়নি';
-      }
-    } catch (err) {
-      notifyStatus = 'failed';
-      const m = String((err.response && err.response.data && err.response.data.error && err.response.data.error.message) || err.message);
-      notifyNote = /window|24|outside|allowed|session/i.test(m) ? '২৪ ঘণ্টা পেরিয়ে গেছে — কাস্টমারকে নিজে জানান' : m.slice(0, 120);
-    }
+  if (notify !== false && status !== before.status) {
+    ({ notifyStatus, notifyNote } = await notifyCustomerStatus(before, status));
     order = await store.setOrderFields(before.id, { notifyStatus, notifyNote, notifyAt: new Date().toISOString() });
   }
-  res.json({ ...order, notifyStatus, notifyNote });
+
+  // অ্যাডমিন প্যানেলে জানানো (যেখানে সম্ভব); সফল না হলে অর্ডারে কারণ লেখা থাকে
+  let sync = { synced: false, note: '' };
+  if (status !== before.status) {
+    sync = await orderSync.pushStatus(before, status);
+    const f = {};
+    if (sync.created) f.fsSynced = true;
+    f.syncNote = sync.note || '';
+    order = await store.setOrderFields(before.id, f);
+  }
+  res.json({ ...order, notifyStatus, notifyNote, sync });
+});
+
+// ফোনের ফলাফল: confirmed (সবুজ) / later (হলুদ, নোটসহ) / rejected (লাল) / noanswer (ধরেনি)
+router.post('/orders/:id/call', async (req, res) => {
+  const { result, note, remindAt, notify } = req.body || {};
+  if (!['confirmed', 'later', 'rejected', 'noanswer'].includes(result)) return res.status(400).json({ error: 'অবৈধ ফলাফল' });
+  const before = await store.getOrderById(req.params.id);
+  if (!before) return res.status(404).json({ error: 'অর্ডার পাওয়া যায়নি' });
+  const cleanNote = String(note || '').trim().slice(0, 300);
+  let remind = '';
+  if (result === 'later') {
+    if (remindAt && !/^\d{4}-\d{2}-\d{2}$/.test(String(remindAt))) return res.status(400).json({ error: 'তারিখ সঠিক নয়' });
+    remind = String(remindAt || '');
+    if (!remind && !cleanNote) return res.status(400).json({ error: 'কবে আবার ফোন করবেন বা কী কারণ — অন্তত একটা লিখুন' });
+  }
+  const callAt = new Date().toISOString();
+  const attempts = result === 'noanswer' ? (Number(before.callAttempts) || 0) + 1 : (Number(before.callAttempts) || 0);
+  const fields = { callStatus: result, callNote: cleanNote, callAt, remindAt: remind, callAttempts: attempts, remindNotified: false };
+  let newStatus = before.status;
+  if (result === 'confirmed' && before.status === 'Pending') newStatus = 'Processing';
+  if (result === 'rejected' && before.status !== 'Delivered') newStatus = 'Cancelled';
+  if (newStatus !== before.status) fields.status = newStatus;
+  let order = await store.setOrderFields(before.id, fields);
+  order = (await applyStockForStatus(before, newStatus)) || order;
+
+  // কনফার্ম হলে কাস্টমারকে জানানো (রিজেক্টে কিছু পাঠাই না — কাস্টমার নিজেই নিতে চায়নি)
+  let notifyStatus = 'skipped', notifyNote = '';
+  if (result === 'confirmed' && notify !== false && newStatus !== before.status) {
+    ({ notifyStatus, notifyNote } = await notifyCustomerStatus(before, newStatus));
+    order = await store.setOrderFields(before.id, { notifyStatus, notifyNote, notifyAt: new Date().toISOString(), notifiedStatus: newStatus });
+  }
+
+  const sync = await orderSync.pushCall({ ...before, ...fields }, result, { note: cleanNote, remindAt: remind, callAt, attempts });
+  const f = { syncNote: sync.note || '' };
+  if (sync.created) f.fsSynced = true;
+  order = await store.setOrderFields(before.id, f);
+  res.json({ ...order, notifyStatus, notifyNote, sync });
 });
 
 // অর্ডার CSV আকারে ডাউনলোড (Excel-এ খোলা যায়)
