@@ -1,0 +1,128 @@
+'use strict';
+// ওয়েবসাইট (khanglobalshop) এর সুরক্ষিত অর্ডার ও AI-চ্যাট রুট — SmartBiz সার্ভারের ভেতরেই চলে।
+// গুরুত্বপূর্ণ: এই ফাইলে কোনো ভুল বা Firebase কী না থাকলে শুধু এই দুই রুট 503 দেয় — বাকি সার্ভার কখনো থামে না।
+const express = require('express');
+const { computeOrder, UserError } = require('../services/pricing');
+
+const ROOT = process.env.FIRESTORE_ROOT || 'bazaar_store/khanglobalshop_main';
+const AI_WEBHOOK_URL = process.env.AI_WEBHOOK_URL || '';
+const AI_WEBHOOK_SECRET = process.env.AI_WEBHOOK_SECRET || '';
+const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://farukvaiy199-netizen.github.io').split(',').map(s => s.trim()).filter(Boolean);
+
+let admin = null, db = null, initError = '';
+function init() {
+  if (db) return true;
+  if (initError) return false;
+  try {
+    if (!process.env.FIREBASE_SERVICE_ACCOUNT) throw new Error('FIREBASE_SERVICE_ACCOUNT সেট করা নেই');
+    admin = require('firebase-admin'); // দেরিতে লোড — না লাগলে মেমরি খরচ হয় না
+    const cred = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    const appName = 'shop-order';
+    const existing = admin.apps.find(a => a && a.name === appName);
+    const app = existing || admin.initializeApp({ credential: admin.credential.cert(cred) }, appName);
+    db = app.firestore();
+    return true;
+  } catch (e) {
+    initError = e.message;
+    console.error('[shopOrder] চালু হয়নি (বাকি সার্ভার ঠিক আছে):', e.message);
+    return false;
+  }
+}
+
+const router = express.Router();
+
+// শুধু নিজের সাইটের ঠিকানা থেকে আসা ব্রাউজার অনুরোধ নেবে (অর্ডার-সার্ভারের আগের নিয়ম)
+router.use(['/api/place-order', '/api/chat-ai'], (req, res, next) => {
+  const o = req.headers.origin;
+  if (o && !ALLOWED.includes(o)) return res.status(403).json({ error: 'এই ঠিকানা থেকে অনুমতি নেই' });
+  next();
+});
+
+const hits = new Map();
+function rateLimit(key, max, windowMs) {
+  const now = Date.now(), arr = (hits.get(key) || []).filter(t => now - t < windowMs);
+  if (arr.length >= max) { hits.set(key, arr); return false; }
+  arr.push(now); hits.set(key, arr); return true;
+}
+setInterval(() => { const now = Date.now(); for (const [k, v] of hits) if (!v.some(t => now - t < 3600e3)) hits.delete(k); }, 600e3).unref();
+
+async function authMw(req, res, next) {
+  if (!init()) return res.status(503).json({ error: 'অর্ডার সার্ভার এখনো চালু হয়নি' });
+  const h = String(req.headers.authorization || '');
+  if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'সাইন-ইন প্রয়োজন' });
+  try { req.user = await admin.auth(admin.app('shop-order')).verifyIdToken(h.slice(7)); next(); }
+  catch (e) { res.status(401).json({ error: 'সাইন-ইন মেয়াদ শেষ — পেজ রিফ্রেশ করুন' }); }
+}
+async function loadSettings() {
+  const snap = await db.doc(`${ROOT}/parts/settings`).get();
+  if (!snap.exists) return {};
+  try { return JSON.parse(snap.data().json).settings || {}; } catch (e) { return {}; }
+}
+function bdDate() { return new Date(Date.now() + 6 * 3600e3).toISOString().slice(0, 10); }
+
+router.get('/api/shop-health', (req, res) => res.json({ ok: init(), error: initError || undefined }));
+
+router.post('/api/place-order', authMw, async (req, res) => {
+  const uid = req.user.uid;
+  if (!rateLimit('order:' + uid, 6, 3600e3) || !rateLimit('orderip:' + req.ip, 20, 3600e3)) return res.status(429).json({ error: 'অনেকবার চেষ্টা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন' });
+  try {
+    const input = req.body || {};
+    const settings = await loadSettings();
+    const phone = String(input.phone || '').replace(/[\s-]/g, '');
+    if (phone) {
+      const q = await db.collection(`${ROOT}/orders`).where('phone', '==', phone).limit(30).get();
+      const pending = q.docs.filter(d => d.data().status === 'pending').length;
+      if (pending >= 5) throw new UserError('এই নম্বরে ইতিমধ্যে অনেকগুলো অর্ডার অপেক্ষায় আছে — আমাদের সাথে যোগাযোগ করুন');
+    }
+    const result = await db.runTransaction(async tx => {
+      const counterRef = db.doc(`${ROOT}/counters/orderCounter`);
+      const counterSnap = await tx.get(counterRef);
+      const ids = [...new Set((Array.isArray(input.items) ? input.items : []).map(i => String((i && i.pid) || '')))].filter(id => id && id.indexOf('/') < 0).slice(0, 30);
+      const snaps = await Promise.all(ids.map(id => tx.get(db.doc(`${ROOT}/products/${id}`))));
+      const pmap = {}; snaps.forEach(s => { if (s.exists) pmap[s.id] = s.data(); });
+      const calc = computeOrder(settings, pmap, input);
+      const next = counterSnap.exists ? counterSnap.data().next : 1001;
+      const orderId = 'ORD-' + next;
+      const order = {
+        id: orderId, ownerUid: uid, ownerEmail: req.user.email || '',
+        customer: calc.name, phone: calc.phone, address: calc.address, items: calc.items,
+        subtotal: calc.subtotal, discount: calc.discount, tax: calc.tax, shipping: calc.shipping, total: calc.total,
+        district: calc.district, upazila: calc.upazila, shippingBase: calc.shippingBase, prepayDiscount: calc.prepayDiscount,
+        status: 'pending', payment: calc.payment, paymentStatus: 'unpaid', transactionId: calc.transactionId,
+        paymentPlanPercent: calc.paymentPlanPercent, advanceAmount: calc.advanceAmount, dueAmount: calc.dueAmount,
+        courier: 'নির্ধারণ করা হয়নি', date: bdDate(), source: 'server'
+      };
+      tx.set(db.doc(`${ROOT}/orders/${orderId}`), Object.assign({}, order, { createdAt: admin.firestore.FieldValue.serverTimestamp() }));
+      tx.set(counterRef, { next: next + 1 });
+      calc.stockUpdates.forEach(u => tx.update(db.doc(`${ROOT}/products/${u.pid}`), u.variants ? { stock: u.newStock, variants: u.variants } : { stock: u.newStock }));
+      return { orderId, total: calc.total, order };
+    });
+    res.json(result);
+  } catch (e) {
+    if (e instanceof UserError) return res.status(400).json({ error: e.userMessage });
+    console.error('place-order error:', e);
+    res.status(500).json({ error: 'সার্ভারে সমস্যা হয়েছে — আবার চেষ্টা করুন' });
+  }
+});
+
+router.post('/api/chat-ai', authMw, async (req, res) => {
+  if (!AI_WEBHOOK_URL) return res.status(503).json({ error: 'AI চালু নেই' });
+  if (!rateLimit('ai:' + req.user.uid, 12, 60e3)) return res.status(429).json({ error: 'একটু ধীরে মেসেজ দিন' });
+  const b = req.body || {};
+  const message = String(b.message || '').slice(0, 1000);
+  if (!message) return res.status(400).json({ error: 'মেসেজ খালি' });
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (AI_WEBHOOK_SECRET) headers['X-Secret'] = AI_WEBHOOK_SECRET;
+    const r = await fetch(AI_WEBHOOK_URL, { method: 'POST', headers,
+      body: JSON.stringify({ message, customerName: String(b.customerName || '').slice(0, 80), customerEmail: req.user.email || '', history: Array.isArray(b.history) ? b.history.slice(-20) : [] }) });
+    if (!r.ok) return res.status(502).json({ error: 'AI উত্তর দেয়নি' });
+    const ct = r.headers.get('content-type') || '';
+    let reply = '';
+    if (ct.includes('application/json')) { const d = await r.json(); reply = (d && (d.reply || d.text || d.answer || d.message)) || ''; }
+    else reply = await r.text();
+    res.json({ reply: String(reply).slice(0, 2000) });
+  } catch (e) { console.error('chat-ai error:', e.message); res.status(502).json({ error: 'AI-র সাথে সংযোগ হয়নি' }); }
+});
+
+module.exports = router;
