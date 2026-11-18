@@ -153,6 +153,10 @@ app.get('/media/:id', async (req, res) => {
   }
 });
 
+// ওয়েবসাইটের সুরক্ষিত অর্ডার/AI-চ্যাট (Firebase লগইনে চলে, SmartBiz লগইনে নয়) — তাই এটা নিচের requireAuth-এর আগে।
+// try/catch: এই অংশে যা-ই হোক, বাকি সার্ভার চালু থাকবে।
+try { app.use(require('./routes/shopOrder')); } catch (e) { console.error('[shopOrder] লোড হয়নি, বাদ দিয়ে চলছে:', e.message); }
+
 // বাকি সব /api রুট — বৈধ লগইন টোকেন ছাড়া কেউ ডেটা দেখতে বা কিছু পরিবর্তন করতে পারবে না
 app.use('/api', requireAuth, apiRoutes);
 
