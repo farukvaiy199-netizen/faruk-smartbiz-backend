@@ -9,7 +9,13 @@ const ROOT = process.env.FIRESTORE_ROOT || 'bazaar_store/khanglobalshop_main';
 const LOCAL_AI = 'http://127.0.0.1:' + (process.env.PORT || 10000) + '/webhook/ai-reply';
 const AI_WEBHOOK_URL = process.env.AI_WEBHOOK_URL || LOCAL_AI;
 const AI_WEBHOOK_SECRET = process.env.AI_WEBHOOK_SECRET || '';
-const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://farukvaiy199-netizen.github.io').split(',').map(s => s.trim()).filter(Boolean);
+// অনুমোদিত সাইটের ঠিকানা: Render-এর ALLOWED_ORIGINS + বর্তমান GitHub ঠিকানা + কেনা ডোমেন (ডোমেন চালু হলে বা মেয়াদ শেষ হলেও আলাদা কিছু বদলাতে হবে না)
+const ALLOWED = Array.from(new Set(
+  (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean)
+    .concat(['https://farukvaiy199-netizen.github.io', 'https://khanglobalshop.com', 'https://www.khanglobalshop.com'])
+));
+const ADMIN_UIDS = (process.env.ADMIN_UIDS || 'sJYwLDzg6TNj89EIvnMSJVDF0oT2').split(',').map(x => x.trim()).filter(Boolean);
+const PHONE_DOMAIN = '@phone.khanglobalshop.com';
 
 let admin = null, db = null, initError = '';
 function init() {
@@ -34,7 +40,7 @@ function init() {
 const router = express.Router();
 
 // শুধু নিজের সাইটের ঠিকানা থেকে আসা ব্রাউজার অনুরোধ নেবে (অর্ডার-সার্ভারের আগের নিয়ম)
-router.use(['/api/place-order', '/api/chat-ai'], (req, res, next) => {
+router.use(['/api/place-order', '/api/chat-ai', '/api/admin/reset-password'], (req, res, next) => {
   const o = req.headers.origin;
   if (o && !ALLOWED.includes(o)) return res.status(403).json({ error: 'এই ঠিকানা থেকে অনুমতি নেই' });
   next();
@@ -127,4 +133,28 @@ router.post('/api/chat-ai', authMw, async (req, res) => {
   } catch (e) { console.error('chat-ai error:', e.message); res.status(502).json({ error: 'AI-র সাথে সংযোগ হয়নি' }); }
 });
 
+// অ্যাডমিন প্যানেল থেকে: নম্বর-অ্যাকাউন্টের কাস্টমার পাসওয়ার্ড ভুলে গেলে নতুন পাসওয়ার্ড দেওয়া (শুধু অ্যাডমিনের UID পারবে)
+router.post('/api/admin/reset-password', authMw, async (req, res) => {
+  if (!ADMIN_UIDS.includes(req.user.uid)) return res.status(403).json({ error: 'শুধু অ্যাডমিন পারবেন' });
+  if (!rateLimit('reset:' + req.user.uid, 20, 3600e3)) return res.status(429).json({ error: 'অনেকবার চেষ্টা হয়েছে' });
+  try {
+    const auth = admin.auth(admin.app('shop-order'));
+    const uid = String((req.body && req.body.uid) || '');
+    if (!uid) return res.status(400).json({ error: 'কাস্টমার বাছা হয়নি' });
+    const user = await auth.getUser(uid);
+    if (!String(user.email || '').endsWith(PHONE_DOMAIN)) return res.status(403).json({ error: 'শুধু নম্বর-অ্যাকাউন্টের পাসওয়ার্ড বদলানো যায়' });
+    let pass = String((req.body && req.body.password) || '');
+    if (!pass) { const abc = 'abcdefghjkmnpqrstuvwxyz23456789'; pass = Array.from(require('crypto').randomBytes(8)).map(b => abc[b % abc.length]).join(''); }
+    if (pass.length < 6 || pass.length > 64) return res.status(400).json({ error: 'পাসওয়ার্ড ৬-৬৪ অক্ষরের হতে হবে' });
+    await auth.updateUser(uid, { password: pass });
+    await auth.revokeRefreshTokens(uid);
+    res.json({ ok: true, password: pass });
+  } catch (e) { console.error('reset-password error:', e.message); res.status(500).json({ error: 'পাসওয়ার্ড বদলানো যায়নি' }); }
+});
+
 module.exports = router;
+module.exports.helpers = {
+  init, ROOT, initError: () => initError,
+  getDb: () => db,
+  getAuth: () => admin.auth(admin.app('shop-order'))
+};
