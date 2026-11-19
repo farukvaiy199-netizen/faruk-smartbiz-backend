@@ -16,6 +16,14 @@ const app = express();
 // Render একটা প্রক্সির পেছনে চলে (X-Forwarded-For হেডার আসে) — এটা বলে না দিলে
 // express-rate-limit সব রিকোয়েস্টকে ভুল করে একই ব্যবহারকারীর ধরে নিয়ে সবাইকে ব্লক করে দেয়।
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
+// সাধারণ নিরাপত্তা হেডার
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.set('X-Frame-Options', 'SAMEORIGIN');
+  next();
+});
 app.use(cors());
 // ডিফল্ট সীমা মাত্র ১০০KB — মালিকের আপলোড করা ছবি (ডেটা হিসেবে) এর চেয়ে বড় হয়, তাই ২MB করা হলো
 // rawBody রাখা হয় Meta-র সই যাচাই করার জন্য (সই মূল রিকোয়েস্ট বডির উপর হিসেব হয়)
@@ -61,7 +69,12 @@ app.get('/terms', (req, res) => res.send(legalPage('Terms of Service', `
 app.get('/api/ping', (req, res) => res.json({ ok: true }));
 
 // লগইন রুট — টোকেন ছাড়াই অ্যাক্সেসযোগ্য
-app.use('/api/auth', authRoutes);
+// পাসওয়ার্ড অনুমান করে ঢোকা ঠেকাতে: একই IP থেকে ১৫ মিনিটে ১০টার বেশি ব্যর্থ চেষ্টা হলে আটকে দেবে (সফল অনুরোধ গোনা হয় না)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10, skipSuccessfulRequests: true, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'অনেকবার ভুল চেষ্টা হয়েছে — ১৫ মিনিট পরে আবার চেষ্টা করুন' }
+});
+app.use('/api/auth', authLimiter, authRoutes);
 
 // কেউ ইচ্ছাকৃতভাবে স্প্যাম করে AI কোটা/বিল দ্রুত শেষ করে দিতে না পারে, তাই ওয়েবহুকে সীমা —
 // প্রতি IP থেকে মিনিটে সর্বোচ্চ ২০টা রিকোয়েস্ট। সাধারণ ব্যবহারে এটা কখনো ধরা পড়বে না।
