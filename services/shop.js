@@ -3,6 +3,7 @@
 //       ৩) ওয়েবসাইট চ্যাটে নতুন মেসেজ এলে মালিককে জানানো  ৪) অ্যাপের "ই-কমার্স" পেজের জন্য সারাংশ।
 // প্রোডাক্ট পড়তে কোনো অ্যাকাউন্ট লাগে না (পাবলিক)। অর্ডার/চ্যাট পড়তে অ্যাডমিন প্যানেলের "অটোমেশন API" পেজে বানানো বট ইউজার লাগে (ঐচ্ছিক)।
 const axios = require('axios');
+const delivery = require('./delivery');
 const store = require('./store');
 const { notifyOwner } = require('./notify');
 const config = require('../config');
@@ -219,6 +220,15 @@ async function usesWebsiteProducts() {
   } catch (e) { return false; }
 }
 
+// ডেলিভারি/COD নিয়ম (লাইভ, ১ মিনিটের ক্যাশ)। সংযুক্ত না থাকলে বা সেটিংস না পড়া গেলে null — তখন পাহারা বসে না।
+async function getDeliveryRules() {
+  try {
+    const { cfg, snap: sn } = await getSnapshot();
+    if (!cfg.connected || !sn || !sn.settings || !Object.keys(sn.settings).length) return null;
+    return delivery.fromSettings(sn.settings);
+  } catch (e) { return null; }
+}
+
 async function getAiContext(message) {
   try {
     const { cfg, snap: s } = await getSnapshot();
@@ -265,6 +275,7 @@ async function getAiContext(message) {
       if (st.announce) offers.push('ঘোষণা: ' + String(st.announce).slice(0, 200));
       if (offers.length) txt += 'চলমান অফার:\n' + offers.map(o => '- ' + o).join('\n') + '\n';
     }
+    if (s.settings && Object.keys(s.settings).length) txt += delivery.promptText(delivery.fromSettings(s.settings), site);
     txt += `
 === ছবি ও লিংক (ওয়েবসাইটের প্রোডাক্ট) ===
 - কাস্টমার কোনো প্রোডাক্টের ছবি দেখতে চাইলে (বা প্রোডাক্ট দেখানোর সময় ছবি দিলে ভালো হয়) সেই প্রোডাক্টের [ID] থেকে হুবহু ID "shopProductId"-তে বসাবে। ছবি সিস্টেম নিজেই পাঠিয়ে দেবে — তুমি ছবির লিংক বানাবে না, "imageUrl" ও "imageId" null রাখবে। ছবি পাঠানো না গেলে সিস্টেম কিছু করবে না, তাই reply-তে সবসময় প্রোডাক্টের লিংকও দেবে।
@@ -541,4 +552,4 @@ async function categoryNames() {
   return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
 }
 
-module.exports = { addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+module.exports = { getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
