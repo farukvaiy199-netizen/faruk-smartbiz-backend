@@ -14,6 +14,7 @@ const { notifyOwner } = require('../services/notify');
 const { sendInstagramMessage, sendInstagramImage, getInstagramProfile } = require('../services/instagram');
 const crypto = require('crypto');
 const shop = require('../services/shop');
+const delivery = require('../services/delivery');
 const assistant = require('../services/assistant');
 const { summarizeCustomerMemory } = require('../services/ai');
 const comments = require('../services/comments');
@@ -612,6 +613,20 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       return;
     }
 
+    // ওয়েবসাইটের লাইভ ডেলিভারি/COD নিয়ম মেনে চলছে কিনা সার্ভারে আবার যাচাই (AI ভুল করলেও নিয়মবিরুদ্ধ অর্ডার ঢুকবে না)
+    try {
+      const rules = await shop.getDeliveryRules();
+      if (rules) {
+        const chk = delivery.checkChatOrder(rules, order);
+        if (!chk.ok) {
+          await store.appendMessage(customer.id, 'assistant', chk.message);
+          await send(chk.message);
+          return;
+        }
+        order.district = chk.district; order.payment = chk.payment; order.transactionId = chk.transactionId; order.shipping = chk.shipping;
+      }
+    } catch (err) { console.error('ডেলিভারি নিয়ম যাচাই করা যায়নি (অর্ডার আগের মতো চলছে):', err.message); }
+
     const wantQty = Number(order.qty) || 1;
 
     // স্টক: আগে অ্যাপের স্টক পেজের সংখ্যা দেখি; সেখানে না থাকলে শিটের Stock কলাম
@@ -653,7 +668,8 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
         qty: wantQty,
         price: order.price || 0,
         source: platform === 'email' ? 'Email' : platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : platform === 'tiktok' ? 'TikTok' : 'WhatsApp',
-        stockItem: reservedStock ? reservedStock.name : ''
+        stockItem: reservedStock ? reservedStock.name : '',
+        district: order.district || '', payment: order.payment || '', transactionId: order.transactionId || '', shipping: order.shipping || 0
       });
     } catch (err) {
       // অর্ডার সেভ না হলে আটকে রাখা স্টক ফেরত দিই
