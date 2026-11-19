@@ -5,7 +5,9 @@ const express = require('express');
 const { computeOrder, UserError } = require('../services/pricing');
 
 const ROOT = process.env.FIRESTORE_ROOT || 'bazaar_store/khanglobalshop_main';
-const AI_WEBHOOK_URL = process.env.AI_WEBHOOK_URL || '';
+// AI_WEBHOOK_URL দেওয়া না থাকলে এই সার্ভারের নিজের /webhook/ai-reply-ই ব্যবহার হবে (আগে সাইট সরাসরি এটাকেই ডাকত)
+const LOCAL_AI = 'http://127.0.0.1:' + (process.env.PORT || 10000) + '/webhook/ai-reply';
+const AI_WEBHOOK_URL = process.env.AI_WEBHOOK_URL || LOCAL_AI;
 const AI_WEBHOOK_SECRET = process.env.AI_WEBHOOK_SECRET || '';
 const ALLOWED = (process.env.ALLOWED_ORIGINS || 'https://farukvaiy199-netizen.github.io').split(',').map(s => s.trim()).filter(Boolean);
 
@@ -106,7 +108,6 @@ router.post('/api/place-order', authMw, async (req, res) => {
 });
 
 router.post('/api/chat-ai', authMw, async (req, res) => {
-  if (!AI_WEBHOOK_URL) return res.status(503).json({ error: 'AI চালু নেই' });
   if (!rateLimit('ai:' + req.user.uid, 12, 60e3)) return res.status(429).json({ error: 'একটু ধীরে মেসেজ দিন' });
   const b = req.body || {};
   const message = String(b.message || '').slice(0, 1000);
@@ -114,6 +115,7 @@ router.post('/api/chat-ai', authMw, async (req, res) => {
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (AI_WEBHOOK_SECRET) headers['X-Secret'] = AI_WEBHOOK_SECRET;
+    if (AI_WEBHOOK_URL === LOCAL_AI) headers['X-Forwarded-For'] = String(req.ip || '1.1.1.1'); // ওয়েবহুকের IP-সীমা প্রতিজন কাস্টমারের আলাদা ধরার জন্য
     const r = await fetch(AI_WEBHOOK_URL, { method: 'POST', headers,
       body: JSON.stringify({ message, customerName: String(b.customerName || '').slice(0, 80), customerEmail: req.user.email || '', history: Array.isArray(b.history) ? b.history.slice(-20) : [] }) });
     if (!r.ok) return res.status(502).json({ error: 'AI উত্তর দেয়নি' });
