@@ -227,7 +227,7 @@ async function nextOrderId() {
   return nextOrderIdFrom(await getDb());
 }
 
-async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem }) {
+async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping }) {
   const db = await getDb();
   const id = await nextOrderId();
   const order = {
@@ -239,6 +239,7 @@ async function createOrder({ customerId, name, phone, address, product, qty, pri
     status: 'Pending', source,
     callStatus: '', callNote: '', callAt: '', remindAt: '', callAttempts: 0, fsSynced: false,
     stockItem: stockItem || '', stockRestored: false,
+    district: district || '', payment: payment || '', transactionId: transactionId || '', shipping: Number(shipping) || 0,
     createdAt: new Date().toISOString()
   };
   await db.collection('orders').insertOne(order);
