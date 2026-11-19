@@ -145,10 +145,10 @@ function buildFsOrder(o, extra = {}) {
     id: o.id, ownerUid: '', ownerEmail: o.email || '',
     customer: o.name || 'গ্রাহক', phone: String(o.phone || ''), address: o.address || '',
     items: [{ pid: 'smartbiz-chat', name: o.product || 'পণ্য', qty, price }],
-    subtotal: total, discount: 0, tax: 0, shipping: 0, total,
-    district: '', upazila: '', shippingBase: 0, prepayDiscount: 0,
+    subtotal: total, discount: 0, tax: 0, shipping: Number(o.shipping) || 0, total: total + (Number(o.shipping) || 0),
+    district: o.district || '', upazila: '', shippingBase: Number(o.shipping) || 0, prepayDiscount: 0,
     status: 'processing', payment: o.payment || 'cod', paymentStatus: 'unpaid', transactionId: o.transactionId || '',
-    advanceAmount: 0, dueAmount: total, courier: NO_COURIER, date: bdDate(created),
+    advanceAmount: 0, dueAmount: total + (Number(o.shipping) || 0), courier: NO_COURIER, date: bdDate(created),
     createdAt: { __timestamp: created.toISOString() },
     source: 'smartbiz', sourceChannel: o.source || '', smartbizId: o.id,
     stockRestored: true, // চ্যাট-অর্ডারের স্টক SmartBiz-এ আলাদা, তাই অ্যাডমিন প্যানেল যেন স্টক না ছোঁয়
