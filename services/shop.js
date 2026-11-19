@@ -11,7 +11,7 @@ const config = require('../config');
 const DEFAULT_ROOT = 'bazaar_store/khanglobalshop_main';
 const DEFAULT_SITE = 'https://farukvaiy199-netizen.github.io/khanglobalshop/';
 // ছবি ছাড়া হালকা ফিল্ড — প্রোডাক্টের ছবি অনেক সময় ডেটাবেসের ভেতরে বড় base64 হয়ে থাকে, তাই প্রতি মিনিটে সেটা টানা হয় না
-const LIGHT_FIELDS = ['name', 'category', 'price', 'oldPrice', 'stock', 'sku', 'desc', 'status', 'emoji'];
+const LIGHT_FIELDS = ['name', 'category', 'price', 'oldPrice', 'stock', 'sku', 'desc', 'status', 'emoji', 'variants', 'variantLabel'];
 const CACHE_MS = 60 * 1000; // AI রিপ্লাইয়ের সময় সর্বোচ্চ ১ মিনিটের পুরনো তথ্য — মানে প্রায় "লাইভ"
 
 function defaults() {
@@ -149,7 +149,11 @@ function normProduct(p) {
     stock: toNum(p.stock),
     sku: String(p.sku || ''),
     desc: String(p.desc || '').replace(/\s+/g, ' ').trim().slice(0, 160),
-    status: String(p.status || 'active')
+    status: String(p.status || 'active'),
+    variantLabel: String(p.variantLabel || 'অপশন'),
+    variants: (Array.isArray(p.variants) ? p.variants : []).filter(v => v && v.id).map(v => ({
+      id: String(v.id), name: String(v.name || '').trim(), price: toNum(v.price), oldPrice: toNum(v.oldPrice), stock: toNum(v.stock)
+    }))
   };
 }
 
@@ -220,6 +224,40 @@ async function usesWebsiteProducts() {
   } catch (e) { return false; }
 }
 
+/* ---------- চ্যাট-অর্ডারের দাম ওয়েবসাইট থেকে যাচাই ---------- */
+const nrm = x => String(x || '').toLowerCase().replace(/[\s\-_.,()]+/g, '');
+const bn2en = x => String(x || '').replace(/[০-৯]/g, d => '০১২৩৪৫৬৭৮৯'.indexOf(d));
+// order: { productId, product, variant } → { ok, product, variant, unitPrice, label } বা { ok:false, message }
+async function resolveOrderItem(order) {
+  try {
+    const { cfg, snap: sn } = await getSnapshot();
+    if (!cfg.connected || !sn || !sn.products.length) return null; // ওয়েবসাইট না পড়া গেলে পাহারা বসে না
+    const act = activeProducts(sn.products);
+    let p = order.productId ? act.find(x => x.id === String(order.productId).trim()) : null;
+    if (!p) { // ID না পেলে নাম মিলিয়ে দেখি (ঠিক একটাই মিললে)
+      const nm = nrm(bn2en(order.product));
+      if (nm) {
+        const hits = act.filter(x => { const a = nrm(bn2en(x.name)); return a && (nm.includes(a) || a.includes(nm)); });
+        if (hits.length === 1) p = hits[0];
+      }
+    }
+    if (!p) return { ok: false, message: 'আপনি ঠিক কোন প্রোডাক্টটা নিতে চান? আমাদের ওয়েবসাইটের তালিকা থেকে প্রোডাক্টের নাম জানাবেন।' };
+    let v = null, unit = p.price, label = p.name;
+    if (p.variants.length) {
+      const want = nrm(bn2en(order.variant || order.product));
+      const hits = p.variants.filter(x => { const a = nrm(bn2en(x.name)); return a && want.includes(a); });
+      v = hits.length === 1 ? hits[0] : (p.variants.length === 1 ? p.variants[0] : null);
+      if (!v) return { ok: false, message: `"${p.name}" কোন ${p.variantLabel}-এ নেবেন? ` + p.variants.map(x => `${x.name} (৳${x.price})`).join(', ') };
+      if (v.stock !== null && v.stock <= 0) return { ok: false, message: `দুঃখিত, "${p.name}" (${v.name}) এখন স্টকে নেই। অন্য ${p.variantLabel} বেছে নেবেন?` };
+      unit = v.price; label = `${p.name} (${v.name})`;
+    } else if (p.stock !== null && p.stock <= 0) {
+      return { ok: false, message: `দুঃখিত, "${p.name}" এখন স্টকে নেই।` };
+    }
+    if (unit === null || !(unit > 0)) return null;
+    return { ok: true, product: p, variant: v, unitPrice: unit, label };
+  } catch (e) { return null; }
+}
+
 // ডেলিভারি/COD নিয়ম (লাইভ, ১ মিনিটের ক্যাশ)। সংযুক্ত না থাকলে বা সেটিংস না পড়া গেলে null — তখন পাহারা বসে না।
 async function getDeliveryRules() {
   try {
@@ -235,7 +273,7 @@ async function getAiContext(message) {
     if (!s) return '';
     const site = siteUrl(cfg);
     let txt = '\n=== ই-কমার্স ওয়েবসাইটের লাইভ তথ্য (অ্যাডমিন প্যানেল থেকে) ===\n' +
-      'প্রোডাক্ট, দাম, স্টক ও অফারের জন্য এই অংশটাই একমাত্র নির্ভরযোগ্য উৎস। শিটে বা আগের কথোপকথনে অন্য কোনো প্রোডাক্ট-তালিকা থাকলে সেটা পুরনো ধরে নেবে — এই তালিকার সাথে না মিললে এই তালিকাই ঠিক।\n' +
+      'প্রোডাক্ট, দাম, স্টক ও অফারের জন্য এই অংশটাই একমাত্র নির্ভরযোগ্য উৎস। দাম ও ডেলিভারি/পেমেন্ট নিয়মে ওয়েবসাইটই চূড়ান্ত — মালিকের পুরনো নির্দেশনা, শিট, স্টক তালিকা বা কাস্টমারের স্মৃতিতে অন্য দাম থাকলে সেটা ভুল/পুরনো, কখনোই বলবে না। যে প্রোডাক্টের অপশন (ওজন/সাইজ) আছে, সেখানে কাস্টমারকে অপশন বেছে নিতে বলবে এবং সেই অপশনের দামই বলবে।  শিটে বা আগের কথোপকথনে অন্য কোনো প্রোডাক্ট-তালিকা থাকলে সেটা পুরনো ধরে নেবে — এই তালিকার সাথে না মিললে এই তালিকাই ঠিক।\n' +
       `ওয়েবসাইট: ${site}\n`;
     if (cfg.show.products) {
       const act = activeProducts(s.products);
@@ -256,7 +294,9 @@ async function getAiContext(message) {
       txt += list.length
         ? list.map(p => {
             const parts = [`[ID: ${p.id}]`, p.name];
-            if (p.price !== null) parts.push('৳' + p.price + (p.oldPrice && p.oldPrice > p.price ? ` (আগে ৳${p.oldPrice})` : ''));
+            if (p.variants && p.variants.length) {
+              parts.push(`${p.variantLabel} অনুযায়ী দাম আলাদা — ` + p.variants.map(v => `${v.name}: ৳${v.price}` + (v.oldPrice && v.oldPrice > v.price ? ` (আগে ৳${v.oldPrice})` : '') + (v.stock !== null && v.stock <= 0 ? ' [স্টক শেষ]' : '')).join(', '));
+            } else if (p.price !== null) parts.push('৳' + p.price + (p.oldPrice && p.oldPrice > p.price ? ` (আগে ৳${p.oldPrice})` : ''));
             if (p.category) parts.push(p.category);
             const st = stockText(p, cfg); if (st) parts.push(st);
             if (p.desc) parts.push(p.desc);
@@ -552,4 +592,4 @@ async function categoryNames() {
   return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
 }
 
-module.exports = { getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+module.exports = { resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
