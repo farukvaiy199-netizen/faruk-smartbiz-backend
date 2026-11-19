@@ -21,7 +21,8 @@ const comments = require('../services/comments');
 const telegram = require('../services/telegram');
 const tiktok = require('../services/tiktok');
 
-const businessInfo = `ডেলিভারি চার্জ: ৳৭০ (ঢাকা), ৳১৩০ (ঢাকার বাইরে)। কাজের সময়: সকাল ৯টা - রাত ১০টা।`;
+// ডেলিভারি চার্জ/COD নিয়ম এখানে লেখা নেই — ওয়েবসাইটের সেটিংস থেকে লাইভ আসে (shop.getAiContext)
+const businessInfo = `কাজের সময়: সকাল ৯টা - রাত ১০টা। ডেলিভারি চার্জ ও পেমেন্টের নিয়ম শুধু ওয়েবসাইটের তথ্য অনুযায়ী বলবে।`;
 
 // ওয়েবসাইট সংযুক্ত থাকলে প্রোডাক্টের তালিকা ওয়েবসাইট থেকেই আসে (শিটের পুরনো তালিকা নয়); শিটের FAQ আগের মতোই কাজ করে
 async function getSheetCtx(settings, text) {
@@ -50,8 +51,20 @@ function pickCapableKey(settings, capableCheck) {
 }
 
 function buildConfirmationText(order) {
-  const total = (order.price || 0) * (order.qty || 1);
-  return `✅ আপনার অর্ডারটি কনফার্ম হয়েছে!\n\nঅর্ডার আইডি: ${order.id}\nপ্রোডাক্ট: ${order.product} x${order.qty}\nমোট মূল্য: ৳${total}\nঠিকানা: ${order.address || ''}\n\nধন্যবাদ আমাদের সাথে থাকার জন্য! 🙏`;
+  const sub = (order.price || 0) * (order.qty || 1);
+  const ship = Number(order.shipping) || 0;
+  const payLabel = order.payment === 'bkash' ? 'বিকাশ (অগ্রিম)' : order.payment === 'nagad' ? 'নগদ (অগ্রিম)' : order.payment === 'cod' ? 'ক্যাশ অন ডেলিভারি' : '';
+  const lines = [
+    '✅ আপনার অর্ডারটি কনফার্ম হয়েছে!', '',
+    `অর্ডার আইডি: ${order.id}`,
+    `প্রোডাক্ট: ${order.product} x${order.qty}`,
+    `পণ্যের দাম: ৳${sub}`
+  ];
+  if (ship || order.payment) lines.push(`ডেলিভারি চার্জ: ৳${ship}`, `মোট পরিশোধযোগ্য: ৳${sub + ship}`);
+  if (payLabel) lines.push(`পেমেন্ট: ${payLabel}`);
+  if (order.district) lines.push(`জেলা: ${order.district}`);
+  lines.push(`ঠিকানা: ${order.address || ''}`, '', 'ধন্যবাদ আমাদের সাথে থাকার জন্য! 🙏');
+  return lines.join('\n');
 }
 
 // নোটিফিকেশনে কাস্টমারের নাম দেখানোর জন্য — নাম জানা না থাকলে প্ল্যাটফর্ম + আইডির শেষ ৪ অক্ষর
@@ -613,6 +626,21 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       return;
     }
 
+    // দাম/প্রোডাক্ট/অপশন ওয়েবসাইট থেকে যাচাই — AI ভুল দাম বললেও সার্ভার ওয়েবসাইটের আসল দামই বসায়
+    try {
+      const item = await shop.resolveOrderItem(order);
+      if (item) {
+        if (!item.ok) {
+          await store.appendMessage(customer.id, 'assistant', item.message);
+          await send(item.message);
+          return;
+        }
+        if (Number(order.price) !== item.unitPrice) console.warn(`AI-র দাম ৳${order.price} ছিল, ওয়েবসাইটের দাম ৳${item.unitPrice} — ঠিক করা হলো`);
+        order.stockProduct = order.product; // অ্যাপের স্টক পেজে খোঁজার জন্য AI-র দেওয়া নামটা আলাদা রাখি
+        order.price = item.unitPrice; order.product = item.label;
+      }
+    } catch (err) { console.error('ওয়েবসাইট থেকে দাম যাচাই করা যায়নি:', err.message); }
+
     // ওয়েবসাইটের লাইভ ডেলিভারি/COD নিয়ম মেনে চলছে কিনা সার্ভারে আবার যাচাই (AI ভুল করলেও নিয়মবিরুদ্ধ অর্ডার ঢুকবে না)
     try {
       const rules = await shop.getDeliveryRules();
@@ -630,7 +658,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     const wantQty = Number(order.qty) || 1;
 
     // স্টক: আগে অ্যাপের স্টক পেজের সংখ্যা দেখি; সেখানে না থাকলে শিটের Stock কলাম
-    const stockEntry = await store.findStockEntry(order.product);
+    const stockEntry = await store.findStockEntry(order.stockProduct || order.product);
     let reservedStock = null;
     if (stockEntry) {
       const dec = await store.decrementStock(stockEntry.name, wantQty);
