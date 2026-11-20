@@ -2,6 +2,7 @@
 // প্রতিটা নতুন deploy-তে সেই ফাইল মুছে যায় (ephemeral disk), ফলে ডেটা হারিয়ে যাচ্ছিল।
 // এখন সবকিছু MongoDB-তে স্থায়ীভাবে সেভ হয় — redeploy হলেও আর হারাবে না।
 
+const orderSheet = require('./orderSheet');
 const { MongoClient } = require('mongodb');
 const config = require('../config');
 
@@ -223,13 +224,25 @@ async function nextOrderIdFrom(db) {
   return 'ORD-' + String(1000 + seq).padStart(6, '0');
 }
 
+async function nextSeq(db) {
+  const r = await db.collection('counters').findOneAndUpdate({ _id: 'orderSeq' }, { $inc: { value: 1 } }, { upsert: true, returnDocument: 'after' });
+  const doc = (r && typeof r.value === 'object' && r.value !== null) ? r.value : r;
+  return (doc && Number(doc.value)) || 1;
+}
+
 async function nextOrderId() {
   return nextOrderIdFrom(await getDb());
 }
 
 async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping }) {
   const db = await getDb();
-  const id = await nextOrderId();
+  // আইডি আসে মালিকের অর্ডার-শিট থেকে (প্রথম ফাঁকা ঘর); শিট চালু না থাকলে আগের নিয়মে
+  let id = null;
+  if (orderSheet.enabled()) {
+    const q = Number(qty) || 1, pr = Number(price) || 0, sh = Number(shipping) || 0;
+    id = await orderSheet.claim({ name, phone, address, district, product, qty: q, price: pr, shipping: sh, total: pr * q + sh, payment, transactionId, source: source || 'Chat', status: 'Pending' });
+    if (!id) id = 'ORD-E' + (1000 + (await nextSeq(db))); // শিট না পেলে আলাদা চিহ্নের আইডি — যাতে শিটের আইডির সাথে না মেশে
+  } else id = await nextOrderId();
   const order = {
     id, customerId, name,
     phone: phone || '',
@@ -322,6 +335,7 @@ async function updateOrderStatus(id, status) {
   const db = await getDb();
   const col = db.collection('orders');
   await col.updateOne({ id }, { $set: { status } });
+  orderSheet.setStatus(id, status);
   return stripId(await col.findOne({ id }));
 }
 
