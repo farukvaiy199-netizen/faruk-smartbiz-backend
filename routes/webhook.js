@@ -565,6 +565,17 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const orderLine = pastOrders.slice(0, 3).map(o => `অর্ডার আইডি ${o.id}: ${o.product} ×${o.qty} (${o.status})`).join('; ');
   const customerMemory = [memory, orderLine ? 'আগের অর্ডার: ' + orderLine : ''].filter(Boolean).join('\n');
 
+  // "অর্ডার আইডি/নম্বর কত" — AI-কে জিজ্ঞেস না করে সরাসরি আসল তথ্য থেকে উত্তর
+  if (/অর্ডার\s*(আইডি|নং|নম্বর|নাম্বার|ID)|order\s*(id|no|number)/i.test(String(text || ''))) {
+    const last = pastOrders[0];
+    const msg = last
+      ? `আপনার সর্বশেষ অর্ডারের আইডি: ${last.id}\nপণ্য: ${last.product} ×${last.qty}\nস্ট্যাটাস: ${last.status}`
+      : 'আপনার নামে এখনো কোনো অর্ডার পাইনি। অর্ডার করতে চাইলে পণ্যের নাম জানান 🙏';
+    await store.appendMessage(customer.id, 'assistant', msg);
+    await send(msg);
+    return;
+  }
+
   const { reply, imageUrl, imageId, shopProductId, order, handoff } = await getAIReplyWithFallback({
     settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext, customerMemory
   });
@@ -582,8 +593,18 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     finalImageUrl = await shop.getProductImage(shopProductId);
   }
 
-  await send(reply, finalImageUrl); // আগে কাস্টমারকে পাঠাই, তারপর খাতায় লিখি
-  await store.appendMessage(customer.id, 'assistant', reply);
+  // অর্ডার নেওয়া হচ্ছে — AI-র নিজের "নিশ্চিত হলো" লেখা পাঠাই না; সার্ভার যাচাই করে নিজে নিশ্চিতকরণ/সমস্যার বার্তা দেবে
+  const placingOrder = !!(order && order.product && !order.emailOnly);
+  let outReply = reply;
+  const recentOrd = pastOrders[0] && (Date.now() - new Date(pastOrders[0].createdAt).getTime() < 10 * 60 * 1000);
+  if (!order && !recentOrd && /নিশ্চিত করা হলো|সফলভাবে গ্রহণ করা হয়েছে|অর্ডার কনফার্ম হয়েছে/.test(String(reply || ''))) {
+    console.warn('AI অর্ডার ছাড়াই "নিশ্চিত" বলেছিল — বার্তা বদলানো হলো');
+    outReply = 'আপনার অর্ডারটি এখনো নিশ্চিত হয়নি। কোন পণ্য কত পরিমাণ নেবেন, সাথে নাম, মোবাইল, ঠিকানা আর পেমেন্ট কীভাবে করবেন — একটু জানাবেন? 🙏';
+  }
+  if (!placingOrder) {
+    await send(outReply, finalImageUrl); // আগে কাস্টমারকে পাঠাই, তারপর খাতায় লিখি
+    await store.appendMessage(customer.id, 'assistant', outReply);
+  }
 
   // প্রতি ৫টা মেসেজে কাস্টমারের স্মৃতি নতুন করে লেখা (পেছনে — উত্তরের গতি কমায় না)
   const userCount = fullHistory.filter(h => h.role === 'user').length;
@@ -626,6 +647,9 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     );
     if (duplicate) {
       console.warn(`ডুপ্লিকেট অর্ডার ঠেকানো হলো: ${customer.id} — ${order.product}`);
+      const dm = `এই অর্ডারটি আগেই নেওয়া হয়েছে — অর্ডার আইডি: ${duplicate.id}। নতুন করে অর্ডার করতে চাইলে জানান 🙏`;
+      await store.appendMessage(customer.id, 'assistant', dm);
+      await send(dm);
       return;
     }
 
