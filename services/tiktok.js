@@ -133,7 +133,46 @@ async function postFields(settings, { buffer, whenMs, force } = {}) {
 async function cleanup(job) { if (job.tkMediaId) await store.deletePostMedia(job.tkMediaId).catch(() => {}); }
 
 // কখনো এরর ছোঁড়ে না
+const MB = 1024 * 1024;
+// ভিডিও পোস্ট: FILE_UPLOAD পদ্ধতি — ডোমেইন যাচাই লাগে না; টুকরো টুকরো করে পাঠানো হয়
+async function publishTkVideo(job) {
+  const vp = require('./videoPosts');
+  if (!job.mediaId) throw new Error('পোস্টের ভিডিও পাওয়া যায়নি');
+  const { size } = await vp.openVideo(job.mediaId).then(o => { o.stream.destroy(); return o; });
+  const privacy = await pickPrivacy();
+  const chunk = size < 20 * MB ? size : 20 * MB;           // TikTok: প্রতি টুকরো ৫–৬৪ MB, শেষটা ১২৮ MB পর্যন্ত
+  const count = Math.max(1, Math.floor(size / chunk));
+  const caption = String(job.caption || '');
+  const d = await api('/v2/post/publish/video/init/', {
+    post_info: { title: clip(caption, 2200), privacy_level: privacy, disable_duet: false, disable_comment: false, disable_stitch: false },
+    source_info: { source: 'FILE_UPLOAD', video_size: size, chunk_size: chunk, total_chunk_count: count }
+  });
+  if (!d.upload_url) throw new Error('TikTok আপলোডের লিংক দেয়নি');
+  for (let i = 0; i < count; i++) {
+    const start = i * chunk, end = i === count - 1 ? size - 1 : start + chunk - 1;
+    const buf = await vp.readVideoRange(job.mediaId, start, end);
+    try {
+      await axios.put(d.upload_url, buf, {
+        headers: { 'Content-Type': 'video/mp4', 'Content-Length': buf.length, 'Content-Range': `bytes ${start}-${end}/${size}` },
+        maxBodyLength: Infinity, maxContentLength: Infinity, timeout: 10 * 60 * 1000
+      });
+    } catch (err) { throw new Error('TikTok-এ ভিডিও আপলোড হয়নি: ' + errMsg(err)); }
+  }
+  await store.updatePost(job.id, { tkStatus: 'submitted', tkPublishId: d.publish_id || '', tkPrivacy: privacy, tkError: '', tkSubmittedAt: Date.now() });
+  await vp.releaseVideo(job.id);
+  return { ok: true };
+}
+
 async function publishTkJob(job) {
+  if (job.mediaType === 'video') {
+    try { return await publishTkVideo(job); }
+    catch (err) {
+      const msg = clip(err.message || err, 200);
+      await store.updatePost(job.id, { tkStatus: 'failed', tkError: msg }).catch(() => {});
+      await require('./videoPosts').releaseVideo(job.id);
+      return { ok: false, error: msg };
+    }
+  }
   try {
     if (!job.tkMediaId) throw new Error('ছবি পাওয়া যায়নি');
     const privacy = await pickPrivacy();
