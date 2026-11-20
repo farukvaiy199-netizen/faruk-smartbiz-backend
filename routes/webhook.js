@@ -562,7 +562,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   const history = fullHistory.slice(0, -1);
   const ownerRules = rulesRaw.map(r => r.text);
   const stockList = stockRaw.map(e => ({ name: e.name, qty: e.qty }));
-  const orderLine = pastOrders.slice(0, 3).map(o => `${o.product} ×${o.qty} (${o.status})`).join('; ');
+  const orderLine = pastOrders.slice(0, 3).map(o => `অর্ডার আইডি ${o.id}: ${o.product} ×${o.qty} (${o.status})`).join('; ');
   const customerMemory = [memory, orderLine ? 'আগের অর্ডার: ' + orderLine : ''].filter(Boolean).join('\n');
 
   const { reply, imageUrl, imageId, shopProductId, order, handoff } = await getAIReplyWithFallback({
