@@ -94,6 +94,35 @@ async function streamVideo(id, req, res) {
   }
 }
 
+// ভিডিওর আকার + পুরো স্ট্রিম (Telegram-এ আপলোডের জন্য)
+async function openVideo(id) {
+  const bucket = await bucketOf();
+  const files = await bucket.find({ _id: id }).limit(1).toArray();
+  if (!files.length) throw new Error('পোস্টের ভিডিও পাওয়া যায়নি');
+  return { size: files[0].length, stream: bucket.openDownloadStream(id) };
+}
+
+// ভিডিওর একটা অংশ (TikTok-এ টুকরো টুকরো আপলোডের জন্য); start..end দুটোই অন্তর্ভুক্ত
+async function readVideoRange(id, start, end) {
+  const bucket = await bucketOf();
+  const chunks = [];
+  await new Promise((resolve, reject) => {
+    bucket.openDownloadStream(id, { start, end: end + 1 }).on('data', c => chunks.push(c)).on('error', reject).on('end', resolve);
+  });
+  return Buffer.concat(chunks);
+}
+
+// Instagram/Telegram/TikTok — কেউ আর ভিডিও না চাইলে তবেই মোছে (একটা শেষ হলেই মুছলে বাকিগুলো ভিডিও পেত না)
+async function releaseVideo(postId) {
+  try {
+    const post = await store.getPostById(postId);
+    if (!post || !post.mediaId || post.mediaType !== 'video') return;
+    const busy = s => s === 'pending' || s === 'publishing';
+    if (busy(post.igStatus) || busy(post.tgStatus) || busy(post.tkStatus)) return;
+    await deleteVideo(post.mediaId);
+  } catch (e) { /* পরে আবার চেষ্টা বা নিজে থেকেই মুছবে */ }
+}
+
 /* ---------- Facebook পেজে ভিডিও ---------- */
 // ফেসবুক নিজেই নির্ধারিত সময়ে পোস্ট করে (published=false + scheduled_publish_time)
 async function uploadFacebookVideo({ token, filePath, mime, caption, scheduledAtMs }) {
@@ -199,7 +228,7 @@ async function normalizeVideo(filePath) {
 }
 
 /* ---------- পুরো কাজ (রিকোয়েস্টের জবাব দেওয়ার পর পেছনে চলে) ---------- */
-async function processVideoPost({ post, filePath: origPath, mime: origMime, settings, whenMs, wantFb, wantIg }) {
+async function processVideoPost({ post, filePath: origPath, mime: origMime, settings, whenMs, wantFb, wantIg, wantTg, wantTk }) {
   let filePath = origPath, mime = origMime, convPath = null;
   try {
     // ০) ফরম্যাট ঠিক না থাকলে নিজে থেকেই MP4 (H.264) বানিয়ে নিই — HEVC/MOV/অন্য ফরম্যাট সব চলবে
@@ -225,25 +254,37 @@ async function processVideoPost({ post, filePath: origPath, mime: origMime, sett
       fbPostId: fbVideoId, fbVideoId
     });
 
-    // ২) Instagram (ফেসবুকের ধাপ সফল হওয়ার পর; এখনই হলে সাথে সাথে, নইলে শিডিউলার সময়মতো)
-    if (wantIg) {
+    // ২) Instagram / Telegram / TikTok — ভিডিও একবার MongoDB-তে রেখে তিনটাই সেখান থেকে নেয়
+    //    (এখনই হলে সাথে সাথে, নইলে শিডিউলার সময়মতো)
+    if (wantIg || wantTg || wantTk) {
+      let mediaId = '';
       try {
-        if (!settings.fbToken || !settings.igUserId) throw new Error('Instagram সংযুক্ত নেই');
-        const mediaId = await saveVideo(filePath, mime);
-        updated = await store.updatePost(post.id, {
-          mediaId, mediaType: 'video',
-          igStatus: whenMs ? 'pending' : 'publishing',
-          igDueAt: new Date(whenMs || Date.now()).toISOString()
-        });
-        if (!whenMs) {
-          const { publishIgJob } = require('./scheduler'); // দেরিতে require — গোলাকার নির্ভরতা এড়াতে
-          await publishIgJob(updated, settings, false);
-        }
+        if (wantIg && (!settings.fbToken || !settings.igUserId)) throw new Error('Instagram সংযুক্ত নেই');
+        mediaId = await saveVideo(filePath, mime);
       } catch (err) {
         const msg = errMsg(err);
-        const f = { igStatus: 'failed', igError: msg };
+        const f = {};
+        if (wantIg) Object.assign(f, { igStatus: 'failed', igError: msg });
+        if (wantTg) Object.assign(f, { tgStatus: 'failed', tgError: msg });
+        if (wantTk) Object.assign(f, { tkStatus: 'failed', tkError: msg });
         if (!wantFb) { f.status = 'failed'; f.error = msg; }
         await store.updatePost(post.id, f);
+      }
+      if (mediaId) {
+        const dueIso = new Date(whenMs || Date.now()).toISOString();
+        const fields = { mediaId, mediaType: 'video' };
+        if (wantIg) Object.assign(fields, { igStatus: whenMs ? 'pending' : 'publishing', igDueAt: dueIso });
+        if (wantTg) Object.assign(fields, { tgStatus: whenMs ? 'pending' : 'publishing', tgDueAt: dueIso });
+        if (wantTk) Object.assign(fields, { tkStatus: whenMs ? 'pending' : 'publishing', tkDueAt: dueIso });
+        const updated = await store.updatePost(post.id, fields);
+        if (!whenMs) {
+          const { publishIgJob } = require('./scheduler'); // দেরিতে require — গোলাকার নির্ভরতা এড়াতে
+          const jobs = [];
+          if (wantTg) jobs.push(require('./telegram').publishTgJob(updated, settings));
+          if (wantTk) jobs.push(require('./tiktok').publishTkJob(updated));
+          if (wantIg) jobs.push(publishIgJob(updated, settings, false));
+          await Promise.all(jobs.map(j => j.catch(e => console.error('ভিডিও পোস্ট (প্ল্যাটফর্ম) এরর:', e.message))));
+        }
       }
     }
 
@@ -263,5 +304,5 @@ async function processVideoPost({ post, filePath: origPath, mime: origMime, sett
 
 module.exports = {
   processVideoPost, publishInstagramReel, uploadFacebookVideo,
-  saveVideo, deleteVideo, streamVideo, parseRange, normalizeVideo
+  saveVideo, deleteVideo, streamVideo, openVideo, readVideoRange, releaseVideo, parseRange, normalizeVideo
 };
