@@ -506,7 +506,7 @@ function parseAIJson(raw) {
     if (!parsed) parsed = { reply: raw, order: null };
   }
   return {
-    reply: parsed.reply || 'দুঃখিত, একটু পরে আবার চেষ্টা করুন।',
+    reply: parsed.reply || CONTACT_FALLBACK,
     imageUrl: parsed.imageUrl || null,
     order: parsed.order || null,
     rule: parsed.rule || null,
@@ -571,4 +571,7 @@ async function testSlot(settings, sfx) {
   return { ok: true, ms: Date.now() - t0, provider: slot.provider, model: healed.get(slot.provider + '|' + (slot.model || MODELS[slot.provider] || '')) || slot.model || MODELS[slot.provider] || '', reply: String(r.reply || '').slice(0, 120) };
 }
 
+const CONTACT_PHONE = process.env.SHOP_CONTACT_PHONE || '01400778482';
+const CONTACT_FALLBACK = `দয়া করে WhatsApp বা ${CONTACT_PHONE} নম্বরে মেসেজ বা কল করুন।`;
 module.exports = { testSlot, summarizeCustomerMemory, getAIReply, getAIReplyWithFallback, getVisionReply, isVisionCapable, getOwnerChatReply, getSlots, getJsonReply };
+module.exports.CONTACT_FALLBACK = CONTACT_FALLBACK;
