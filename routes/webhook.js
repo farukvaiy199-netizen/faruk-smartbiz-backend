@@ -571,11 +571,14 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
 
   // মালিকের আপলোড করা ছবি থাকলে সেটাকেই অগ্রাধিকার; না থাকলে শিটের ছবির লিংক
   let finalImageUrl = imageUrl;
-  if (imageId && ownerImages.some(i => i.id === imageId)) {
+  // কাস্টমার ছবি না চাইলে কখনো ছবি পাঠানো হবে না
+  const wantsImage = /ছবি|ফটো|photo|pic|image|দেখি|দেখান|দেখাও|দেখতে চাই/i.test(String(text || ''));
+  if (!wantsImage) { finalImageUrl = null; }
+  else if (imageId && ownerImages.some(i => i.id === imageId)) {
     finalImageUrl = `${config.publicUrl}/media/${imageId}`;
   }
   // ওয়েবসাইটের প্রোডাক্টের ছবি (পাওয়া না গেলে null — তখন reply-তে থাকা লিংকই কাস্টমার পান)
-  if (!finalImageUrl && shopProductId) {
+  if (wantsImage && !finalImageUrl && shopProductId) {
     finalImageUrl = await shop.getProductImage(shopProductId);
   }
 
