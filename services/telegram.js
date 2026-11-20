@@ -4,6 +4,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const config = require('../config');
 const store = require('./store');
+const FormData = require('form-data');
 
 const API = 'https://api.telegram.org';
 const clip = (s, n) => String(s || '').slice(0, n);
@@ -46,6 +47,20 @@ async function sendMessage(token, chatId, text) {
 }
 async function sendPhoto(token, chatId, url, caption) {
   await call(token, 'sendPhoto', { chat_id: chatId, photo: url, caption: clip(caption, 1000) }, 25000);
+}
+// ভিডিও সরাসরি আপলোড (বট সর্বোচ্চ ৫০ MB নিতে পারে)
+async function sendVideoStream(token, chatId, stream, size, caption) {
+  if (size > 50 * 1024 * 1024) { stream.destroy(); throw new Error('Telegram বট ৫০ MB-এর বেশি ভিডিও নিতে পারে না — ভিডিও ছোট করুন'); }
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (String(caption || '').length <= 1000) form.append('caption', String(caption || ''));
+  form.append('supports_streaming', 'true');
+  form.append('video', stream, { filename: 'video.mp4', contentType: 'video/mp4', knownLength: size });
+  try {
+    const r = await axios.post(`${API}/bot${token}/sendVideo`, form, { headers: form.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity, timeout: 10 * 60 * 1000 });
+    return r.data && r.data.result;
+  } catch (err) { throw new Error(errMsg(err)); }
+  finally { try { stream.destroy(); } catch (e) {} }
 }
 function typing(token, chatId) {
   call(token, 'sendChatAction', { chat_id: chatId, action: 'typing' }, 5000).catch(() => {});
@@ -143,6 +158,16 @@ async function postFields(settings, { buffer, whenMs, force } = {}) {
 async function publishTgJob(job, settings) {
   try {
     if (!settings.tgToken || !settings.tgChannel) throw new Error('Telegram চ্যানেল সংযুক্ত নেই');
+    if (job.mediaType === 'video') {
+      if (!job.mediaId) throw new Error('পোস্টের ভিডিও পাওয়া যায়নি');
+      const vp = require('./videoPosts');
+      const { stream, size } = await vp.openVideo(job.mediaId);
+      await sendVideoStream(settings.tgToken, settings.tgChannel, stream, size, job.caption);
+      if (String(job.caption || '').length > 1000) await sendMessage(settings.tgToken, settings.tgChannel, job.caption);
+      await store.updatePost(job.id, { tgStatus: 'published', tgError: '' });
+      await vp.releaseVideo(job.id);
+      return { ok: true };
+    }
     const url = job.tgMediaId ? `${config.publicUrl}/pmedia/${job.tgMediaId}.jpg` : '';
     await sendToChannel(settings, job.caption, url);
     await store.updatePost(job.id, { tgStatus: 'published', tgError: '' });
@@ -151,6 +176,7 @@ async function publishTgJob(job, settings) {
   } catch (err) {
     const msg = clip(err.message || err, 200);
     await store.updatePost(job.id, { tgStatus: 'failed', tgError: msg }).catch(() => {});
+    if (job.mediaType === 'video') await require('./videoPosts').releaseVideo(job.id);
     if (job.tgMediaId) await store.deletePostMedia(job.tgMediaId).catch(() => {});
     return { ok: false, error: msg };
   }
@@ -175,6 +201,6 @@ async function sendTest() {
 }
 
 module.exports = {
-  call, secretFor, checkSecret, normChannel, sendMessage, sendPhoto, typing, downloadFile,
+  call, secretFor, checkSecret, normChannel, sendMessage, sendPhoto, sendVideoStream, typing, downloadFile,
   connect, disconnect, status, postFields, publishTgJob, runDue, sendTest
 };
