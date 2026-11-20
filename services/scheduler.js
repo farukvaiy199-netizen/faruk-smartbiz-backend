@@ -4,7 +4,7 @@
 const config = require('../config');
 const store = require('./store');
 const { publishInstagramPhoto } = require('./instagram');
-const { publishInstagramReel, deleteVideo } = require('./videoPosts');
+const { publishInstagramReel, releaseVideo } = require('./videoPosts');
 const { notifyOwner } = require('./notify');
 const shop = require('./shop');
 
@@ -25,7 +25,7 @@ async function publishIgJob(job, settings, notifyOnFail) {
         caption: job.caption
       });
       await store.updatePost(job.id, { igStatus: 'published', igMediaId: r.igMediaId, igPublishedAt: new Date().toISOString(), igError: '' });
-      await deleteVideo(job.mediaId); // পাবলিশ হয়ে গেছে, ভিডিও আর রাখার দরকার নেই (ডেটাবেসের জায়গা বাঁচে)
+      await releaseVideo(job.id); // পাবলিশ হয়ে গেছে; Telegram/TikTok-ও শেষ হলে ভিডিও মুছবে (ডেটাবেসের জায়গা বাঁচে)
       return { ok: true };
     }
 
@@ -41,7 +41,7 @@ async function publishIgJob(job, settings, notifyOnFail) {
   } catch (err) {
     const msg = String(err.message || err).slice(0, 200);
     await store.updatePost(job.id, { igStatus: 'failed', igError: msg });
-    if (job.mediaType === 'video' && job.mediaId) await deleteVideo(job.mediaId); // ব্যর্থ ভিডিও ফেলে রেখে জায়গা নষ্ট নয়
+    if (job.mediaType === 'video' && job.mediaId) await releaseVideo(job.id); // ব্যর্থ ভিডিও ফেলে রেখে জায়গা নষ্ট নয়
     if (notifyOnFail) await notifyOwner({ type: 'post', title: '❌ Instagram-এ পোস্ট হয়নি', body: msg });
     return { ok: false, error: msg };
   }
