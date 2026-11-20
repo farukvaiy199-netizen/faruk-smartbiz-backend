@@ -41,7 +41,7 @@ const orderSheet = require('../services/orderSheet');
 const router = express.Router();
 
 // শুধু নিজের সাইটের ঠিকানা থেকে আসা ব্রাউজার অনুরোধ নেবে (অর্ডার-সার্ভারের আগের নিয়ম)
-router.use(['/api/place-order', '/api/chat-ai', '/api/admin/reset-password'], (req, res, next) => {
+router.use(['/api/place-order', '/api/chat-ai', '/api/admin/reset-password', '/api/otp/send'], (req, res, next) => {
   const o = req.headers.origin;
   if (o && !ALLOWED.includes(o)) return res.status(403).json({ error: 'এই ঠিকানা থেকে অনুমতি নেই' });
   next();
@@ -129,6 +129,12 @@ router.post('/api/place-order', authMw, async (req, res) => {
     console.error('place-order error:', e);
     res.status(500).json({ error: 'সার্ভারে সমস্যা হয়েছে — আবার চেষ্টা করুন' });
   }
+});
+
+// ওটিপি পাঠানো — আসল SMS সেবা যুক্ত হলে এখানে বসবে; এখন সৎভাবে "চালু হয়নি" জানায় (ওয়েবসাইটে কাউন্টডাউন উঠবে না)
+router.post('/api/otp/send', (req, res) => {
+  if (!rateLimit('otp:' + req.ip, 10, 3600e3)) return res.status(429).json({ ok: false, error: 'অনেকবার চেষ্টা হয়েছে — একটু পরে চেষ্টা করুন' });
+  res.status(503).json({ ok: false, error: 'ওটিপি সেবা এখনো চালু হয়নি' });
 });
 
 router.post('/api/chat-ai', authMw, async (req, res) => {
