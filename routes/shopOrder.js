@@ -37,6 +37,7 @@ function init() {
   }
 }
 
+const orderSheet = require('../services/orderSheet');
 const router = express.Router();
 
 // শুধু নিজের সাইটের ঠিকানা থেকে আসা ব্রাউজার অনুরোধ নেবে (অর্ডার-সার্ভারের আগের নিয়ম)
@@ -82,7 +83,23 @@ router.post('/api/place-order', authMw, async (req, res) => {
       const pending = q.docs.filter(d => d.data().status === 'pending').length;
       if (pending >= 5) throw new UserError('এই নম্বরে ইতিমধ্যে অনেকগুলো অর্ডার অপেক্ষায় আছে — আমাদের সাথে যোগাযোগ করুন');
     }
-    const result = await db.runTransaction(async tx => {
+    // আইডি আসে মালিকের অর্ডার-শিট থেকে। আগে অর্ডারটা যাচাই করি (ভুল হলে শিটের ঘর নষ্ট হবে না), তারপর ঘর নিই।
+    let sheetId = null;
+    if (orderSheet.enabled()) {
+      const ids0 = [...new Set((Array.isArray(input.items) ? input.items : []).map(i => String((i && i.pid) || '')))].filter(id => id && id.indexOf('/') < 0).slice(0, 30);
+      const snaps0 = await Promise.all(ids0.map(id => db.doc(`${ROOT}/products/${id}`).get()));
+      const pmap0 = {}; snaps0.forEach(s => { if (s.exists) pmap0[s.id] = s.data(); });
+      const c0 = computeOrder(settings, pmap0, input); // সমস্যা থাকলে এখানেই UserError
+      sheetId = await orderSheet.claim({
+        name: c0.name, phone: c0.phone, address: c0.address, district: c0.district,
+        product: c0.items.map(i => (i.name || '') + (i.variantName ? ' (' + i.variantName + ')' : '') + ' x' + (i.qty || 1)).join(', '),
+        qty: c0.items.reduce((n, i) => n + (Number(i.qty) || 1), 0), price: c0.subtotal, shipping: c0.shipping, total: c0.total,
+        payment: c0.payment, transactionId: c0.transactionId, source: 'ওয়েবসাইট', status: 'Pending'
+      });
+    }
+    let result;
+    try {
+    result = await db.runTransaction(async tx => {
       const counterRef = db.doc(`${ROOT}/counters/orderCounter`);
       const counterSnap = await tx.get(counterRef);
       const ids = [...new Set((Array.isArray(input.items) ? input.items : []).map(i => String((i && i.pid) || '')))].filter(id => id && id.indexOf('/') < 0).slice(0, 30);
@@ -90,7 +107,7 @@ router.post('/api/place-order', authMw, async (req, res) => {
       const pmap = {}; snaps.forEach(s => { if (s.exists) pmap[s.id] = s.data(); });
       const calc = computeOrder(settings, pmap, input);
       const next = counterSnap.exists ? counterSnap.data().next : 1001;
-      const orderId = 'ORD-' + next;
+      const orderId = sheetId || (orderSheet.enabled() ? 'ORD-E' + next : 'ORD-' + next);
       const order = {
         id: orderId, ownerUid: uid, ownerEmail: req.user.email || '',
         customer: calc.name, phone: calc.phone, address: calc.address, items: calc.items,
@@ -101,10 +118,11 @@ router.post('/api/place-order', authMw, async (req, res) => {
         courier: 'নির্ধারণ করা হয়নি', date: bdDate(), source: 'server'
       };
       tx.set(db.doc(`${ROOT}/orders/${orderId}`), Object.assign({}, order, { createdAt: admin.firestore.FieldValue.serverTimestamp() }));
-      tx.set(counterRef, { next: next + 1 });
+      if (!sheetId) tx.set(counterRef, { next: next + 1 });
       calc.stockUpdates.forEach(u => tx.update(db.doc(`${ROOT}/products/${u.pid}`), u.variants ? { stock: u.newStock, variants: u.variants } : { stock: u.newStock }));
       return { orderId, total: calc.total, order };
     });
+    } catch (txErr) { if (sheetId) await orderSheet.release(sheetId); throw txErr; }
     res.json(result);
   } catch (e) {
     if (e instanceof UserError) return res.status(400).json({ error: e.userMessage });
