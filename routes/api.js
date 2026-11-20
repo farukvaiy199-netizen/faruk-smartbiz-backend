@@ -714,9 +714,13 @@ router.post('/posts/video', (req, res, next) => {
     const settings = await store.getSettings();
     const wantFb = req.body.postToFacebook !== 'false';
     const wantIg = req.body.postToInstagram === 'true';
-    if (!wantFb && !wantIg) { drop(); return res.status(400).json({ error: 'Facebook বা Instagram অন্তত একটা বেছে নিন' }); }
-    if (!settings.fbToken) { drop(); return res.status(400).json({ error: 'আগে Settings থেকে Facebook পেজ সংযুক্ত করুন' }); }
-    if (!wantFb && !settings.igUserId) { drop(); return res.status(400).json({ error: 'Instagram সংযুক্ত নেই' }); }
+    const wantTg = req.body.postToTelegram === 'true';
+    const wantTk = req.body.postToTiktok === 'true';
+    if (!wantFb && !wantIg && !wantTg && !wantTk) { drop(); return res.status(400).json({ error: 'অন্তত একটা জায়গা বেছে নিন (Facebook, Instagram, TikTok বা Telegram)' }); }
+    if ((wantFb || wantIg) && !settings.fbToken) { drop(); return res.status(400).json({ error: 'আগে Settings থেকে Facebook পেজ সংযুক্ত করুন' }); }
+    if (!wantFb && wantIg && !settings.igUserId) { drop(); return res.status(400).json({ error: 'Instagram সংযুক্ত নেই' }); }
+    if (wantTg && !(settings.tgToken && settings.tgChannel)) { drop(); return res.status(400).json({ error: 'Telegram চ্যানেল সংযুক্ত নেই' }); }
+    if (wantTk && !settings.tkAccessToken) { drop(); return res.status(400).json({ error: 'TikTok অ্যাকাউন্ট সংযুক্ত নেই' }); }
 
     let whenMs = null;
     if (req.body.scheduledAt) {
@@ -736,7 +740,7 @@ router.post('/posts/video', (req, res, next) => {
 
     // ফাইল সার্ভারে পৌঁছে গেছে — অ্যাপকে সাথে সাথে জবাব দিই, ফেসবুক/Instagram-এ পাঠানো পেছনে চলে (তালিকায় অবস্থা দেখা যায়)
     res.json(post);
-    videoPosts.processVideoPost({ post, filePath: file.path, mime: file.mimetype, settings, whenMs, wantFb, wantIg })
+    videoPosts.processVideoPost({ post, filePath: file.path, mime: file.mimetype, settings, whenMs, wantFb, wantIg, wantTg, wantTk })
       .catch(err => console.error('video post error:', err.message));
   } catch (err) {
     drop();
