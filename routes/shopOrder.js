@@ -41,7 +41,7 @@ const orderSheet = require('../services/orderSheet');
 const router = express.Router();
 
 // শুধু নিজের সাইটের ঠিকানা থেকে আসা ব্রাউজার অনুরোধ নেবে (অর্ডার-সার্ভারের আগের নিয়ম)
-router.use(['/api/place-order', '/api/chat-ai', '/api/admin/reset-password', '/api/otp/send'], (req, res, next) => {
+router.use(['/api/place-order', '/api/chat-ai', '/api/admin/reset-password', '/api/otp/send', '/api/track'], (req, res, next) => {
   const o = req.headers.origin;
   if (o && !ALLOWED.includes(o)) return res.status(403).json({ error: 'এই ঠিকানা থেকে অনুমতি নেই' });
   next();
@@ -78,9 +78,11 @@ router.post('/api/place-order', authMw, async (req, res) => {
     const input = req.body || {};
     const settings = await loadSettings();
     const phone = String(input.phone || '').replace(/[\s-]/g, '');
+    let priorOrders = 0;
     if (phone) {
       const q = await db.collection(`${ROOT}/orders`).where('phone', '==', phone).limit(30).get();
       const pending = q.docs.filter(d => d.data().status === 'pending').length;
+      priorOrders = q.docs.filter(d => d.data().status !== 'cancelled').length;
       if (pending >= 5) throw new UserError('এই নম্বরে ইতিমধ্যে অনেকগুলো অর্ডার অপেক্ষায় আছে — আমাদের সাথে যোগাযোগ করুন');
     }
     // আইডি আসে মালিকের অর্ডার-শিট থেকে। আগে অর্ডারটা যাচাই করি (ভুল হলে শিটের ঘর নষ্ট হবে না), তারপর ঘর নিই।
@@ -89,7 +91,7 @@ router.post('/api/place-order', authMw, async (req, res) => {
       const ids0 = [...new Set((Array.isArray(input.items) ? input.items : []).map(i => String((i && i.pid) || '')))].filter(id => id && id.indexOf('/') < 0).slice(0, 30);
       const snaps0 = await Promise.all(ids0.map(id => db.doc(`${ROOT}/products/${id}`).get()));
       const pmap0 = {}; snaps0.forEach(s => { if (s.exists) pmap0[s.id] = s.data(); });
-      const c0 = computeOrder(settings, pmap0, input); // সমস্যা থাকলে এখানেই UserError
+      const c0 = computeOrder(settings, pmap0, input, { priorOrders }); // সমস্যা থাকলে এখানেই UserError
       sheetId = await orderSheet.claim({
         name: c0.name, phone: c0.phone, address: c0.address, district: c0.district,
         product: c0.items.map(i => (i.name || '') + (i.variantName ? ' (' + i.variantName + ')' : '') + ' x' + (i.qty || 1)).join(', '),
@@ -105,13 +107,13 @@ router.post('/api/place-order', authMw, async (req, res) => {
       const ids = [...new Set((Array.isArray(input.items) ? input.items : []).map(i => String((i && i.pid) || '')))].filter(id => id && id.indexOf('/') < 0).slice(0, 30);
       const snaps = await Promise.all(ids.map(id => tx.get(db.doc(`${ROOT}/products/${id}`))));
       const pmap = {}; snaps.forEach(s => { if (s.exists) pmap[s.id] = s.data(); });
-      const calc = computeOrder(settings, pmap, input);
+      const calc = computeOrder(settings, pmap, input, { priorOrders });
       const next = counterSnap.exists ? counterSnap.data().next : 1001;
       const orderId = sheetId || (orderSheet.enabled() ? 'ORD-E' + next : 'ORD-' + next);
       const order = {
         id: orderId, ownerUid: uid, ownerEmail: req.user.email || '',
         customer: calc.name, phone: calc.phone, address: calc.address, items: calc.items,
-        subtotal: calc.subtotal, discount: calc.discount, tax: calc.tax, shipping: calc.shipping, total: calc.total,
+        subtotal: calc.subtotal, discount: calc.discount, couponCode: calc.couponCode || '', flashDiscount: calc.flashDiscount || 0, bundleDiscount: calc.bundleDiscount || 0, couponDiscount: calc.couponDiscount || 0, tax: calc.tax, shipping: calc.shipping, total: calc.total,
         district: calc.district, upazila: calc.upazila, shippingBase: calc.shippingBase, prepayDiscount: calc.prepayDiscount,
         status: 'pending', payment: calc.payment, paymentStatus: 'unpaid', transactionId: calc.transactionId,
         paymentPlanPercent: calc.paymentPlanPercent, advanceAmount: calc.advanceAmount, dueAmount: calc.dueAmount,
@@ -129,6 +131,27 @@ router.post('/api/place-order', authMw, async (req, res) => {
     console.error('place-order error:', e);
     res.status(500).json({ error: 'সার্ভারে সমস্যা হয়েছে — আবার চেষ্টা করুন' });
   }
+});
+
+
+// অর্ডার ট্র্যাকিং — অর্ডার আইডি + মোবাইল নম্বর দুটোই মিললে তবেই অবস্থা দেখায় (ঠিকানা/নাম দেখায় না)
+router.post('/api/track', async (req, res) => {
+  if (!rateLimit('track:' + req.ip, 40, 3600e3)) return res.status(429).json({ error: 'অনেকবার চেষ্টা হয়েছে — একটু পরে আবার চেষ্টা করুন' });
+  if (!init()) return res.status(503).json({ error: 'সেবা এখন চালু নেই' });
+  try {
+    const id = String((req.body || {}).orderId || '').trim().toUpperCase().replace(/\s+/g, '');
+    const phone = String((req.body || {}).phone || '').replace(/[\s-]/g, '');
+    if (!/^[A-Z0-9-]{3,24}$/.test(id) || !/^01[3-9]\d{8}$/.test(phone)) return res.status(400).json({ error: 'সঠিক অর্ডার নম্বর ও মোবাইল নম্বর দিন' });
+    const snap = await db.doc(`${ROOT}/orders/${id}`).get();
+    const o = snap.exists ? snap.data() : null;
+    if (!o || String(o.phone || '').replace(/[\s-]/g, '') !== phone) return res.status(404).json({ error: 'এই তথ্যে কোনো অর্ডার পাওয়া যায়নি' });
+    res.json({
+      id: o.id || id, status: o.status || 'pending', date: o.date || '', payment: o.payment || '', paymentStatus: o.paymentStatus || '',
+      total: o.total || 0, courier: o.courier || '', district: o.district || '',
+      items: (o.items || []).slice(0, 20).map(i => ({ name: i.name, qty: i.qty })),
+      tracking: o.steadfastTrackingId || o.pathaoConsignmentId || o.trackingCode || ''
+    });
+  } catch (e) { console.error('track error:', e); res.status(500).json({ error: 'সার্ভারে সমস্যা হয়েছে' }); }
 });
 
 // ওটিপি পাঠানো — আসল SMS সেবা যুক্ত হলে এখানে বসবে; এখন সৎভাবে "চালু হয়নি" জানায় (ওয়েবসাইটে কাউন্টডাউন উঠবে না)
