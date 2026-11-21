@@ -149,9 +149,120 @@ router.post('/api/track', async (req, res) => {
       id: o.id || id, status: o.status || 'pending', date: o.date || '', payment: o.payment || '', paymentStatus: o.paymentStatus || '',
       total: o.total || 0, courier: o.courier || '', district: o.district || '',
       items: (o.items || []).slice(0, 20).map(i => ({ name: i.name, qty: i.qty })),
+      courierStatus: o.courierStatusText || '',
       tracking: o.steadfastTrackingId || o.pathaoConsignmentId || o.trackingCode || ''
     });
   } catch (e) { console.error('track error:', e); res.status(500).json({ error: 'সার্ভারে সমস্যা হয়েছে' }); }
+});
+
+
+// ---------- কুরিয়ারের অবস্থা (শুধু অ্যাডমিন): Steadfast / Pathao থেকে এনে অর্ডারে জমা রাখে ----------
+const SF_TEXT = { pending: 'কুরিয়ার গ্রহণ করেছে (অপেক্ষায়)', in_review: 'রিভিউ হচ্ছে', delivered: 'ডেলিভারি সম্পন্ন', partial_delivered: 'আংশিক ডেলিভারি', cancelled: 'বাতিল', hold: 'হোল্ডে আছে', unknown: 'অজানা',
+  delivered_approval_pending: 'ডেলিভারি হয়েছে (অনুমোদনের অপেক্ষায়)', partial_delivered_approval_pending: 'আংশিক ডেলিভারি (অনুমোদনের অপেক্ষায়)', cancelled_approval_pending: 'বাতিল (অনুমোদনের অপেক্ষায়)', unknown_approval_pending: 'যাচাই চলছে' };
+const PATHAO_BASES = { live: 'https://api-hermes.pathao.com', sandbox: 'https://courier-api-sandbox.pathao.com' };
+let secureCache = { at: 0, v: null }, pathaoTok = { sig: '', token: '', exp: 0 };
+async function loadSecure() {
+  if (secureCache.v && Date.now() - secureCache.at < 60e3) return secureCache.v;
+  const snap = await db.doc(`${ROOT}/parts/settings_secure`).get();
+  let v = {};
+  if (snap.exists) { try { v = JSON.parse(snap.data().json).settingsSecure || {}; } catch (e) {} }
+  secureCache = { at: Date.now(), v }; return v;
+}
+async function pathaoToken(c) {
+  const sig = [c.clientId, c.clientSecret, c.username, c.password, c.env].join('|');
+  if (pathaoTok.token && pathaoTok.sig === sig && Date.now() < pathaoTok.exp) return pathaoTok.token;
+  const base = PATHAO_BASES[c.env] || PATHAO_BASES.live;
+  const r = await fetch(base + '/aladdin/api/v1/issue-token', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ client_id: c.clientId, client_secret: c.clientSecret, username: c.username, password: c.password, grant_type: 'password' }) });
+  const d = await r.json().catch(() => null);
+  if (!r.ok || !d || !d.access_token) throw new Error('pathao-auth');
+  pathaoTok = { sig, token: d.access_token, exp: Date.now() + ((d.expires_in || 3600) * 1000) - 60000 };
+  return pathaoTok.token;
+}
+// একটি অর্ডারের কুরিয়ার অবস্থা আনে; ফেরত: { code, text } বা null
+async function fetchCourierStatus(o, sec) {
+  if (o.steadfastTrackingId && sec.steadfastApiKey && sec.steadfastSecretKey) {
+    const r = await fetch('https://portal.packzy.com/api/v1/status_by_invoice/' + encodeURIComponent(o.id), { headers: { 'Api-Key': sec.steadfastApiKey, 'Secret-Key': sec.steadfastSecretKey, 'Content-Type': 'application/json' } });
+    const d = await r.json().catch(() => null);
+    if (r.ok && d && d.delivery_status) return { code: String(d.delivery_status), text: SF_TEXT[d.delivery_status] || String(d.delivery_status), courier: 'Steadfast' };
+    return null;
+  }
+  const pc = sec.pathao;
+  if (o.pathaoConsignmentId && pc && pc.connected) {
+    const base = PATHAO_BASES[pc.env] || PATHAO_BASES.live;
+    const get = async t => fetch(base + '/aladdin/api/v1/orders/' + encodeURIComponent(o.pathaoConsignmentId) + '/info', { headers: { Accept: 'application/json', Authorization: 'Bearer ' + t } });
+    let r = await get(await pathaoToken(pc));
+    if (r.status === 401) { pathaoTok.token = ''; r = await get(await pathaoToken(pc)); }
+    const d = await r.json().catch(() => null);
+    const st = d && d.data && (d.data.order_status || d.data.order_status_slug);
+    if (r.ok && st) return { code: String(st), text: String(st), courier: 'Pathao' };
+  }
+  return null;
+}
+const FINAL_COURIER = /^(delivered|cancelled|Delivered|Cancelled|Return|Returned|Payment Invoice)/;
+async function refreshOne(id, sec) {
+  const ref = db.doc(`${ROOT}/orders/${id}`), snap = await ref.get();
+  if (!snap.exists) return null;
+  const o = Object.assign({ id }, snap.data());
+  const st = await fetchCourierStatus(o, sec);
+  if (!st) return null;
+  await ref.update({ courierStatus: st.code, courierStatusText: st.text, courierStatusAt: new Date().toISOString() });
+  return st;
+}
+router.post('/api/admin/courier-status', authMw, async (req, res) => {
+  if (!ADMIN_UIDS.includes(req.user.uid)) return res.status(403).json({ error: 'শুধু অ্যাডমিন পারবেন' });
+  if (!rateLimit('cour:' + req.user.uid, 30, 3600e3)) return res.status(429).json({ error: 'একটু পরে আবার চেষ্টা করুন' });
+  try {
+    const sec = await loadSecure(), body = req.body || {};
+    if (body.orderId) {
+      const id = String(body.orderId).replace(/[^A-Za-z0-9-]/g, '');
+      const st = await refreshOne(id, sec);
+      if (!st) return res.status(404).json({ error: 'কুরিয়ারের অবস্থা পাওয়া যায়নি — Key/কোড যাচাই করুন' });
+      return res.json({ ok: true, id, status: st });
+    }
+    // সব চলমান অর্ডার (সর্বোচ্চ ৪০টি)
+    const q = await db.collection(`${ROOT}/orders`).where('status', 'in', ['pending', 'processing']).limit(120).get();
+    const ids = q.docs.filter(d => { const o = d.data(); return (o.steadfastTrackingId || o.pathaoConsignmentId) && !FINAL_COURIER.test(String(o.courierStatus || '')); }).slice(0, 40).map(d => d.id);
+    const out = {};
+    for (const id of ids) { try { const st = await refreshOne(id, sec); if (st) out[id] = st; } catch (e) {} }
+    res.json({ ok: true, checked: ids.length, updated: Object.keys(out).length, statuses: out });
+  } catch (e) { console.error('courier-status error:', e.message); res.status(500).json({ error: 'কুরিয়ারের অবস্থা আনা যায়নি' }); }
+});
+
+
+// ---------- পণ্যের শেয়ার লিংক: Facebook/WhatsApp-এ ছবি-নাম-দামসহ প্রিভিউ আসে, মানুষ ক্লিক করলে সোজা ওয়েবসাইটের পণ্যে যায় ----------
+const escH = t => String(t == null ? '' : t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+router.get('/p/:id', async (req, res) => {
+  const DEFAULT_SITE = 'https://farukvaiy199-netizen.github.io/khanglobalshop/';
+  let site = DEFAULT_SITE;
+  try {
+    const u = new URL(String(req.query.s || ''));
+    if (ALLOWED.includes(u.origin) && /^[A-Za-z0-9\/_.-]*$/.test(u.pathname)) site = u.origin + (u.pathname.endsWith('/') ? u.pathname : u.pathname.replace(/[^/]*$/, ''));
+  } catch (e) {}
+  const id = String(req.params.id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60);
+  const target = site + '?product=' + encodeURIComponent(id);
+  let title = 'Khan Global Shop', desc = 'অনলাইনে অর্ডার করুন — সারা বাংলাদেশে ডেলিভারি।', img = '';
+  try {
+    if (init() && id) {
+      const [ps, st] = await Promise.all([db.doc(`${ROOT}/products/${id}`).get(), loadSettings()]);
+      const store = (st && st.storeName && st.storeName !== 'Bazaar') ? st.storeName : 'Khan Global Shop';
+      if (ps.exists && ps.data().status === 'active') {
+        const p = ps.data();
+        title = p.name + ' — ৳' + p.price + ' | ' + store;
+        desc = String(p.desc || '').replace(/\s+/g, ' ').trim().slice(0, 150) || (p.name + ' এখনই অর্ডার করুন — সারা বাংলাদেশে ডেলিভারি, ক্যাশ অন ডেলিভারি।');
+        if (/^https:\/\//.test(String(p.image || ''))) img = p.image;
+      } else title = store;
+      if (!img && /^https:\/\//.test(String((st && st.logo) || ''))) img = st.logo;
+    }
+  } catch (e) {}
+  res.set('Cache-Control', 'public, max-age=300');
+  res.type('html').send('<!doctype html><html lang="bn"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>' + escH(title) + '</title><meta name="description" content="' + escH(desc) + '">' +
+    '<meta property="og:type" content="product"><meta property="og:title" content="' + escH(title) + '"><meta property="og:description" content="' + escH(desc) + '"><meta property="og:url" content="' + escH(target) + '">' +
+    (img ? '<meta property="og:image" content="' + escH(img) + '"><meta name="twitter:image" content="' + escH(img) + '">' : '') +
+    '<meta name="twitter:card" content="' + (img ? 'summary_large_image' : 'summary') + '"><meta property="og:locale" content="bn_BD">' +
+    '<meta http-equiv="refresh" content="0;url=' + escH(target) + '"><link rel="canonical" href="' + escH(target) + '"></head><body>' +
+    '<script>location.replace(' + JSON.stringify(target).replace(/</g, '\\u003c') + ')</script><p><a href="' + escH(target) + '">পণ্যটি দেখতে এখানে চাপুন</a></p></body></html>');
 });
 
 // ওটিপি পাঠানো — আসল SMS সেবা যুক্ত হলে এখানে বসবে; এখন সৎভাবে "চালু হয়নি" জানায় (ওয়েবসাইটে কাউন্টডাউন উঠবে না)
