@@ -549,6 +549,20 @@ async function findProduct(query) {
   } catch (e) { return null; }
 }
 
+
+// মেসেঞ্জার কার্ডের জন্য: প্রোডাক্টের নাম, দাম, কোড, ছবি আর শেয়ার-লিংক (লিংকে ছবিসহ প্রিভিউ আসে)
+async function getProductCard(id) {
+  try {
+    const { cfg, snap: s } = await getSnapshot();
+    if (!s || !id) return null;
+    const p = activeProducts(s.products).find(x => String(x.id) === String(id));
+    if (!p) return null;
+    const image = await getProductImage(p.id);
+    const url = `${config.publicUrl}/p/${encodeURIComponent(p.id)}?s=${encodeURIComponent(siteUrl(cfg))}`;
+    return { id: p.id, name: p.name, price: p.price, sku: p.sku || '', image, url };
+  } catch (e) { return null; }
+}
+
 function toValue(v) {
   if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
   return { stringValue: String(v) };
@@ -594,4 +608,4 @@ async function categoryNames() {
   return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
 }
 
-module.exports = { resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+module.exports = { getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
