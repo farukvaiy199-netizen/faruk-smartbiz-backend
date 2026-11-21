@@ -13,6 +13,7 @@ const { sendOrderConfirmationEmail } = emailSvc;
 const { notifyOwner } = require('../services/notify');
 const { sendInstagramMessage, sendInstagramImage, getInstagramProfile } = require('../services/instagram');
 const crypto = require('crypto');
+const axios = require('axios');
 const shop = require('../services/shop');
 const delivery = require('../services/delivery');
 const assistant = require('../services/assistant');
@@ -115,6 +116,52 @@ function verifyMeta(secretOrList, label) {
   };
 }
 
+
+/* =============== প্রোডাক্ট কার্ড (ছবি + "এটি নিতে চাই" / "বিস্তারিত" বাটন) ও বাটন-চাপা (postback) =============== */
+const lastCardAt = new Map(); // customerId|productId → সময়; একই পণ্যের কার্ড বারবার না পাঠানোর জন্য
+async function sendProductCard(platform, platformId, settings, card) {
+  if (!card || !(platform === 'facebook' || platform === 'instagram') || !settings.fbToken) return false;
+  const el = {
+    title: String(card.name).slice(0, 80),
+    subtitle: ('দাম ৳' + card.price + (card.sku ? ' · কোড ' + card.sku : '')).slice(0, 80),
+    buttons: [
+      { type: 'postback', title: 'এটি নিতে চাই', payload: 'ORDER:' + card.id },
+      { type: 'postback', title: 'বিস্তারিত', payload: 'INFO:' + card.id }
+    ]
+  };
+  if (card.image) el.image_url = card.image;
+  await axios.post('https://graph.facebook.com/v21.0/me/messages', {
+    recipient: { id: platformId }, messaging_type: 'RESPONSE',
+    message: { attachment: { type: 'template', payload: { template_type: 'generic', elements: [el] } } }
+  }, { params: { access_token: settings.fbToken }, timeout: 15000 });
+  return true;
+}
+// কাস্টমার কার্ডের বাটন চাপলে
+async function handlePostback({ platform, senderId, payload, sigOk }) {
+  const m = /^(ORDER|INFO):([\w-]{1,60})$/.exec(String(payload || ''));
+  if (!m) return;
+  const card = await shop.getProductCard(m[2]);
+  if (!card) {
+    return handleIncomingMessage({ platform, platformId: senderId, direct: 'দুঃখিত, পণ্যটি এখন পাওয়া যাচ্ছে না। অন্য কোন পণ্য দেখতে চান, জানাবেন? 😊', sigOk });
+  }
+  if (m[1] === 'INFO') {
+    const msg = `${card.name} — দাম ৳${card.price}${card.sku ? ' (কোড ' + card.sku + ')' : ''}\n\nছবি, অপশন ও রিভিউসহ পুরো বিস্তারিত দেখুন:\n${card.url}\n\nআপনি চাইলে এখানেই অর্ডার করতে পারেন — নিচের কার্ডের "এটি নিতে চাই" চাপুন বা লিখে জানান। 😊`;
+    return handleIncomingMessage({ platform, platformId: senderId, direct: msg, sigOk });
+  }
+  const text = `এই পণ্যটি নিতে চাই: ${card.name}${card.sku ? ' (কোড ' + card.sku + ')' : ''} — দাম ৳${card.price}`;
+  return handleIncomingMessage({ platform, platformId: senderId, text, fromButton: card.id, sigOk });
+}
+
+// পেমেন্টের স্ক্রিনশট দেখার গোপন লিংক (শুধু মালিক জানে — অনুমান-অযোগ্য আইডি)
+router.get('/proof/:id', async (req, res) => {
+  try {
+    const p = /^[a-f0-9]{24}$/.test(req.params.id) ? await store.getProof(req.params.id) : null;
+    if (!p) return res.sendStatus(404);
+    res.set('Cache-Control', 'private, max-age=3600'); res.set('X-Robots-Tag', 'noindex');
+    res.type(p.mime || 'image/jpeg').send(Buffer.from(p.b64, 'base64'));
+  } catch (e) { res.sendStatus(500); }
+});
+
 /* =============== FACEBOOK MESSENGER =============== */
 
 router.get('/facebook', (req, res) => {
@@ -138,6 +185,7 @@ router.post('/facebook', verifyMeta(config.fbAppSecret, 'Facebook'), async (req,
     const events = entry.messaging || [];
     for (const event of events) {
       const senderId = event.sender?.id;
+      if (senderId && event.postback && event.postback.payload) { handlePostback({ platform: 'facebook', senderId, payload: event.postback.payload, sigOk: !!req.sigOk }).catch(err => console.error('Facebook বাটন এরর:', err.message)); continue; }
       const msg = event.message;
       if (!senderId || !msg) continue;
       if (msg.is_echo) continue; // পেজ নিজে যে মেসেজ পাঠিয়েছে তার প্রতিধ্বনি — কাস্টমার না
@@ -244,6 +292,7 @@ router.post('/instagram', verifyMeta([config.fbAppSecret, config.igAppSecret], '
     const events = entry.messaging || [];
     for (const event of events) {
       const senderId = event.sender && event.sender.id;
+      if (senderId && event.postback && event.postback.payload && String(senderId) !== String(entry.id)) { handlePostback({ platform: 'instagram', senderId, payload: event.postback.payload, sigOk: !!req.sigOk }).catch(err => console.error('Instagram বাটন এরর:', err.message)); continue; }
       const msg = event.message;
       if (!senderId || !msg) continue;
       // নিজের অ্যাকাউন্টের পাঠানো মেসেজের প্রতিধ্বনি বাদ
@@ -454,7 +503,7 @@ function typingOn(platform, platformId, settings) {
   }
 }
 
-async function handleIncomingMessage({ platform, platformId, text, name, phone, username, email, imageBuffer, imageMime, audioBuffer, sigOk }) {
+async function handleIncomingMessage({ platform, platformId, text, name, phone, username, email, imageBuffer, imageMime, audioBuffer, sigOk, direct, fromButton }) {
   if (await ownerChannel({ platform, platformId, text, imageBuffer, audioBuffer, sigOk })) return;
   const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone, username, email });
   console.log(`💬 মেসেজ প্রসেস হচ্ছে: ${platform} / ${platformId} (AI ${customer.ai ? 'চালু' : 'বন্ধ'})`);
@@ -495,6 +544,12 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     }
   };
 
+  if (direct) { // কার্ডের "বিস্তারিত" বাটন — AI ছাড়াই সরাসরি উত্তর
+    await store.appendMessage(customer.id, 'assistant', direct);
+    await send(direct);
+    return;
+  }
+
   if (!text && audioBuffer) {
     const whisperKey = pickCapableKey(settings, isWhisperCapable);
     if (!whisperKey) {
@@ -512,6 +567,18 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
       await send('দুঃখিত, ভয়েস মেসেজটা স্পষ্ট শোনা যায়নি। আরেকবার বলবেন বা লিখে পাঠাবেন?');
       return;
     }
+  }
+
+  // পেমেন্টের ধাপে ছবি এলে সেটা স্ক্রিনশট হিসেবে গোপনে রাখি (প্রোডাক্টের ছবি ভেবে বিশ্লেষণ করি না)
+  if (imageBuffer) {
+    try {
+      const recent = (await store.getConversation(customer.id)).slice(-4);
+      if (recent.some(h => h.role === 'assistant' && /TrxID|ট্রানজেকশন|স্ক্রিনশট|বিকাশ|নগদ|bkash|nagad|অগ্রিম/i.test(String(h.text || '')))) {
+        await store.saveProof(customer.id, { mime: imageMime || 'image/jpeg', b64: imageBuffer.toString('base64') });
+        text = (text ? text + ' ' : '') + '[পেমেন্টের স্ক্রিনশট পাঠানো হয়েছে]';
+        imageBuffer = null;
+      }
+    } catch (err) { console.error('পেমেন্টের স্ক্রিনশট রাখা যায়নি:', err.message); }
   }
 
   if (imageBuffer && !text) {
@@ -577,7 +644,8 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   }
 
   const { reply, imageUrl, imageId, shopProductId, order, handoff } = await getAIReplyWithFallback({
-    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext, customerMemory
+    settings, customerMessage: text, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext, customerMemory,
+    customerName: (customer.name && customer.name !== 'অজানা কাস্টমার') ? customer.name : ''
   });
 
   // মালিকের আপলোড করা ছবি থাকলে সেটাকেই অগ্রাধিকার; না থাকলে শিটের ছবির লিংক
@@ -602,7 +670,26 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     outReply = 'আপনার অর্ডারটি এখনো নিশ্চিত হয়নি। কোন পণ্য কত পরিমাণ নেবেন, সাথে নাম, মোবাইল, ঠিকানা আর পেমেন্ট কীভাবে করবেন — একটু জানাবেন? 🙏';
   }
   if (!placingOrder) {
-    await send(outReply, finalImageUrl); // আগে কাস্টমারকে পাঠাই, তারপর খাতায় লিখি
+    // কোনো নির্দিষ্ট পণ্যের কথা হলে ছবি-নাম-দামসহ কার্ড + বাটন পাঠাই (একই পণ্যের কার্ড ১০ মিনিটে একবার; বাটন চাপার পরের অর্ডার-ধাপে নয়)
+    let textSent = false;
+    if (shopProductId && !order && !fromButton && (platform === 'facebook' || platform === 'instagram')) {
+      const ck = customer.id + '|' + shopProductId;
+      if (!lastCardAt.has(ck) || Date.now() - lastCardAt.get(ck) > 10 * 60 * 1000) {
+        const card = await shop.getProductCard(shopProductId).catch(() => null);
+        if (card) {
+          await send(outReply); textSent = true;
+          try {
+            if (await sendProductCard(platform, platformId, settings, card)) lastCardAt.set(ck, Date.now());
+          } catch (err) {
+            console.error('প্রোডাক্ট কার্ড পাঠানো যায়নি:', err.response && err.response.data ? JSON.stringify(err.response.data) : err.message);
+            if (wantsImage && finalImageUrl) {
+              try { await (platform === 'facebook' ? sendFacebookImage(platformId, finalImageUrl, settings.fbToken) : sendInstagramImage(platformId, finalImageUrl, settings.fbToken)); } catch (e) {}
+            }
+          }
+        }
+      }
+    }
+    if (!textSent) await send(outReply, finalImageUrl); // আগে কাস্টমারকে পাঠাই, তারপর খাতায় লিখি
     await store.appendMessage(customer.id, 'assistant', outReply);
   }
 
@@ -672,15 +759,35 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     try {
       const rules = await shop.getDeliveryRules();
       if (rules) {
-        const chk = delivery.checkChatOrder(rules, order);
+        const proofId = await store.getLatestProof(customer.id, 24 * 3600e3).catch(() => '');
+        const chk = delivery.checkChatOrder(rules, order, !!proofId);
         if (!chk.ok) {
           await store.appendMessage(customer.id, 'assistant', chk.message);
           await send(chk.message);
           return;
         }
+        // TrxID সত্যিই কাস্টমার নিজে লিখেছে কিনা (AI বানিয়ে বসালে ধরা পড়ে)
+        if (chk.payment !== 'cod') {
+          const said = fullHistory.some(h => h.role === 'user' && String(h.text || '').toUpperCase().includes(String(chk.transactionId).toUpperCase())) || String(text || '').toUpperCase().includes(String(chk.transactionId).toUpperCase());
+          if (!said) {
+            const mm = 'পেমেন্টের ট্রানজেকশন আইডি (TrxID) টা আরেকবার নিজের হাতে লিখে পাঠাবেন? (বিকাশ/নগদের মেসেজে থাকে) 😊';
+            await store.appendMessage(customer.id, 'assistant', mm); await send(mm); return;
+          }
+          order.paymentProof = proofId;
+        }
         order.district = chk.district; order.payment = chk.payment; order.transactionId = chk.transactionId; order.shipping = chk.shipping;
       }
     } catch (err) { console.error('ডেলিভারি নিয়ম যাচাই করা যায়নি (অর্ডার আগের মতো চলছে):', err.message); }
+
+    // মোবাইল নম্বর ১১ সংখ্যার ও সঠিক প্রিফিক্সের না হলে অর্ডার নেওয়া হবে না (স্টক আটকানোর আগেই)
+    const goodPhone = delivery.normBdPhone(order.phone || customer.phone || '');
+    if (!goodPhone) {
+      const pm = 'দুঃখিত, আপনার মোবাইল নম্বরটি ঠিক মনে হচ্ছে না। বাংলাদেশি নম্বর ১১ সংখ্যার হয় এবং ০১ দিয়ে শুরু হয় (যেমন 01712345678)। সঠিক নম্বরটি আবার লিখে দেবেন? 🙏';
+      await store.appendMessage(customer.id, 'assistant', pm);
+      await send(pm);
+      return;
+    }
+    order.phone = goodPhone;
 
     const wantQty = Number(order.qty) || 1;
 
@@ -724,7 +831,8 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
         price: order.price || 0,
         source: platform === 'email' ? 'Email' : platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : platform === 'tiktok' ? 'TikTok' : 'WhatsApp',
         stockItem: reservedStock ? reservedStock.name : '',
-        district: order.district || '', payment: order.payment || '', transactionId: order.transactionId || '', shipping: order.shipping || 0
+        district: order.district || '', payment: order.payment || '', transactionId: order.transactionId || '', shipping: order.shipping || 0,
+        paymentProof: order.paymentProof || ''
       });
     } catch (err) {
       // অর্ডার সেভ না হলে আটকে রাখা স্টক ফেরত দিই
@@ -736,7 +844,7 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     await notifyOwner({
       type: 'order',
       title: `🛒 নতুন অর্ডার ${savedOrder.id}`,
-      body: `${savedOrder.name} · ${savedOrder.product} x${savedOrder.qty} · ৳${(savedOrder.price || 0) * (savedOrder.qty || 1)}`
+      body: `${savedOrder.name} · ${savedOrder.product} x${savedOrder.qty} · ৳${(savedOrder.price || 0) * (savedOrder.qty || 1)}` + (savedOrder.paymentProof ? `\nপেমেন্ট স্ক্রিনশট: ${config.publicUrl}/webhook/proof/${savedOrder.paymentProof}` : '')
     });
     if (reservedStock && reservedStock.qty <= (settings.lowStockThreshold ?? 5)) {
       await notifyOwner({
