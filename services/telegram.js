@@ -49,6 +49,27 @@ async function sendPhoto(token, chatId, url, caption) {
   await call(token, 'sendPhoto', { chat_id: chatId, photo: url, caption: clip(caption, 1000) }, 25000);
 }
 // ভিডিও সরাসরি আপলোড (বট সর্বোচ্চ ৫০ MB নিতে পারে)
+
+// প্রোডাক্ট কার্ড: ছবি + "এটি নিতে চাই" (বাটন) + "বিস্তারিত" (সাইটের লিংক)
+async function sendCard(token, chatId, card) {
+  const caption = clip(`${card.name}\nদাম ৳${card.price}${card.sku ? ' · কোড ' + card.sku : ''}`, 1000);
+  const reply_markup = { inline_keyboard: [[{ text: 'এটি নিতে চাই', callback_data: 'ORDER:' + card.id }], [{ text: 'বিস্তারিত', url: card.url }]] };
+  if (card.image) await call(token, 'sendPhoto', { chat_id: chatId, photo: card.image, caption, reply_markup }, 25000);
+  else await call(token, 'sendMessage', { chat_id: chatId, text: caption, reply_markup });
+}
+async function answerCallback(token, id) { try { await call(token, 'answerCallbackQuery', { callback_query_id: id }); } catch (e) {} }
+// আগে যুক্ত করা বটের ওয়েবহুকে callback_query না থাকলে নিজে ঠিক করে নেয় (প্রতি চালুতে একবার; আবার কানেক্ট করতে হয় না)
+let cbChecked = '';
+async function ensureCallbacks(token) {
+  if (!token || cbChecked === token || !config.publicUrl) return;
+  cbChecked = token;
+  try {
+    const info = await call(token, 'getWebhookInfo');
+    const ok = Array.isArray(info.allowed_updates) && info.allowed_updates.includes('callback_query');
+    if (info.url && !ok) await call(token, 'setWebhook', { url: info.url, secret_token: secretFor(token), allowed_updates: ['message', 'callback_query'] });
+  } catch (e) { cbChecked = ''; }
+}
+
 async function sendVideoStream(token, chatId, stream, size, caption) {
   if (size > 50 * 1024 * 1024) { stream.destroy(); throw new Error('Telegram বট ৫০ MB-এর বেশি ভিডিও নিতে পারে না — ভিডিও ছোট করুন'); }
   const form = new FormData();
@@ -81,7 +102,7 @@ async function connect({ token, channel }) {
   await call(token, 'setWebhook', {
     url: `${config.publicUrl}/webhook/telegram`,
     secret_token: secretFor(token),
-    allowed_updates: ['message'],
+    allowed_updates: ['message', 'callback_query'],
     drop_pending_updates: true
   });
   const patch = { tgToken: token, tgBotUsername: me.username || '', tgBotId: me.id };
@@ -201,6 +222,6 @@ async function sendTest() {
 }
 
 module.exports = {
-  call, secretFor, checkSecret, normChannel, sendMessage, sendPhoto, sendVideoStream, typing, downloadFile,
+  call, secretFor, checkSecret, normChannel, sendMessage, sendPhoto, sendCard, answerCallback, ensureCallbacks, sendVideoStream, typing, downloadFile,
   connect, disconnect, status, postFields, publishTgJob, runDue, sendTest
 };
