@@ -217,7 +217,8 @@ function isVisionCapable(provider) {
  * কাস্টমারের মেসেজ পড়ে AI দিয়ে রিপ্লাই বানায়।
  * AI কে বলা হয় JSON আকারে ফেরত দিতে: { reply, order }
  */
-async function getAIReply({ apiKey, provider = 'groq', model = '', baseUrl = '', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [], stockList = [], shopContext = '', customerMemory = '' }) {
+async function getAIReply({ apiKey, provider = 'groq', model = '', baseUrl = '', customerMessage, history = [], sheetContext = '', businessInfo = '', ownerRules = [], ownerImages = [], stockList = [], shopContext = '', customerMemory = '', customerName = '' }) {
+  const nameBlock = customerName ? `\n=== কাস্টমারের নাম ===\nনাম: ${customerName}\n` : '';
   // অ্যাপের স্টক পেজ থেকে মালিকের বসানো বর্তমান স্টক — এটাই সবচেয়ে নির্ভরযোগ্য
   const stockBlock = stockList.length
     ? `\n=== বর্তমান স্টক (অ্যাপ থেকে, সবচেয়ে নির্ভরযোগ্য) ===\nনিচের তালিকায় যে প্রোডাক্ট আছে তার স্টক শুধু এখান থেকে বলবে (শিটের Stock কলামের চেয়ে এটা বেশি সঠিক)। ০ হলে "স্টকে নেই" বলবে, আর অর্ডার নেবে না:\n${stockList.map(e => `- ${e.name}: ${e.qty > 0 ? e.qty + 'টি আছে' : 'স্টক শেষ'}`).join('\n')}\n`
@@ -235,7 +236,7 @@ async function getAIReply({ apiKey, provider = 'groq', model = '', baseUrl = '',
 বাংলায়, সংক্ষেপে উত্তর দাও।
 ${businessInfo ? 'দোকানের তথ্য:\n' + businessInfo : ''}
 ${sheetContext ? sheetContext : ''}
-${rulesBlock}${imagesBlock}${stockBlock}${shopContext}${customerMemory ? `
+${nameBlock}${rulesBlock}${imagesBlock}${stockBlock}${shopContext}${customerMemory ? `
 === এই কাস্টমার সম্পর্কে আগের স্মৃতি (আগের কথোপকথন ও অর্ডার থেকে) ===
 ${customerMemory}
 এই তথ্য মনে রেখে কথা বলবে — যা আগেই জানা (নাম, ঠিকানা, পছন্দ, আগের অর্ডার) তা আবার জিজ্ঞেস করবে না; বরং "আগের ঠিকানাতেই পাঠাব?" ধরনের স্বাভাবিক কথা বলবে। স্মৃতিতে ভুল মনে হলে কাস্টমারের নতুন কথাই মানবে।
@@ -245,8 +246,10 @@ ${customerMemory}
 
 === ব্যবহার ও ভদ্রতা ===
 - সবসময় নম্র, ভদ্র ও আন্তরিকভাবে কথা বলবে, কখনো রূঢ় বা তাড়াহুড়ার সুরে না।
-- কাস্টমারের নাম/লেখার ধরন থেকে ছেলে/মেয়ে বোঝা গেলে সেভাবে সম্বোধন করবে —
-  ছেলে হলে "ভাইয়া", মেয়ে হলে "আপু"। বোঝা না গেলে নিরপেক্ষভাবে সম্মানসূচক ভাষায় (আপনি/জি)।
+- কাস্টমারের নাম জানা থাকলে (নিচে "কাস্টমারের নাম" দেখো) নাম ধরে ভদ্রভাবে সম্বোধন করবে:
+  নাম দেখে ছেলে বোঝা গেলে "<নাম> স্যার" (যেমন "রহিম স্যার"), মেয়ে বোঝা গেলে "<নাম> ম্যাম" (যেমন "ফাতেমা ম্যাম")।
+  নাম থেকে ছেলে/মেয়ে নিশ্চিত বোঝা না গেলে শুধু নাম + "আপনি" ব্যবহার করবে — অনুমান করে ভুল সম্বোধন (স্যারকে ম্যাম বা উল্টো) কখনো করবে না।
+  নাম ইংরেজি হলেও (Rahim, Fatema) বাংলায় লিখবে। "ভাইয়া/আপু" আর বলবে না। প্রতি বাক্যে নাম বসাবে না — শুভেচ্ছায়, অর্ডারের সারাংশে আর শেষ ধন্যবাদে বসালেই যথেষ্ট।
 - ধন্যবাদ, দোয়া, সালামের জবাব — এসব স্বাভাবিক সৌজন্যতা বজায় রাখবে।
 
 === সক্রিয়ভাবে কথা বলা (খুবই গুরুত্বপূর্ণ) ===
@@ -284,6 +287,7 @@ ${customerMemory}
 ২) কখনোই কোনো তথ্য নিজে থেকে অনুমান করে বসাবে না। কাস্টমার স্পষ্ট না বললে সেই ফিল্ড খালি থাকবে।
 ৩) অর্ডার নিশ্চিত করার আগে এই ৪টা তথ্য একটার পর একটা (এক মেসেজে সব না চেয়ে) জেনে নেবে:
    পুরো নাম, মোবাইল নাম্বার, ডেলিভারি ঠিকানা, প্রোডাক্টের নাম ও পরিমাণ (qty)।
+৩ক) মোবাইল নাম্বার অবশ্যই ঠিক ১১ সংখ্যার ও ০১ দিয়ে শুরু (০১৩–০১৯) হতে হবে। কাস্টমারের দেওয়া নম্বরে ১০ বা ১২ সংখ্যা, অক্ষর বা ভুল প্রিফিক্স থাকলে সেটা "order"-এ বসাবে না — ভদ্রভাবে জানাবে নম্বরটা ঠিক মনে হচ্ছে না, আবার ১১ সংখ্যার নম্বর দিতে বলবে (+৮৮ বা ৮৮ দিয়ে শুরু হলে ওটুকু বাদ দিয়ে ১১ সংখ্যা ধরবে)।
 ৪) এর মধ্যে কোনো একটা এখনো না পাওয়া গেলে "order" null রাখবে, reply-তে বাকি থাকা
    তথ্যটাই জিজ্ঞেস করবে (একসাথে সব না চেয়ে)।
 ৫) চারটাই পাওয়া গেলে হুবহু বসিয়ে "order" পূরণ করবে, reply-তে সারাংশ দেখিয়ে কনফার্ম করবে।
@@ -343,9 +347,9 @@ ${customerMemory}
 }
 
 // প্রধান AI Key ব্যর্থ হলে (rate limit/quota/এরর) স্বয়ংক্রিয়ভাবে পরের ঘরের Key দিয়ে আবার চেষ্টা করে
-async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [], stockList = [], shopContext = '', customerMemory = '' }) {
+async function getAIReplyWithFallback({ settings, customerMessage, history, sheetContext, businessInfo, ownerRules = [], ownerImages = [], stockList = [], shopContext = '', customerMemory = '', customerName = '' }) {
   return withSlots(settings, (slot) => getAIReply({
-    ...slot, customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext, customerMemory
+    ...slot, customerMessage, history, sheetContext, businessInfo, ownerRules, ownerImages, stockList, shopContext, customerMemory, customerName
   }));
 }
 
