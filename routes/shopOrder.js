@@ -12,7 +12,7 @@ const AI_WEBHOOK_SECRET = process.env.AI_WEBHOOK_SECRET || '';
 // অনুমোদিত সাইটের ঠিকানা: Render-এর ALLOWED_ORIGINS + বর্তমান GitHub ঠিকানা + কেনা ডোমেন (ডোমেন চালু হলে বা মেয়াদ শেষ হলেও আলাদা কিছু বদলাতে হবে না)
 const ALLOWED = Array.from(new Set(
   (process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean)
-    .concat(['https://farukvaiy199-netizen.github.io', 'https://khanglobalshop.com', 'https://www.khanglobalshop.com'])
+    .concat(['https://farukvaiy199-netizen.github.io', 'https://khanglobalshop.com', 'https://www.khanglobalshop.com', 'https://khanglobalshop.pages.dev', 'https://khanglobalshop.web.app', 'https://khanglobalshop.firebaseapp.com'])
 ));
 const ADMIN_UIDS = (process.env.ADMIN_UIDS || 'sJYwLDzg6TNj89EIvnMSJVDF0oT2').split(',').map(x => x.trim()).filter(Boolean);
 const PHONE_DOMAIN = '@phone.khanglobalshop.com';
