@@ -37,10 +37,50 @@ function calcShipping(st, subtotal, district, payment){
   const off = prepaid ? Math.min(c.prepay, base) : 0;
   return { base, off, final: base - off };
 }
+
+// ---- ছাড়ের ইঞ্জিন: ফ্ল্যাশ সেল + বান্ডেল + কুপন (ওয়েবসাইটের dealDiscount-এর হুবহু সার্ভার সংস্করণ) ----
+function normCoupon(v){
+  if(v && typeof v === 'object') return { type: v.type === 'percent' ? 'percent' : 'amount', value: num(v.value, 0), min: num(v.min, 0), max: num(v.max, 0), expires: String(v.expires || ''), first: !!v.first, active: v.active !== false };
+  return { type: 'amount', value: num(v, 0), min: 0, max: 0, expires: '', first: false, active: true };
+}
+function flashOn(st, now){ const f = st && st.flash; return !!(f && f.on && num(f.pct, 0) > 0 && num(f.endAt, 0) > (now || Date.now())); }
+// lines: [{pid, qty, price}] — ফেরত: { flash, bundle, coupon, total, couponCode, couponError }
+function dealDiscount(st, lines, code, ctx){
+  ctx = ctx || {};
+  const now = ctx.now || Date.now();
+  const subtotal = lines.reduce((s, l)=>s + l.price * l.qty, 0);
+  let flash = 0;
+  if(flashOn(st, now)){
+    const f = st.flash, pids = Array.isArray(f.pids) ? f.pids : [], pct = num(f.pct, 0);
+    lines.forEach(l=>{ if(!pids.length || pids.includes(l.pid)) flash += Math.round(l.price * l.qty * pct / 100); });
+  }
+  let bundle = 0;
+  const b = st && st.bundle, qtyAll = lines.reduce((s, l)=>s + l.qty, 0);
+  if(b && b.on && num(b.pct, 0) > 0 && qtyAll >= Math.max(num(b.minQty, 2), 2)) bundle = Math.round(Math.max(subtotal - flash, 0) * num(b.pct, 0) / 100);
+  let coupon = 0, couponError = '';
+  const cc = String(code || '').trim().toUpperCase();
+  if(cc){
+    const raw = st && st.coupons && st.coupons[cc];
+    if(raw === undefined || raw === null || raw === '') couponError = 'অবৈধ কুপন কোড';
+    else{
+      const c = normCoupon(raw), base = Math.max(subtotal - flash - bundle, 0);
+      if(!c.active) couponError = 'এই কুপনটি এখন বন্ধ আছে';
+      else if(c.expires && now > Date.parse(c.expires + 'T23:59:59+06:00')) couponError = 'এই কুপনের মেয়াদ শেষ';
+      else if(c.min && base < c.min) couponError = 'এই কুপনের জন্য কমপক্ষে ৳' + c.min + ' এর কেনাকাটা লাগবে';
+      else if(c.first && ctx.priorOrders > 0) couponError = 'এই কুপন শুধু প্রথম অর্ডারের জন্য';
+      else{
+        coupon = c.type === 'percent' ? Math.round(base * c.value / 100) : c.value;
+        if(c.type === 'percent' && c.max > 0) coupon = Math.min(coupon, c.max);
+      }
+    }
+  }
+  const total = Math.min(flash + bundle + coupon, subtotal);
+  return { flash, bundle, coupon, total, couponCode: couponError ? '' : cc, couponError };
+}
 const variantsOf = p=>Array.isArray(p.variants) ? p.variants.filter(v=>v && v.id) : [];
 
 // st: সেটিংস, products: { pid: productData }, input: গ্রাহকের পাঠানো তথ্য
-function computeOrder(st, products, input){
+function computeOrder(st, products, input, ctx){
   const name = String(input.name || '').trim(), phone = String(input.phone || '').replace(/[\s-]/g, '');
   const address = String(input.address || '').trim(), district = String(input.district || '').trim(), upazila = String(input.upazila || '').trim();
   if(!isValidName(name)) throw new UserError('সঠিক পুরো নাম দিন');
@@ -97,9 +137,9 @@ function computeOrder(st, products, input){
     else stockUpdates.push({ pid, newStock: Math.max((w.p.stock || 0) - w.plain, 0) });
   }
 
-  let discount = 0;
-  const code = String(input.couponCode || '').trim().toUpperCase();
-  if(code && st.coupons && st.coupons[code]) discount = num(st.coupons[code], 0);
+  const dd = dealDiscount(st, items, input.couponCode, ctx);
+  if(dd.couponError) throw new UserError(dd.couponError);
+  const discount = dd.total;
   const taxable = Math.max(subtotal - discount, 0);
   const taxRate = num(st.tax, 0);
   const tax = taxRate > 0 ? Math.round(taxable * taxRate / 100) : 0;
@@ -117,8 +157,8 @@ function computeOrder(st, products, input){
       dueAmount = Math.max(total - advanceAmount, 0);
     }
   }
-  return { name, phone, address, district, upazila, payment, transactionId, items, subtotal, discount, tax,
+  return { name, phone, address, district, upazila, payment, transactionId, items, subtotal, discount, couponCode: dd.couponCode, flashDiscount: dd.flash, bundleDiscount: dd.bundle, couponDiscount: dd.coupon, tax,
     shipping: ship.final, shippingBase: ship.base, prepayDiscount: ship.off, total, advanceAmount, dueAmount, paymentPlanPercent: planPercent, stockUpdates };
 }
 
-module.exports = { UserError, computeOrder, calcShipping, isValidPhone, num };
+module.exports = { UserError, computeOrder, dealDiscount, calcShipping, isValidPhone, num };
