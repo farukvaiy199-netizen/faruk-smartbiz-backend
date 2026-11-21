@@ -563,6 +563,36 @@ async function getProductCard(id) {
   } catch (e) { return null; }
 }
 
+
+// উত্তর/কথোপকথনে যে পণ্যগুলোর নাম এসেছে সেগুলো সার্ভার নিজে চেনে (AI আইডি না দিলেও কার্ড/ছবি যায়)।
+// ক্রম: ১) AI-র উত্তরে নাম আছে এমন পণ্য (উল্লেখের ক্রমে, সর্বোচ্চ ৩) ২) কাস্টমারের লেখা ৩) আগের মেসেজে সর্বশেষ উল্লেখ ৪) AI-র দেওয়া আইডি
+const bnDigits = t => String(t || '').replace(/[০-৯]/g, d => '০১২৩৪৫৬৭৮৯'.indexOf(d));
+const normName = t => bnDigits(t).toLowerCase().normalize('NFC').replace(/[\s*_`'"“”‘’.,:;!?()\-–—|\[\]]+/g, '');
+async function resolveProducts({ reply, text, history = [], aiId }) {
+  try {
+    const { snap: s } = await getSnapshot();
+    if (!s) return [];
+    const act = activeProducts(s.products).filter(p => p.name && normName(p.name).length >= 3);
+    const findIn = str => {
+      const hay = normName(str); if (!hay) return [];
+      return act.map(p => ({ p, i: hay.indexOf(normName(p.name)) })).filter(x => x.i >= 0).sort((a, b) => a.i - b.i || normName(b.p.name).length - normName(a.p.name).length);
+    };
+    const uniq = list => { const seen = new Set(); return list.filter(x => !seen.has(x.p.id) && seen.add(x.p.id)).map(x => x.p); };
+    let found = uniq(findIn(reply));
+    // উত্তরে ৩টির বেশি পণ্যের তালিকা থাকলে কার্ড নয় (তালিকা-উত্তর)
+    const replyCount = found.length;
+    // একটা নাম আরেকটার অংশ হলে (যেমন "মধু ১ কেজি" ⊂ "পিউর সুন্দরবন মধু ১ কেজি") লম্বাটাই রাখি
+    found = found.filter(a => !found.some(b => b !== a && normName(b.name).includes(normName(a.name))));
+    if (replyCount > 3) return [];
+    if (!found.length) found = uniq(findIn(text));
+    if (!found.length) {
+      for (let k = history.length - 1; k >= 0 && !found.length; k--) found = uniq(findIn(history[k].text));
+    }
+    if (!found.length && aiId) { const p = act.find(x => String(x.id) === String(aiId)); if (p) found = [p]; }
+    return found.slice(0, 3).map(p => p.id);
+  } catch (e) { return []; }
+}
+
 function toValue(v) {
   if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
   return { stringValue: String(v) };
@@ -608,4 +638,4 @@ async function categoryNames() {
   return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
 }
 
-module.exports = { getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+module.exports = { resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
