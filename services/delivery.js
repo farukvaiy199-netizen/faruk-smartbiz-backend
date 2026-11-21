@@ -69,7 +69,7 @@ ${r.plans.length ? `- অগ্রিমের অপশন: মোট দাম
 অর্ডার নেওয়ার সময় এই ধাপগুলো মানবে:
 ক) নাম, ফোন, ঠিকানা ও পণ্যের সাথে কাস্টমারের **জেলা** জেনে নেবে (ঠিকানায় না থাকলে জিজ্ঞেস করবে)।
 খ) জেলা COD-এর তালিকায় থাকলে জিজ্ঞেস করবে "ক্যাশ অন ডেলিভারি নেবেন নাকি আগে পেমেন্ট করবেন?"। না থাকলে পরিষ্কার জানাবে এই জেলায় COD নেই, অগ্রিম পেমেন্ট লাগবে — নম্বর ও চার্জ জানিয়ে পেমেন্ট করে ট্রানজেকশন আইডি (TrxID) পাঠাতে বলবে।
-গ) অগ্রিমের ক্ষেত্রে TrxID না পাওয়া পর্যন্ত "order" null রাখবে।
+গ) অগ্রিম পেমেন্টে (বিকাশ/নগদ) দুটোই লাগবে: (১) ট্রানজেকশন আইডি (TrxID) এবং (২) পেমেন্টের স্ক্রিনশট। কাস্টমার স্ক্রিনশট পাঠালে চ্যাটে "[পেমেন্টের স্ক্রিনশট পাঠানো হয়েছে]" লেখা দেখবে। TrxID ও স্ক্রিনশট — এই দুটোর একটাও না পাওয়া পর্যন্ত "order" null রাখবে এবং যেটা বাকি সেটা ভদ্রভাবে চাইবে।
 ঘ) "order"-এ অতিরিক্ত ফিল্ড বসাবে: "district" (কাস্টমারের জেলা, বাংলায়), "payment" ("cod" / "bkash" / "nagad"), "transactionId" (অগ্রিম হলে কাস্টমারের দেওয়া TrxID হুবহু, নইলে null)।
 ঙ) সারাংশে পণ্যের দাম, ডেলিভারি চার্জ ও মোট পরিশোধযোগ্য টাকা আলাদা করে দেখাবে। ওয়েবসাইট: ${site}
 `;
@@ -78,7 +78,7 @@ ${r.plans.length ? `- অগ্রিমের অপশন: মোট দাম
 const isValidTrx = t => /^[A-Za-z0-9]{8,15}$/.test(String(t || '').trim()) && /[A-Za-z]/.test(t) && /[0-9]/.test(t);
 
 // চ্যাট-অর্ডার তৈরির আগে সার্ভারের পাহারা (AI ভুল করলেও ফেক/নিয়মবিরুদ্ধ COD অর্ডার ঢুকবে না)
-function checkChatOrder(r, order) {
+function checkChatOrder(r, order, hasProof) {
   const subtotal = (Number(order.price) || 0) * (Number(order.qty) || 1);
   const fromAi = canon(order.district);
   const inAddr = districtsIn(order.address);
@@ -105,7 +105,16 @@ function checkChatOrder(r, order) {
     if (!isValidTrx(transactionId))
       return { ok: false, message: 'পেমেন্টের ট্রানজেকশন আইডি (TrxID) সঠিক মনে হচ্ছে না — বিকাশ/নগদের মেসেজ থেকে আইডিটা (অক্ষর ও সংখ্যা মিশিয়ে ৮-১৫ ঘরের) হুবহু পাঠাবেন?' + (pay ? '\n' + pay : '') };
   }
+  if (payment !== 'cod' && !hasProof)
+    return { ok: false, message: 'পেমেন্টের স্ক্রিনশটটা (বিকাশ/নগদের মেসেজ বা অ্যাপের ছবি) পাঠিয়ে দেবেন? স্ক্রিনশট পেলেই অর্ডারটা কনফার্ম করে ফেলব। 😊' };
   return { ok: true, district, payment, transactionId, shipping: ship.final, total: subtotal + ship.final };
 }
 
-module.exports = { DISTRICTS, canon, districtsIn, fromSettings, promptText, checkChatOrder, isValidTrx };
+// বাংলাদেশি মোবাইল নম্বর: ১১ সংখ্যা, ০১৩–০১৯ দিয়ে শুরু। +৮৮/৮৮ থাকলে বাদ; ভুল হলে '' ফেরত
+function normBdPhone(raw) {
+  let t = String(raw || '').replace(/[০-৯]/g, d => '০১২৩৪৫৬৭৮৯'.indexOf(d)).replace(/[\s\-().]/g, '');
+  if (/^\+?8801/.test(t)) t = t.replace(/^\+?88/, '');
+  return /^01[3-9]\d{8}$/.test(t) ? t : '';
+}
+
+module.exports = { normBdPhone, DISTRICTS, canon, districtsIn, fromSettings, promptText, checkChatOrder, isValidTrx };
