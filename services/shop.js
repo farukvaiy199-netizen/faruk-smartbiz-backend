@@ -567,7 +567,7 @@ async function getProductCard(id) {
 // উত্তর/কথোপকথনে যে পণ্যগুলোর নাম এসেছে সেগুলো সার্ভার নিজে চেনে (AI আইডি না দিলেও কার্ড/ছবি যায়)।
 // ক্রম: ১) AI-র উত্তরে নাম আছে এমন পণ্য (উল্লেখের ক্রমে, সর্বোচ্চ ৩) ২) কাস্টমারের লেখা ৩) আগের মেসেজে সর্বশেষ উল্লেখ ৪) AI-র দেওয়া আইডি
 const bnDigits = t => String(t || '').replace(/[০-৯]/g, d => '০১২৩৪৫৬৭৮৯'.indexOf(d));
-const normName = t => bnDigits(t).toLowerCase().normalize('NFC').replace(/[\s*_`'"“”‘’.,:;!?()\-–—|\[\]]+/g, '');
+const normName = t => bnDigits(t).toLowerCase().normalize('NFC').replace(/[\u0981\s*_`'"“”‘’.,:;!?()\-–—|\[\]]+/g, '');
 async function resolveProducts({ reply, text, history = [], aiId }) {
   try {
     const { snap: s } = await getSnapshot();
@@ -578,7 +578,15 @@ async function resolveProducts({ reply, text, history = [], aiId }) {
       return act.map(p => ({ p, i: hay.indexOf(normName(p.name)) })).filter(x => x.i >= 0).sort((a, b) => a.i - b.i || normName(b.p.name).length - normName(a.p.name).length);
     };
     const uniq = list => { const seen = new Set(); return list.filter(x => !seen.has(x.p.id) && seen.add(x.p.id)).map(x => x.p); };
+    // নামের বানান একটু অন্যরকম হলেও (ট্রাইগ্রাম মিল ≥ ৮০%) চিনে নিই
+    const tri = t => { const a = new Set(); for (let i = 0; i + 3 <= t.length; i++) a.add(t.slice(i, i + 3)); return a; };
+    const fuzzy = str => {
+      const hay = tri(normName(str)); if (hay.size < 3) return [];
+      return act.map(p => { const n = tri(normName(p.name)); let c = 0; n.forEach(g => { if (hay.has(g)) c++; }); return { p, i: 1e6, sc: n.size ? c / n.size : 0 }; })
+        .filter(x => x.sc >= 0.8).sort((a, b) => b.sc - a.sc);
+    };
     let found = uniq(findIn(reply));
+    if (!found.length) found = uniq(fuzzy(reply)).slice(0, 1);
     // উত্তরে ৩টির বেশি পণ্যের তালিকা থাকলে কার্ড নয় (তালিকা-উত্তর)
     const replyCount = found.length;
     // একটা নাম আরেকটার অংশ হলে (যেমন "মধু ১ কেজি" ⊂ "পিউর সুন্দরবন মধু ১ কেজি") লম্বাটাই রাখি
@@ -586,11 +594,12 @@ async function resolveProducts({ reply, text, history = [], aiId }) {
     if (replyCount > 3) return [];
     if (!found.length) found = uniq(findIn(text));
     if (!found.length) {
-      for (let k = history.length - 1; k >= 0 && !found.length; k--) found = uniq(findIn(history[k].text));
+      for (let k = history.length - 1; k >= 0 && !found.length; k--) { const t = history[k].text || history[k].content || ''; found = uniq(findIn(t)); if (!found.length) found = uniq(fuzzy(t)).slice(0, 1); }
     }
     if (!found.length && aiId) { const p = act.find(x => String(x.id) === String(aiId)); if (p) found = [p]; }
+    if (!found.length) console.log('কার্ড: কোনো পণ্য চেনা যায়নি — উত্তর:', String(reply).slice(0, 80), '| পণ্য-সংখ্যা:', act.length, '| AI-আইডি:', aiId || '-');
     return found.slice(0, 3).map(p => p.id);
-  } catch (e) { return []; }
+  } catch (e) { console.error('resolveProducts এরর:', e.message); return []; }
 }
 
 function toValue(v) {
