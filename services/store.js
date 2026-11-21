@@ -234,7 +234,7 @@ async function nextOrderId() {
   return nextOrderIdFrom(await getDb());
 }
 
-async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping }) {
+async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping, paymentProof }) {
   const db = await getDb();
   // আইডি আসে মালিকের অর্ডার-শিট থেকে (প্রথম ফাঁকা ঘর); শিট চালু না থাকলে আগের নিয়মে
   let id = null;
@@ -252,12 +252,32 @@ async function createOrder({ customerId, name, phone, address, product, qty, pri
     status: 'Pending', source,
     callStatus: '', callNote: '', callAt: '', remindAt: '', callAttempts: 0, fsSynced: false,
     stockItem: stockItem || '', stockRestored: false,
-    district: district || '', payment: payment || '', transactionId: transactionId || '', shipping: Number(shipping) || 0,
+    district: district || '', payment: payment || '', transactionId: transactionId || '', shipping: Number(shipping) || 0, paymentProof: paymentProof || '',
     createdAt: new Date().toISOString()
   };
   await db.collection('orders').insertOne(order);
   await db.collection('customers').updateOne({ id: customerId }, { $inc: { orders: 1 } });
   return stripId(order);
+}
+
+
+// বিকাশ/নগদ পেমেন্টের স্ক্রিনশট — গোপন (অনুমান-অযোগ্য) আইডিতে রাখা হয়
+async function saveProof(customerId, { mime, b64 }) {
+  const db = await getDb();
+  const id = require('crypto').randomBytes(12).toString('hex');
+  await db.collection('proofs').insertOne({ id, customerId, mime: mime || 'image/jpeg', b64, createdAt: new Date().toISOString() });
+  const old = await db.collection('proofs').find({}, { projection: { _id: 1 } }).sort({ createdAt: -1 }).skip(300).toArray();
+  if (old.length) await db.collection('proofs').deleteMany({ _id: { $in: old.map(o => o._id) } });
+  return id;
+}
+async function getLatestProof(customerId, maxAgeMs) {
+  const db = await getDb();
+  const d = await db.collection('proofs').find({ customerId }, { projection: { id: 1, createdAt: 1 } }).sort({ createdAt: -1 }).limit(1).toArray();
+  return d[0] && (Date.now() - new Date(d[0].createdAt).getTime() < (maxAgeMs || 86400000)) ? d[0].id : '';
+}
+async function getProof(id) {
+  const db = await getDb();
+  return db.collection('proofs').findOne({ id: String(id) });
 }
 
 async function getOrders() {
@@ -776,7 +796,7 @@ async function failStuckVideoPosts() {
   );
 }
 
-module.exports = {
+module.exports = { saveProof, getLatestProof, getProof,
   getDb, failStuckVideoPosts,
   getSettings, saveSettings,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
