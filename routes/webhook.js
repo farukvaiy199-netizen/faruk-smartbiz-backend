@@ -119,37 +119,65 @@ function verifyMeta(secretOrList, label) {
 
 /* =============== প্রোডাক্ট কার্ড (ছবি + "এটি নিতে চাই" / "বিস্তারিত" বাটন) ও বাটন-চাপা (postback) =============== */
 const lastCardAt = new Map(); // customerId|productId → সময়; একই পণ্যের কার্ড বারবার না পাঠানোর জন্য
-async function sendProductCard(platform, platformId, settings, card) {
-  if (!card || !(platform === 'facebook' || platform === 'instagram') || !settings.fbToken) return false;
-  const el = {
-    title: String(card.name).slice(0, 80),
-    subtitle: ('দাম ৳' + card.price + (card.sku ? ' · কোড ' + card.sku : '')).slice(0, 80),
-    buttons: [
-      { type: 'postback', title: 'এটি নিতে চাই', payload: 'ORDER:' + card.id },
-      { type: 'postback', title: 'বিস্তারিত', payload: 'INFO:' + card.id }
-    ]
-  };
-  if (card.image) el.image_url = card.image;
-  await axios.post('https://graph.facebook.com/v21.0/me/messages', {
-    recipient: { id: platformId }, messaging_type: 'RESPONSE',
-    message: { attachment: { type: 'template', payload: { template_type: 'generic', elements: [el] } } }
-  }, { params: { access_token: settings.fbToken }, timeout: 15000 });
-  return true;
+async function sendProductCards(platform, platformId, settings, cards) {
+  cards = (cards || []).filter(Boolean);
+  if (!cards.length) return false;
+  if (platform === 'facebook' || platform === 'instagram') {
+    if (!settings.fbToken) return false;
+    const elements = cards.map(card => {
+      const el = {
+        title: String(card.name).slice(0, 80),
+        subtitle: ('দাম ৳' + card.price + (card.sku ? ' · কোড ' + card.sku : '')).slice(0, 80),
+        buttons: [
+          { type: 'postback', title: 'এটি নিতে চাই', payload: 'ORDER:' + card.id },
+          { type: 'postback', title: 'বিস্তারিত', payload: 'INFO:' + card.id }
+        ]
+      };
+      if (card.image) el.image_url = card.image;
+      return el;
+    });
+    // Instagram-Login টোকেন (IG…) হলে graph.instagram.com, নইলে পেজ টোকেনে graph.facebook.com
+    const host = platform === 'instagram' && /^IG/.test(String(settings.fbToken)) ? 'https://graph.instagram.com/v21.0' : 'https://graph.facebook.com/v21.0';
+    await axios.post(host + '/me/messages', {
+      recipient: { id: platformId }, messaging_type: 'RESPONSE',
+      message: { attachment: { type: 'template', payload: { template_type: 'generic', elements } } }
+    }, { params: { access_token: settings.fbToken }, timeout: 15000 });
+    return true;
+  }
+  if (platform === 'telegram') {
+    if (!settings.tgToken) return false;
+    for (const c of cards) await telegram.sendCard(settings.tgToken, platformId, c);
+    return true;
+  }
+  if (platform === 'whatsapp') {
+    if (!settings.waToken || !settings.waPhoneNumberId) return false;
+    for (const c of cards) {
+      const interactive = {
+        type: 'button',
+        body: { text: (c.name + '\nদাম ৳' + c.price + (c.sku ? ' · কোড ' + c.sku : '')).slice(0, 1000) },
+        action: { buttons: [{ type: 'reply', reply: { id: 'ORDER:' + c.id, title: 'এটি নিতে চাই' } }, { type: 'reply', reply: { id: 'INFO:' + c.id, title: 'বিস্তারিত' } }] }
+      };
+      if (c.image) interactive.header = { type: 'image', image: { link: c.image } };
+      await axios.post(`https://graph.facebook.com/v21.0/${settings.waPhoneNumberId}/messages`, { messaging_product: 'whatsapp', to: platformId, type: 'interactive', interactive },
+        { headers: { Authorization: 'Bearer ' + settings.waToken }, timeout: 15000 });
+    }
+    return true;
+  }
+  return false;
 }
-// কাস্টমার কার্ডের বাটন চাপলে
-async function handlePostback({ platform, senderId, payload, sigOk }) {
+// কাস্টমার কার্ডের বাটন চাপলে — extra: নাম/ফোন (WhatsApp)
+async function handlePostback({ platform, senderId, payload, sigOk, extra }) {
   const m = /^(ORDER|INFO):([\w-]{1,60})$/.exec(String(payload || ''));
   if (!m) return;
   const card = await shop.getProductCard(m[2]);
-  if (!card) {
-    return handleIncomingMessage({ platform, platformId: senderId, direct: 'দুঃখিত, পণ্যটি এখন পাওয়া যাচ্ছে না। অন্য কোন পণ্য দেখতে চান, জানাবেন? 😊', sigOk });
-  }
+  const base = Object.assign({ platform, platformId: senderId, sigOk }, extra || {});
+  if (!card) return handleIncomingMessage({ ...base, direct: 'দুঃখিত, পণ্যটি এখন পাওয়া যাচ্ছে না। অন্য কোন পণ্য দেখতে চান, জানাবেন? 😊' });
   if (m[1] === 'INFO') {
-    const msg = `${card.name} — দাম ৳${card.price}${card.sku ? ' (কোড ' + card.sku + ')' : ''}\n\nছবি, অপশন ও রিভিউসহ পুরো বিস্তারিত দেখুন:\n${card.url}\n\nআপনি চাইলে এখানেই অর্ডার করতে পারেন — নিচের কার্ডের "এটি নিতে চাই" চাপুন বা লিখে জানান। 😊`;
-    return handleIncomingMessage({ platform, platformId: senderId, direct: msg, sigOk });
+    const msg = `${card.name} — দাম ৳${card.price}${card.sku ? ' (কোড ' + card.sku + ')' : ''}\n\nছবি, অপশন ও রিভিউসহ পুরো বিস্তারিত দেখুন:\n${card.url}\n\nআপনি চাইলে এখানেই অর্ডার করতে পারেন — কার্ডের "এটি নিতে চাই" চাপুন বা লিখে জানান। 😊`;
+    return handleIncomingMessage({ ...base, direct: msg });
   }
   const text = `এই পণ্যটি নিতে চাই: ${card.name}${card.sku ? ' (কোড ' + card.sku + ')' : ''} — দাম ৳${card.price}`;
-  return handleIncomingMessage({ platform, platformId: senderId, text, fromButton: card.id, sigOk });
+  return handleIncomingMessage({ ...base, text, fromButton: card.id });
 }
 
 // পেমেন্টের স্ক্রিনশট দেখার গোপন লিংক (শুধু মালিক জানে — অনুমান-অযোগ্য আইডি)
@@ -245,6 +273,11 @@ router.post('/whatsapp', verifyMeta(config.waAppSecret, 'WhatsApp'), async (req,
     let text = msg.text?.body;
     let imageBuffer = null, imageMime = null, audioBuffer = null;
 
+    if (msg.type === 'interactive' && msg.interactive && msg.interactive.button_reply && msg.interactive.button_reply.id && from) {
+      handlePostback({ platform: 'whatsapp', senderId: from, payload: msg.interactive.button_reply.id, sigOk: !!req.sigOk, extra: { name, phone: from } }).catch(err => console.error('WhatsApp বাটন এরর:', err.message));
+      continue;
+    }
+
     try {
       if (msg.type === 'image' && msg.image?.id && settings.waToken) {
         const media = await getWhatsAppMediaBuffer(msg.image.id, settings.waToken);
@@ -337,6 +370,14 @@ router.post('/telegram', async (req, res) => {
     const upd = req.body || {};
     if (tgSeen.includes(upd.update_id)) return;
     tgSeen.push(upd.update_id); if (tgSeen.length > 300) tgSeen.shift();
+    telegram.ensureCallbacks(settings.tgToken).catch(() => {});
+    const cq = upd.callback_query;
+    if (cq && cq.data && cq.message && cq.message.chat && cq.message.chat.type === 'private') {
+      telegram.answerCallback(settings.tgToken, cq.id);
+      const nm = [cq.from && cq.from.first_name, cq.from && cq.from.last_name].filter(Boolean).join(' ') || (cq.from && cq.from.username) || '';
+      await handlePostback({ platform: 'telegram', senderId: String(cq.message.chat.id), payload: cq.data, sigOk: true, extra: { name: nm, username: (cq.from && cq.from.username) || '' } });
+      return;
+    }
     const m = upd.message;
     if (!m || !m.chat || m.chat.type !== 'private' || (m.from && m.from.is_bot)) return;
     const chatId = String(m.chat.id);
@@ -582,7 +623,6 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   }
 
   if (imageBuffer && !text) {
-    await store.appendMessage(customer.id, 'user', '[ছবি পাঠিয়েছে]');
 
     const visionKey = pickCapableKey(settings, isVisionCapable);
     if (!visionKey) {
@@ -594,13 +634,22 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
 
     const sheetContext = (await getSheetCtx(settings, '')) + (await shop.getAiContext(''));
     try {
-      const { reply } = await getVisionReply({
+      const vr = await getVisionReply({
         apiKey: visionKey.apiKey, provider: visionKey.provider,
         imageBase64: imageBuffer.toString('base64'), mimeType: imageMime || 'image/jpeg',
         sheetContext, businessInfo
       });
+      const reply = vr.reply;
+      // ছবিতে কী দেখা গেছে সেটা কথোপকথনে লিখে রাখি — পরের মেসেজে AI এটা ধরে কথা বলবে
+      await store.appendMessage(customer.id, 'user', '[ছবি পাঠিয়েছে' + (vr.seen ? ': ' + String(vr.seen).slice(0, 150) : '') + ']');
       await store.appendMessage(customer.id, 'assistant', reply);
       await send(reply);
+      const vids = vr.matched === false ? [] : await shop.resolveProducts({ reply, text: '', history: [], aiId: vr.productId });
+      if (vids.length && ['facebook', 'instagram', 'whatsapp', 'telegram'].includes(platform)) {
+        const cards = (await Promise.all(vids.map(id => shop.getProductCard(id).catch(() => null)))).filter(Boolean);
+        try { if (await sendProductCards(platform, platformId, settings, cards)) cards.forEach(c => lastCardAt.set(customer.id + '|' + c.id, Date.now())); }
+        catch (err) { console.error(`কার্ড পাঠানো যায়নি (${platform}):`, err.response && err.response.data ? JSON.stringify(err.response.data) : err.message); }
+      }
     } catch (err) {
       console.error('ছবি প্রসেস করতে ব্যর্থ:', err.message);
       const msgTxt = 'দুঃখিত, ছবিটা এই মুহূর্তে দেখা যাচ্ছে না। প্রোডাক্টের নাম লিখে জানাবেন?';
@@ -648,6 +697,8 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     customerName: (customer.name && customer.name !== 'অজানা কাস্টমার') ? customer.name : ''
   });
 
+  // AI আইডি না দিলেও (বা ভুল দিলেও) উত্তরে যে পণ্যের নাম আছে সার্ভার নিজে চিনে নেয়
+  const resolvedIds = (order || fromButton) ? [] : await shop.resolveProducts({ reply, text, history, aiId: shopProductId });
   // মালিকের আপলোড করা ছবি থাকলে সেটাকেই অগ্রাধিকার; না থাকলে শিটের ছবির লিংক
   let finalImageUrl = imageUrl;
   // কাস্টমার ছবি না চাইলে কখনো ছবি পাঠানো হবে না
@@ -657,8 +708,8 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     finalImageUrl = `${config.publicUrl}/media/${imageId}`;
   }
   // ওয়েবসাইটের প্রোডাক্টের ছবি (পাওয়া না গেলে null — তখন reply-তে থাকা লিংকই কাস্টমার পান)
-  if (wantsImage && !finalImageUrl && shopProductId) {
-    finalImageUrl = await shop.getProductImage(shopProductId);
+  if (wantsImage && !finalImageUrl && (resolvedIds[0] || shopProductId)) {
+    finalImageUrl = await shop.getProductImage(resolvedIds[0] || shopProductId);
   }
 
   // অর্ডার নেওয়া হচ্ছে — AI-র নিজের "নিশ্চিত হলো" লেখা পাঠাই না; সার্ভার যাচাই করে নিজে নিশ্চিতকরণ/সমস্যার বার্তা দেবে
@@ -672,20 +723,21 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   if (!placingOrder) {
     // কোনো নির্দিষ্ট পণ্যের কথা হলে ছবি-নাম-দামসহ কার্ড + বাটন পাঠাই (একই পণ্যের কার্ড ১০ মিনিটে একবার; বাটন চাপার পরের অর্ডার-ধাপে নয়)
     let textSent = false;
-    if (shopProductId && !order && !fromButton && (platform === 'facebook' || platform === 'instagram')) {
-      const ck = customer.id + '|' + shopProductId;
-      if (!lastCardAt.has(ck) || Date.now() - lastCardAt.get(ck) > 10 * 60 * 1000) {
-        const card = await shop.getProductCard(shopProductId).catch(() => null);
-        if (card) {
-          await send(outReply); textSent = true;
+    if (resolvedIds.length && ['facebook', 'instagram', 'whatsapp', 'telegram'].includes(platform)) {
+      // কাস্টমার নিজে ছবি/দেখতে চাইলে সবসময়, নইলে একই পণ্যের কার্ড ১০ মিনিটে একবার
+      const fresh = resolvedIds.filter(id => wantsImage || !lastCardAt.has(customer.id + '|' + id) || Date.now() - lastCardAt.get(customer.id + '|' + id) > 10 * 60 * 1000);
+      const cards = (await Promise.all(fresh.map(id => shop.getProductCard(id).catch(() => null)))).filter(Boolean);
+      if (cards.length) {
+        await send(outReply); textSent = true;
+        try {
+          if (await sendProductCards(platform, platformId, settings, cards)) cards.forEach(c => lastCardAt.set(customer.id + '|' + c.id, Date.now()));
+        } catch (err) {
+          console.error(`প্রোডাক্ট কার্ড পাঠানো যায়নি (${platform}):`, err.response && err.response.data ? JSON.stringify(err.response.data) : err.message);
+          // কার্ড না গেলে অন্তত ছবি + লিংক
           try {
-            if (await sendProductCard(platform, platformId, settings, card)) lastCardAt.set(ck, Date.now());
-          } catch (err) {
-            console.error('প্রোডাক্ট কার্ড পাঠানো যায়নি:', err.response && err.response.data ? JSON.stringify(err.response.data) : err.message);
-            if (wantsImage && finalImageUrl) {
-              try { await (platform === 'facebook' ? sendFacebookImage(platformId, finalImageUrl, settings.fbToken) : sendInstagramImage(platformId, finalImageUrl, settings.fbToken)); } catch (e) {}
-            }
-          }
+            const img = cards[0].image;
+            if (img) await (platform === 'facebook' ? sendFacebookImage(platformId, img, settings.fbToken) : platform === 'instagram' ? sendInstagramImage(platformId, img, settings.fbToken) : platform === 'whatsapp' ? sendWhatsAppImage(platformId, img, settings.waPhoneNumberId, settings.waToken) : telegram.sendPhoto(settings.tgToken, platformId, img, cards[0].name + ' — ৳' + cards[0].price));
+          } catch (e2) { console.error('ছবিও পাঠানো যায়নি:', e2.message); }
         }
       }
     }
