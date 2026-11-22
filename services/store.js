@@ -175,7 +175,7 @@ async function setCustomerAI(id, aiOn) {
   return stripId(await col.findOne({ id }));
 }
 
-async function updateCustomerContact(id, { name, phone, photoUrl, username, email }) {
+async function updateCustomerContact(id, { name, phone, photoUrl, username, email, orderName, nameSource }) {
   const db = await getDb();
   const col = db.collection('customers');
   const set = {};
@@ -184,6 +184,8 @@ async function updateCustomerContact(id, { name, phone, photoUrl, username, emai
   if (photoUrl) set.photoUrl = photoUrl;
   if (username) set.username = username;
   if (email) set.email = email;
+  if (orderName && orderName.trim()) set.orderName = orderName.trim();
+  if (nameSource) set.nameSource = nameSource;
   if (Object.keys(set).length) await col.updateOne({ id }, { $set: set });
   return stripId(await col.findOne({ id }));
 }
@@ -195,11 +197,11 @@ async function getConversation(customerId) {
   return (doc && doc.messages) || [];
 }
 
-async function appendMessage(customerId, role, text) {
+async function appendMessage(customerId, role, text, meta) {
   const db = await getDb();
   const current = await getConversation(customerId);
   // সাম্প্রতিক ১৬টা মেসেজ রাখি — এতে প্রতিটা AI রিকোয়েস্টে কম টোকেন লাগে
-  const updated = [...current, { role, text, ts: new Date().toISOString() }].slice(-24);
+  const updated = [...current, Object.assign({ role, text, ts: new Date().toISOString() }, meta || {})].slice(-80);
   await db.collection('conversations').updateOne(
     { customerId },
     { $set: { messages: updated } },
@@ -513,6 +515,45 @@ async function getCustomerById(id) {
   return stripId(await db.collection('customers').findOne({ id }));
 }
 
+
+// অ্যাপের সার্চ: নাম, ইউজারনেম, ফোন, আইডি, অর্ডারে দেওয়া নাম/ফোন/ঠিকানা, কেনা পণ্যের নাম, চ্যাটের যেকোনো লেখা — মিললে সেই কাস্টমার সবার উপরে
+async function searchCustomers(q) {
+  const norm = t => String(t || '').normalize('NFC').toLowerCase().replace(/[\u0981\s]+/g, '');
+  const digits = t => String(t || '').replace(/[০-৯]/g, d => '০১২৩৪৫৬৭৮৯'.indexOf(d)).replace(/\D/g, '');
+  const nq = norm(q), dq = digits(q);
+  if (!nq) return [];
+  const db = await getDb();
+  const [customers, convs, orders] = await Promise.all([
+    db.collection('customers').find().toArray(),
+    db.collection('conversations').find().toArray(),
+    db.collection('orders').find({}, { projection: { customerId: 1, product: 1, name: 1, phone: 1, address: 1, id: 1 } }).toArray()
+  ]);
+  const best = {};
+  const hit = (id, score, why, snip) => { if (!best[id] || best[id].score < score) best[id] = { id, score, why, snippet: snip || '' }; };
+  customers.forEach(c => {
+    const f = (v, sc, why) => { if (v && norm(v).includes(nq)) hit(c.id, sc + (norm(v) === nq || norm(v).startsWith(nq) ? 5 : 0), why, String(v)); };
+    f(c.name, 100, 'নাম'); f(c.username, 95, 'ইউজারনেম'); f(c.orderName, 90, 'অর্ডারের নাম'); f(c.platformId, 85, 'আইডি');
+    if (dq.length >= 3) { const ph = digits(c.phone); if (ph && ph.includes(dq)) hit(c.id, 98, 'ফোন', c.phone); }
+    f(c.note, 70, 'নোট'); f(c.email, 80, 'ইমেইল');
+    if (c.interest && c.interest.product && norm(c.interest.product).includes(nq)) hit(c.id, 75, 'আগ্রহী পণ্য', c.interest.product);
+  });
+  orders.forEach(o => {
+    if (o.product && norm(o.product).includes(nq)) hit(o.customerId, 72, 'কেনা পণ্য', o.product);
+    if (o.name && norm(o.name).includes(nq)) hit(o.customerId, 88, 'অর্ডারের নাম', o.name);
+    if (dq.length >= 3 && digits(o.phone).includes(dq)) hit(o.customerId, 96, 'অর্ডারের ফোন', o.phone);
+    if (o.address && norm(o.address).includes(nq)) hit(o.customerId, 60, 'ঠিকানা', o.address);
+    if (o.id && norm(o.id).includes(nq)) hit(o.customerId, 97, 'অর্ডার নম্বর', o.id);
+  });
+  convs.forEach(cv => {
+    const ms = cv.messages || [];
+    for (let i = ms.length - 1; i >= 0; i--) {
+      const t = String(ms[i].text || '');
+      if (norm(t).includes(nq)) { hit(cv.customerId, 50, 'চ্যাট', t.slice(0, 90)); break; }
+    }
+  });
+  const known = new Set(customers.map(c => c.id));
+  return Object.values(best).filter(h => known.has(h.id)).sort((a, b) => b.score - a.score);
+}
 
 /* ---------- কাস্টমার ম্যানেজমেন্ট (CRM): পরিসংখ্যান, নোট, আগ্রহী তালিকা, ফলো-আপ ---------- */
 // প্রতিটা কাস্টমারের অর্ডারের হিসাব: মোট অর্ডার, ডেলিভারড, বাতিল/ফেরত, পেন্ডিং, মোট কেনা টাকা (ডেলিভারড)
@@ -865,7 +906,7 @@ async function failStuckVideoPosts() {
 module.exports = { saveProof, getLatestProof, getProof,
   getDb, failStuckVideoPosts,
   getSettings, saveSettings,
-  statsFromOrders, getCustomerStatsMap, setCustomerNote, setInterest, getInterestedCustomers, setFollowUp, clearFollowUp, claimDueFollowUps,
+  searchCustomers, statsFromOrders, getCustomerStatsMap, setCustomerNote, setInterest, getInterestedCustomers, setFollowUp, clearFollowUp, claimDueFollowUps,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
   createOrder, createWebsiteOrder, getOrders, getOrdersByCustomer, updateOrderStatus, attachEmailToLatestOrder,
