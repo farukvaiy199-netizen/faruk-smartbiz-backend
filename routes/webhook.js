@@ -465,25 +465,28 @@ router.post('/email/:key', async (req, res) => {
 async function ensureCustomer({ platform, platformId, name, phone, username, email }) {
   const settings = await store.getSettings();
   let customer = await store.findOrCreateCustomer({ platform, platformId, name, phone });
-  // প্ল্যাটফর্ম থেকে আসল নাম/ইউজারনেম পাওয়া গেলে আগের ফাঁকা বা "অজানা" নাম বদলে দিই
-  const placeholder = !customer.name || customer.name === 'অজানা কাস্টমার';
+  // প্ল্যাটফর্মের আসল নাম (Telegram/WhatsApp/TikTok মেসেজের সাথে আসে) সবসময় সঠিক ধরা হয় — অর্ডারে লেখা নাম এটা বদলায় না
   const patch = {};
-  if (name && placeholder) patch.name = name;
+  const placeholder = !customer.name || customer.name === 'অজানা কাস্টমার';
+  if (name && ['telegram', 'whatsapp', 'tiktok'].includes(platform)) {
+    if (customer.name !== name || customer.nameSource !== 'platform') { patch.name = name; patch.nameSource = 'platform'; }
+  } else if (name && placeholder && platform !== 'website') patch.name = name;
   if (username && customer.username !== username) patch.username = username;
   if (email && customer.email !== email) patch.email = email;
   if (Object.keys(patch).length) {
     try { customer = await store.updateCustomerContact(customer.id, patch); } catch (e) { /* নাম না বদলালেও চলবে */ }
   }
 
-  // প্রোফাইল (নাম/ছবি) আনা উত্তরের পথ আটকায় না — পেছনে চলে, উত্তর দ্রুত যায়
-  if (platform === 'facebook' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
+  // Messenger/Instagram: প্রোফাইল থেকে আসল নাম আনি (পেছনে চলে, উত্তর আটকায় না)। আগে ভুল নাম বসে থাকলে এখানে ঠিক হয়ে যায়
+  const needProfile = placeholder || !customer.photoUrl || customer.nameSource !== 'platform';
+  if (platform === 'facebook' && settings.fbToken && needProfile) {
     getFacebookProfile(platformId, settings.fbToken).then(profile => {
-      if (profile.name || profile.photoUrl) return store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl });
+      if (profile.name || profile.photoUrl) return store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl, nameSource: profile.name ? 'platform' : undefined });
     }).catch(() => {});
   }
-  if (platform === 'instagram' && settings.fbToken && (!customer.name || customer.name === 'অজানা কাস্টমার' || !customer.photoUrl)) {
+  if (platform === 'instagram' && settings.fbToken && needProfile) {
     getInstagramProfile(platformId, settings.fbToken).then(profile => {
-      if (profile.name || profile.photoUrl || profile.username) return store.updateCustomerContact(customer.id, { name: profile.name, photoUrl: profile.photoUrl, username: profile.username });
+      if (profile.name || profile.photoUrl || profile.username) return store.updateCustomerContact(customer.id, { name: profile.name || profile.username, photoUrl: profile.photoUrl, username: profile.username, nameSource: (profile.name || profile.username) ? 'platform' : undefined });
     }).catch(() => {});
   }
   return { settings, customer };
@@ -759,7 +762,7 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
     store.getCustomerMemory(customer.id).catch(() => ''),
     store.getOrdersByCustomer(customer.id).catch(() => [])
   ]);
-  const history = fullHistory.slice(0, -1);
+  const history = fullHistory.slice(0, -1).slice(-24);
   const ownerRules = rulesRaw.map(r => r.text);
   const stockList = stockRaw.map(e => ({ name: e.name, qty: e.qty }));
   const orderLine = pastOrders.slice(0, 3).map(o => `অর্ডার আইডি ${o.id}: ${o.product} ×${o.qty} (${o.status})`).join('; ');
@@ -987,7 +990,7 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
     }
 
     if (order.name || order.phone) {
-      await store.updateCustomerContact(customer.id, { name: order.name, phone: order.phone });
+      await store.updateCustomerContact(customer.id, { orderName: order.name, phone: order.phone });
     }
     let savedOrder;
     try {
