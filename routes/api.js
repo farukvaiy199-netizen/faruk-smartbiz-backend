@@ -218,7 +218,9 @@ router.get('/orders/export', async (req, res) => {
 
 /* ---------- Customers ---------- */
 router.get('/customers', async (req, res) => {
-  const list = await store.getCustomers();
+  const [rawList, statsMap] = await Promise.all([store.getCustomers(), store.getCustomerStatsMap().catch(() => ({}))]);
+  const empty = { total: 0, delivered: 0, cancelled: 0, pending: 0, spent: 0, placedValue: 0, lastOrderAt: '' };
+  const list = rawList.map(c => ({ ...c, stats: statsMap[c.id] || empty }));
   res.json(list);
   // নাম/ছবি এখনো আসেনি এমন Facebook/Instagram কাস্টমারের প্রোফাইল পেছনে এনে রাখি (পরের বার লিস্টে দেখা যাবে)
   try {
@@ -249,6 +251,31 @@ router.patch('/customers/:id/handled', async (req, res) => {
   res.json(c);
 });
 
+// আগ্রহ দেখিয়েছে কিন্তু কেনেনি — তালিকা
+router.get('/customers-interested', async (req, res) => {
+  const list = await store.getInterestedCustomers();
+  res.json(list.map(c => ({ id: c.id, name: c.name, platform: c.platform, platformId: c.platformId, username: c.username || '', photoUrl: c.photoUrl || '', phone: c.phone || '', ai: c.ai !== false, interest: c.interest, followUp: c.followUp && !c.followUp.done ? c.followUp : null })));
+});
+
+// কাস্টমারের নোট (মালিকের নিজের লেখা)
+router.patch('/customers/:id/note', async (req, res) => {
+  const c = await store.setCustomerNote(req.params.id, (req.body && req.body.note) || '');
+  if (!c) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
+  res.json({ ok: true, note: c.note || '' });
+});
+
+// ফলো-আপ নিজে ঠিক করা (at = ISO সময়) বা বাতিল
+router.post('/customers/:id/followup', async (req, res) => {
+  const at = new Date((req.body && req.body.at) || '');
+  if (isNaN(at.getTime()) || at.getTime() < Date.now() - 60000) return res.status(400).json({ error: 'সময় ঠিক নেই' });
+  await store.setFollowUp(req.params.id, { at, reason: String((req.body && req.body.reason) || 'মালিকের ঠিক করা ফলো-আপ') });
+  res.json({ ok: true });
+});
+router.delete('/customers/:id/followup', async (req, res) => {
+  await store.clearFollowUp(req.params.id);
+  res.json({ ok: true });
+});
+
 // কারো নামে ট্যাপ করলে তার সম্পূর্ণ অর্ডার + কথোপকথন হিস্টোরি
 router.get('/customers/:id', async (req, res) => {
   const customers = await store.getCustomers();
@@ -256,7 +283,7 @@ router.get('/customers/:id', async (req, res) => {
   if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
   const orders = await store.getOrdersByCustomer(customer.id);
   const conversation = await store.getConversation(customer.id);
-  res.json({ customer, orders, conversation });
+  res.json({ customer, orders, conversation, stats: store.statsFromOrders(orders) });
 });
 
 // সাপ্তাহিক/মাসিক রিপোর্ট
