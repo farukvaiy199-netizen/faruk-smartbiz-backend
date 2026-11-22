@@ -38,6 +38,7 @@ function init() {
 }
 
 const orderSheet = require('../services/orderSheet');
+const payments = require('../services/payments');
 const router = express.Router();
 
 // শুধু নিজের সাইটের ঠিকানা থেকে আসা ব্রাউজার অনুরোধ নেবে (অর্ডার-সার্ভারের আগের নিয়ম)
@@ -85,6 +86,26 @@ router.post('/api/place-order', authMw, async (req, res) => {
       priorOrders = q.docs.filter(d => d.data().status !== 'cancelled').length;
       if (pending >= 5) throw new UserError('এই নম্বরে ইতিমধ্যে অনেকগুলো অর্ডার অপেক্ষায় আছে — আমাদের সাথে যোগাযোগ করুন');
     }
+    // বিকাশ/নগদ: TrxID আমার ফোনের পেমেন্ট-SMS-এর সাথে মেলে কিনা (SMS_HOOK_KEY সেট থাকলে)
+    let payVerified; let paidAmount = 0; let claimedTrx = '';
+    const wantsMobilePay = payments.enabled() && input.payment && input.payment !== 'cod' && String(input.transactionId || '').trim();
+    if (wantsMobilePay) {
+      const idsV = [...new Set((Array.isArray(input.items) ? input.items : []).map(i => String((i && i.pid) || '')))].filter(id => id && id.indexOf('/') < 0).slice(0, 30);
+      const snapsV = await Promise.all(idsV.map(id => db.doc(`${ROOT}/products/${id}`).get()));
+      const pmapV = {}; snapsV.forEach(sn => { if (sn.exists) pmapV[sn.id] = sn.data(); });
+      const cV = computeOrder(settings, pmapV, input, { priorOrders });
+      const minPay = cV.paymentPlanPercent ? cV.advanceAmount : cV.total;
+      const trx = String(cV.transactionId || input.transactionId).trim();
+      const v = await payments.verify(trx, minPay);
+      const tkey = 'web:' + uid;
+      if (v.state === 'ok') {
+        if (!(await payments.claim(trx, 'web:' + uid))) throw new UserError('এই ট্রানজেকশন আইডি দিয়ে আগেই একটি অর্ডার হয়েছে — নতুন পেমেন্টের আইডি দিন');
+        payVerified = true; paidAmount = v.payment.amount; claimedTrx = trx; payments.clearTry(tkey);
+      } else if (v.state === 'used') throw new UserError('এই ট্রানজেকশন আইডি দিয়ে আগেই একটি অর্ডার হয়েছে — নতুন পেমেন্টের আইডি দিন');
+      else if (v.state === 'low') throw new UserError(`আপনার পেমেন্ট ৳${v.payment.amount} এসেছে, কিন্তু কমপক্ষে ৳${minPay} দরকার — বাকি টাকা পাঠিয়ে নতুন TrxID দিন`);
+      else if (payments.bumpTry(tkey) < 2) throw new UserError('এই ট্রানজেকশন আইডি দিয়ে আমাদের নম্বরে কোনো পেমেন্ট পাইনি — TrxID হুবহু (অক্ষর-সংখ্যা মিলিয়ে) আবার দিন, আর টাকা আমাদের নম্বরে পাঠিয়েছেন কিনা দেখে নিন');
+      else payVerified = false; // ২য় বারও না মিললে অর্ডার যাবে, "যাচাই-বাকি" চিহ্নসহ — মালিক নিজে দেখে নেবেন
+    }
     // আইডি আসে মালিকের অর্ডার-শিট থেকে। আগে অর্ডারটা যাচাই করি (ভুল হলে শিটের ঘর নষ্ট হবে না), তারপর ঘর নিই।
     let sheetId = null;
     if (orderSheet.enabled()) {
@@ -115,7 +136,8 @@ router.post('/api/place-order', authMw, async (req, res) => {
         customer: calc.name, phone: calc.phone, address: calc.address, items: calc.items,
         subtotal: calc.subtotal, discount: calc.discount, couponCode: calc.couponCode || '', flashDiscount: calc.flashDiscount || 0, bundleDiscount: calc.bundleDiscount || 0, couponDiscount: calc.couponDiscount || 0, tax: calc.tax, shipping: calc.shipping, total: calc.total,
         district: calc.district, upazila: calc.upazila, shippingBase: calc.shippingBase, prepayDiscount: calc.prepayDiscount,
-        status: 'pending', payment: calc.payment, paymentStatus: 'unpaid', transactionId: calc.transactionId,
+        status: 'pending', payment: calc.payment, paymentStatus: (payVerified === true && paidAmount + 1 >= calc.total) ? 'paid' : 'unpaid', transactionId: calc.transactionId,
+        paymentVerified: payVerified === undefined ? null : payVerified, paidAmount,
         paymentPlanPercent: calc.paymentPlanPercent, advanceAmount: calc.advanceAmount, dueAmount: calc.dueAmount,
         courier: 'নির্ধারণ করা হয়নি', date: bdDate(), source: 'server'
       };
@@ -124,7 +146,8 @@ router.post('/api/place-order', authMw, async (req, res) => {
       calc.stockUpdates.forEach(u => tx.update(db.doc(`${ROOT}/products/${u.pid}`), u.variants ? { stock: u.newStock, variants: u.variants } : { stock: u.newStock }));
       return { orderId, total: calc.total, order };
     });
-    } catch (txErr) { if (sheetId) await orderSheet.release(sheetId); throw txErr; }
+    } catch (txErr) { if (sheetId) await orderSheet.release(sheetId); if (claimedTrx) await payments.release(claimedTrx, 'web:' + uid); throw txErr; }
+    if (claimedTrx) payments.setRef(claimedTrx, result.orderId);
     res.json(result);
   } catch (e) {
     if (e instanceof UserError) return res.status(400).json({ error: e.userMessage });
