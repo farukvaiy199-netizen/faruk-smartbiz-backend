@@ -1,48 +1,50 @@
-// মালিকের কাছে নোটিফিকেশন: অ্যাপের ভেতরের তালিকায় সেভ হয়, আর ফোনে পুশ যায় (অ্যাপ বন্ধ থাকলেও)।
-// Messenger/WhatsApp দিয়ে নিজেকে মেসেজ পাঠানো যায় না (২৪ ঘণ্টার নিয়ম), তাই Web Push ব্যবহার হচ্ছে।
+// মালিককে জানানো: (১) অ্যাপের ঘণ্টায় তালিকা, (২) ফোনে পুশ নোটিফিকেশন (অ্যাপ বন্ধ থাকলেও)
 const webpush = require('web-push');
-const config = require('../config');
 const store = require('./store');
 
-let configured = false;
-async function setup() {
-  if (configured) return;
-  const keys = await store.getVapidKeys(() => webpush.generateVAPIDKeys());
-  webpush.setVapidDetails(config.publicUrl, keys.publicKey, keys.privateKey);
-  configured = true;
+let ready = null;
+async function init() {
+  if (ready) return ready;
+  ready = (async () => {
+    const keys = await store.getVapidKeys(() => webpush.generateVAPIDKeys());
+    const subject = process.env.VAPID_SUBJECT || 'mailto:' + (process.env.ADMIN_EMAIL || 'admin@example.com');
+    webpush.setVapidDetails(subject, keys.publicKey, keys.privateKey);
+    return keys;
+  })().catch(e => { ready = null; throw e; });
+  return ready;
 }
 
-async function getPublicKey() {
-  const keys = await store.getVapidKeys(() => webpush.generateVAPIDKeys());
-  return keys.publicKey;
-}
+async function getPublicKey() { return (await init()).publicKey; }
 
-async function sendToAll(payload) {
-  await setup();
+const clip = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+
+// ফেরত: { sent, failed, removed }
+async function sendPush(payload) {
+  const out = { sent: 0, failed: 0, removed: 0 };
+  await init();
   const subs = await store.getPushSubs();
-  const data = JSON.stringify(payload);
-  let sent = 0;
-  await Promise.all(subs.map(async (s) => {
+  const body = JSON.stringify(payload);
+  await Promise.all(subs.map(async s => {
     try {
-      await webpush.sendNotification(s.subscription, data, { TTL: 3600 });
-      sent++;
-    } catch (err) {
-      // 404/410 মানে ফোন আর সাবস্ক্রিপশন রাখেনি — তালিকা থেকে মুছে দিই
-      if (err.statusCode === 404 || err.statusCode === 410) await store.deletePushSub(s.endpoint);
-      else console.error('পুশ পাঠাতে ব্যর্থ:', err.statusCode || '', err.body || err.message);
+      await webpush.sendNotification(s.subscription, body, { TTL: 86400, urgency: 'high', topic: String(payload.tag || 'smartbiz').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32) || 'smartbiz' });
+      out.sent++;
+    } catch (e) {
+      // ফোন থেকে সাবস্ক্রিপশন মুছে গেছে (৪০৪/৪১০) — তালিকা থেকে বাদ
+      if (e && (e.statusCode === 404 || e.statusCode === 410)) { out.removed++; await store.deletePushSub(s.endpoint).catch(() => {}); }
+      else { out.failed++; console.error('পুশ পাঠানো যায়নি:', e && (e.statusCode || e.message)); }
     }
   }));
-  return sent;
+  return out;
 }
 
-// কখনো এরর ছুঁড়ে না — নোটিফিকেশন ব্যর্থ হলেও অর্ডার/চ্যাটের মূল কাজ যেন না থামে
+// কখনো এরর ছোঁড়ে না — নোটিফিকেশন ব্যর্থ হলেও আসল কাজ চলবে
 async function notifyOwner({ type, title, body }) {
+  try { await store.addNotification({ type, title, body }); } catch (e) { console.error('নোটিফিকেশন সেভ হয়নি:', e.message); }
   try {
-    await store.addNotification({ type, title, body });
-    await sendToAll({ title, body: body || '', tag: type, url: './' });
-  } catch (err) {
-    console.error('notifyOwner ব্যর্থ:', err.message);
-  }
+    const r = await sendPush({ title: clip(title, 80), body: clip(body, 200), tag: type || 'smartbiz', type: type || '' });
+    if (r.sent || r.failed || r.removed) console.log(`🔔 পুশ: গেছে=${r.sent} ব্যর্থ=${r.failed} বাদ=${r.removed}`);
+    return r;
+  } catch (e) { console.error('পুশ ত্রুটি:', e.message); return { sent: 0, failed: 1, removed: 0 }; }
 }
 
-module.exports = { notifyOwner, getPublicKey, sendToAll };
+module.exports = { notifyOwner, getPublicKey, sendPush };
