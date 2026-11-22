@@ -236,7 +236,7 @@ async function nextOrderId() {
   return nextOrderIdFrom(await getDb());
 }
 
-async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping, paymentProof }) {
+async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping, paymentProof, paymentVerified, paidAmount }) {
   const db = await getDb();
   // আইডি আসে মালিকের অর্ডার-শিট থেকে (প্রথম ফাঁকা ঘর); শিট চালু না থাকলে আগের নিয়মে
   let id = null;
@@ -255,6 +255,7 @@ async function createOrder({ customerId, name, phone, address, product, qty, pri
     callStatus: '', callNote: '', callAt: '', remindAt: '', callAttempts: 0, fsSynced: false,
     stockItem: stockItem || '', stockRestored: false,
     district: district || '', payment: payment || '', transactionId: transactionId || '', shipping: Number(shipping) || 0, paymentProof: paymentProof || '',
+    paymentVerified: paymentVerified === undefined ? null : !!paymentVerified, paidAmount: Number(paidAmount) || 0,
     createdAt: new Date().toISOString()
   };
   await db.collection('orders').insertOne(order);
