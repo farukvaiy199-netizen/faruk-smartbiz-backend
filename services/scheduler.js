@@ -65,6 +65,7 @@ async function runDueInstagramPosts() {
       const settings = await store.getSettings();
       await publishIgJob(job, settings, true);
     }
+    await require('./crm').runFollowUps().catch(e => console.error('ফলো-আপ:', e.message)); // "পরে মেসেজ দিন" বলা কাস্টমারদের ফলো-আপ
     await require('./telegram').runDue(); // শিডিউল করা Telegram চ্যানেল-পোস্ট
     await require('./tiktok').runDue().catch(e => console.error('TikTok শিডিউলার:', e.message)); // TikTok ছবির পোস্ট ও অবস্থা যাচাই
   } catch (err) {
