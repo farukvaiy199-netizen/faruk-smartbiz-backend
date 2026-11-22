@@ -22,6 +22,7 @@ const comments = require('../services/comments');
 const telegram = require('../services/telegram');
 const tiktok = require('../services/tiktok');
 const crm = require('../services/crm');
+const payments = require('../services/payments');
 
 // ডেলিভারি চার্জ/COD নিয়ম এখানে লেখা নেই — ওয়েবসাইটের সেটিংস থেকে লাইভ আসে (shop.getAiContext)
 const businessInfo = `কাজের সময়: সকাল ৯টা - রাত ১০টা। ডেলিভারি চার্জ ও পেমেন্টের নিয়ম শুধু ওয়েবসাইটের তথ্য অনুযায়ী বলবে।`;
@@ -549,6 +550,23 @@ function typingOn(platform, platformId, settings) {
 }
 
 
+
+/* ---------- বিকাশ/নগদ SMS গ্রহণ (ফ্রি SMS-ফরওয়ার্ডার অ্যাপ এখানে পাঠায়) ---------- */
+// ঠিকানা: https://<আপনার-সার্ভার>/webhook/payment-sms?key=SMS_HOOK_KEY-এর-মান
+router.post('/payment-sms', express.urlencoded({ extended: true, limit: '200kb' }), express.text({ type: ['text/*'], limit: '200kb' }), async (req, res) => {
+  try {
+    if (!payments.enabled()) return res.status(503).json({ ok: false, error: 'SMS_HOOK_KEY সেট করা নেই' });
+    const key = String(req.query.key || req.headers['x-sms-key'] || (req.body && req.body.key) || '');
+    const ok = key.length === payments.hookKey().length && require('crypto').timingSafeEqual(Buffer.from(key), Buffer.from(payments.hookKey()));
+    if (!ok) return res.status(401).json({ ok: false, error: 'key ভুল' });
+    const r = await payments.ingest(req.body, req.query.from);
+    res.json(r.ok ? { ok: true, duplicate: !!r.duplicate } : { ok: false, ignored: true, reason: r.reason });
+  } catch (err) {
+    console.error('payment-sms এরর:', err.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
 /* ---------- মালিকের কমা (,) কমান্ড: পেজ-ইনবক্স থেকে কাস্টমারকে মেসেজ দিলে AI থামে/চালু হয় ---------- */
 async function handleOwnerEcho(platform, customerPlatformId, text) {
   try {
@@ -949,7 +967,7 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
           }
           order.paymentProof = proofId;
         }
-        order.district = chk.district; order.payment = chk.payment; order.transactionId = chk.transactionId; order.shipping = chk.shipping;
+        order.district = chk.district; order.payment = chk.payment; order.transactionId = chk.transactionId; order.shipping = chk.shipping; order.minPay = chk.minPay || 0;
       }
     } catch (err) { console.error('ডেলিভারি নিয়ম যাচাই করা যায়নি (অর্ডার আগের মতো চলছে):', err.message); }
 
@@ -963,6 +981,25 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
     }
     order.phone = goodPhone;
 
+    // বিকাশ/নগদ: কাস্টমারের দেওয়া TrxID আমার ফোনের SMS-এর সাথে মেলে কিনা (SMS_HOOK_KEY সেট থাকলে)
+    let payVerified; let paidAmount = 0; let claimedTrx = '';
+    if (order.payment && order.payment !== 'cod' && order.transactionId && payments.enabled()) {
+      const tkey = 'chat:' + customer.id;
+      const v = await payments.verify(order.transactionId, order.minPay || 0);
+      let msg = '';
+      if (v.state === 'ok') {
+        if (await payments.claim(order.transactionId, 'chat:' + customer.id)) { payVerified = true; paidAmount = v.payment.amount; claimedTrx = order.transactionId; payments.clearTry(tkey); }
+        else msg = 'এই ট্রানজেকশন আইডি দিয়ে আগেই একটি অর্ডার হয়েছে। নতুন পেমেন্টের আইডি দিলে অর্ডার কনফার্ম করব 🙏';
+      } else if (v.state === 'used') {
+        msg = 'এই ট্রানজেকশন আইডি দিয়ে আগেই একটি অর্ডার হয়েছে। নতুন পেমেন্টের আইডি দিলে অর্ডার কনফার্ম করব 🙏';
+      } else if (v.state === 'low') {
+        msg = `আপনার পেমেন্ট ৳${v.payment.amount} এসেছে, কিন্তু অর্ডারের জন্য কমপক্ষে ৳${order.minPay} দরকার। বাকি টাকা পাঠিয়ে নতুন TrxID দিতে পারবেন? 🙏`;
+      } else if (payments.bumpTry(tkey) < 2) {
+        msg = 'এই ট্রানজেকশন আইডি দিয়ে আমাদের নম্বরে কোনো পেমেন্ট পাইনি 😔 বিকাশ/নগদের মেসেজ থেকে TrxID টা হুবহু (অক্ষর-সংখ্যা মিলিয়ে) আরেকবার লিখে পাঠাবেন? আর টাকা আমাদের নম্বরে পাঠিয়েছেন কিনা দেখে নিন।';
+      } else { payVerified = false; } // ২য় বারও না মিললে (SMS আসতে দেরি/ফরওয়ার্ডার বন্ধ হতে পারে) অর্ডার যাবে, কিন্তু "যাচাই-বাকি" চিহ্নসহ
+      if (msg) { await store.appendMessage(customer.id, 'assistant', msg); await send(msg); return; }
+    }
+
     const wantQty = Number(order.qty) || 1;
 
     // স্টক: আগে অ্যাপের স্টক পেজের সংখ্যা দেখি; সেখানে না থাকলে শিটের Stock কলাম
@@ -975,6 +1012,7 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
           ? `দুঃখিত, "${order.product}" এখন মাত্র ${dec.qty}টি আছে। কম পরিমাণে নিতে চাইলে জানান।`
           : `দুঃখিত, "${order.product}" এই মুহূর্তে স্টকে নেই। অন্য কোনো প্রোডাক্ট দেখতে চান?`;
         await store.appendMessage(customer.id, 'assistant', outMsg);
+        if (claimedTrx) await payments.release(claimedTrx, 'chat:' + customer.id);
         await send(outMsg);
         return;
       }
@@ -984,6 +1022,7 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
       if (stock !== null && stock <= 0) {
         const outOfStockMsg = `দুঃখিত, "${order.product}" এই মুহূর্তে স্টকে নেই। অন্য কোনো প্রোডাক্ট দেখতে চান?`;
         await store.appendMessage(customer.id, 'assistant', outOfStockMsg);
+        if (claimedTrx) await payments.release(claimedTrx, 'chat:' + customer.id);
         await send(outOfStockMsg);
         return;
       }
@@ -1006,11 +1045,14 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
         source: platform === 'email' ? 'Email' : platform === 'facebook' ? 'Messenger' : platform === 'instagram' ? 'Instagram' : platform === 'telegram' ? 'Telegram' : platform === 'tiktok' ? 'TikTok' : 'WhatsApp',
         stockItem: reservedStock ? reservedStock.name : '',
         district: order.district || '', payment: order.payment || '', transactionId: order.transactionId || '', shipping: order.shipping || 0,
-        paymentProof: order.paymentProof || ''
+        paymentProof: order.paymentProof || '',
+        paymentVerified: payVerified, paidAmount
       });
+      if (claimedTrx) payments.setRef(claimedTrx, savedOrder.id);
     } catch (err) {
       // অর্ডার সেভ না হলে আটকে রাখা স্টক ফেরত দিই
       if (reservedStock) await store.incrementStock(reservedStock.name, wantQty);
+      if (claimedTrx) await payments.release(claimedTrx, 'chat:' + customer.id);
       throw err;
     }
 
@@ -1018,7 +1060,7 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
     await notifyOwner({
       type: 'order',
       title: `🛒 নতুন অর্ডার ${savedOrder.id}`,
-      body: `${savedOrder.name} · ${savedOrder.product} x${savedOrder.qty} · ৳${(savedOrder.price || 0) * (savedOrder.qty || 1)}` + (savedOrder.paymentProof ? `\nপেমেন্ট স্ক্রিনশট: ${config.publicUrl}/webhook/proof/${savedOrder.paymentProof}` : '')
+      body: `${savedOrder.name} · ${savedOrder.product} x${savedOrder.qty} · ৳${(savedOrder.price || 0) * (savedOrder.qty || 1)}` + (savedOrder.paymentProof ? `\nপেমেন্ট স্ক্রিনশট: ${config.publicUrl}/webhook/proof/${savedOrder.paymentProof}` : '') + (savedOrder.paymentVerified === true ? `\n✅ পেমেন্ট SMS-এর সাথে মিলেছে (৳${savedOrder.paidAmount})` : savedOrder.paymentVerified === false ? '\n⚠️ TrxID আপনার SMS-এ পাওয়া যায়নি — পাঠানোর আগে নিজে মিলিয়ে নিন' : '')
     });
     if (reservedStock && reservedStock.qty <= (settings.lowStockThreshold ?? 5)) {
       await notifyOwner({
