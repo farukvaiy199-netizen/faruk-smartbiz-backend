@@ -94,7 +94,9 @@ async function sendPlain(c, text, settings) {
   if (pf === 'instagram' && settings.fbToken) return require('./instagram').sendInstagramMessage(id, text, settings.fbToken);
   if (pf === 'whatsapp' && settings.waToken && settings.waPhoneNumberId) return require('./whatsapp').sendWhatsAppMessage(id, text, settings.waPhoneNumberId, settings.waToken);
   if (pf === 'telegram' && settings.tgToken) return require('./telegram').sendMessage(settings.tgToken, id, text);
-  throw new Error('এই প্ল্যাটফর্মে ফলো-আপ পাঠানো যায় না (' + pf + ')');
+  if (pf === 'tiktok') return require('./tiktok').sendMessage(id, text);
+  if (pf === 'email') return require('./email').sendReply(id, text);
+  throw new Error('এই প্ল্যাটফর্মে মেসেজ পাঠানো যায় না (' + pf + ')');
 }
 
 let running = false;
@@ -135,4 +137,4 @@ async function runFollowUps() {
   return n;
 }
 
-module.exports = { junkReason, floodReason, ownerToggle, isDecline, parseFollowUp, runFollowUps };
+module.exports = { sendPlain, junkReason, floodReason, ownerToggle, isDecline, parseFollowUp, runFollowUps };
