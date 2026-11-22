@@ -307,13 +307,8 @@ async function getAiContext(message) {
       txt += 'কাস্টমার "কী কী পণ্য আছে" জানতে চাইলে এই তালিকার সবগুলো প্রোডাক্টের নাম ও দাম (স্টক শেষ হলে সেটাও) গুছিয়ে বলবে, শেষে ওয়েবসাইটের লিংক দেবে।\n';
     }
     if (cfg.show.offers) {
-      const st = s.settings || {};
-      const offers = [];
-      const coupons = st.coupons && typeof st.coupons === 'object' ? Object.entries(st.coupons) : [];
-      coupons.forEach(([code, amt]) => offers.push(`কুপন কোড ${code}: ৳${amt} ছাড়`));
-      if (st.freeShip) offers.push(`৳${st.freeShip}-এর বেশি অর্ডারে ডেলিভারি ফ্রি`);
-      if (st.announce) offers.push('ঘোষণা: ' + String(st.announce).slice(0, 200));
-      if (offers.length) txt += 'চলমান অফার:\n' + offers.map(o => '- ' + o).join('\n') + '\n';
+      const offers = offerLines(s.settings || {});
+      if (offers.length) txt += 'চলমান অফার (কাস্টমার দ্বিধায় থাকলে, দাম বেশি বললে বা অর্ডার দেওয়ার সময় এগুলো জানাবে — শুধু এই তালিকার অফারই বলবে, নিজে অফার বানাবে না):\n' + offers.map(o => '- ' + o).join('\n') + '\n';
     }
     if (s.settings && Object.keys(s.settings).length) txt += delivery.promptText(delivery.fromSettings(s.settings), site);
     txt += `
@@ -551,6 +546,45 @@ async function findProduct(query) {
 
 
 // মেসেঞ্জার কার্ডের জন্য: প্রোডাক্টের নাম, দাম, কোড, ছবি আর শেয়ার-লিংক (লিংকে ছবিসহ প্রিভিউ আসে)
+
+// ওয়েবসাইটের চলমান অফার (ফ্ল্যাশ সেল, বান্ডেল, কুপন, ফ্রি ডেলিভারি, ঘোষণা) — AI-র জন্য ও "না নেব" বললে কাস্টমারকে দেখানোর জন্য
+function offerLines(st) {
+  const out = [];
+  const num = (v, d) => { const n = Number(v); return isNaN(n) ? d : n; };
+  const bd = ms => new Date(ms).toLocaleString('bn-BD', { timeZone: 'Asia/Dhaka', day: 'numeric', month: 'long', hour: 'numeric', minute: '2-digit' });
+  const f = st.flash;
+  if (f && f.on && num(f.pct, 0) > 0 && num(f.endAt, 0) > Date.now()) out.push(`⚡ ফ্ল্যাশ সেল: ${num(f.pct, 0)}% ছাড় (${bd(f.endAt)} পর্যন্ত)` + (Array.isArray(f.pids) && f.pids.length ? ' — নির্বাচিত পণ্যে' : ' — সব পণ্যে'));
+  const b = st.bundle;
+  if (b && b.on && num(b.pct, 0) > 0) out.push(`🎁 বান্ডেল অফার: ${Math.max(num(b.minQty, 2), 2)}টি বা বেশি নিলে ${num(b.pct, 0)}% ছাড়`);
+  const coupons = st.coupons && typeof st.coupons === 'object' ? Object.entries(st.coupons) : [];
+  coupons.forEach(([code, raw]) => {
+    const c = raw && typeof raw === 'object' ? raw : { type: 'amount', value: num(raw, 0) };
+    if (c.active === false || !num(c.value, 0)) return;
+    if (c.expires && Date.now() > Date.parse(c.expires + 'T23:59:59+06:00')) return;
+    out.push(`🏷️ কুপন ${code}: ` + (c.type === 'percent' ? `${num(c.value, 0)}% ছাড়` + (num(c.max, 0) ? ` (সর্বোচ্চ ৳${num(c.max, 0)})` : '') : `৳${num(c.value, 0)} ছাড়`) + (num(c.min, 0) ? `, কমপক্ষে ৳${num(c.min, 0)} কেনাকাটায়` : '') + (c.first ? ', শুধু প্রথম অর্ডারে' : ''));
+  });
+  if (num(st.freeShip, 0) > 0) out.push(`🚚 ৳${num(st.freeShip, 0)}-এর বেশি অর্ডারে ডেলিভারি ফ্রি`);
+  if (num(st.prepayDiscount, 0) > 0) out.push(`💳 বিকাশ/নগদে আগেই পেমেন্ট করলে ডেলিভারি চার্জে ৳${num(st.prepayDiscount, 0)} ছাড়`);
+  if (st.announce) out.push('📢 ' + String(st.announce).slice(0, 200));
+  return out;
+}
+
+// কাস্টমার একটা পণ্য না নিলে বিকল্প (একই বিভাগ আগে, তারপর স্টকে থাকা অন্যগুলো) + চলমান অফারের লেখা
+async function getAlternatives({ excludeIds = [], max = 3 }) {
+  try {
+    const { cfg, snap: s } = await getSnapshot();
+    if (!s) return { ids: [], offers: [] };
+    const act = activeProducts(s.products).filter(p => p.price !== null && (p.stock === null || p.stock > 0));
+    const ex = new Set(excludeIds.map(String));
+    const cats = new Set(act.filter(p => ex.has(String(p.id))).map(p => p.category).filter(Boolean));
+    const rest = act.filter(p => !ex.has(String(p.id)));
+    const same = rest.filter(p => cats.has(p.category));
+    const other = rest.filter(p => !cats.has(p.category));
+    const ids = [...same, ...other].slice(0, max).map(p => p.id);
+    return { ids, offers: cfg.show.offers ? offerLines(s.settings || {}) : [] };
+  } catch (e) { return { ids: [], offers: [] }; }
+}
+
 async function getProductCard(id) {
   try {
     const { cfg, snap: s } = await getSnapshot();
@@ -647,4 +681,4 @@ async function categoryNames() {
   return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
 }
 
-module.exports = { resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+module.exports = { offerLines, getAlternatives, resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
