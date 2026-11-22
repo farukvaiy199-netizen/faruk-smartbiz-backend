@@ -251,6 +251,55 @@ router.patch('/customers/:id/handled', async (req, res) => {
   res.json(c);
 });
 
+// সার্চ: নাম/ফোন/আইডি/পণ্য/চ্যাটের লেখা — মিললে কাস্টমারদের আইডি (সবচেয়ে মিল আগে) + কোথায় মিলেছে
+router.get('/customers-search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json([]);
+  res.json(await store.searchCustomers(q));
+});
+
+// অ্যাপ থেকে সরাসরি কাস্টমারকে রিপ্লাই (সেই প্ল্যাটফর্মেই যায়)। পাঠানোর পর ডিফল্টে ওই কাস্টমারের AI বন্ধ হয় যাতে দুজনে একসাথে উত্তর না দেয়
+router.post('/customers/:id/reply', async (req, res) => {
+  const text = String((req.body && req.body.text) || '').trim();
+  if (!text) return res.status(400).json({ error: 'মেসেজ লিখুন' });
+  const customer = (await store.getCustomers()).find(c => c.id === req.params.id);
+  if (!customer) return res.status(404).json({ error: 'কাস্টমার পাওয়া যায়নি' });
+  if (customer.platform === 'website') return res.status(400).json({ error: 'ওয়েবসাইট কাস্টমারকে এখান থেকে মেসেজ যায় না — ফোন নম্বর থাকলে WhatsApp/কল করুন' });
+  const settings = await store.getSettings();
+  try {
+    await require('../services/crm').sendPlain(customer, text, settings);
+  } catch (err) {
+    const d = err.response && err.response.data;
+    const why = (d && d.error && (d.error.message || d.error)) || (d && d.description) || err.message;
+    return res.status(502).json({ error: 'পাঠানো যায়নি: ' + String(why).slice(0, 220) + (['facebook', 'instagram', 'whatsapp'].includes(customer.platform) ? ' (কাস্টমারের শেষ মেসেজের ২৪ ঘণ্টা পার হয়ে গেলে এই প্ল্যাটফর্ম মেসেজ নেয় না)' : '') });
+  }
+  await store.appendMessage(customer.id, 'assistant', text, { by: 'owner' });
+  let ai = customer.ai !== false;
+  if (req.body.pauseAI !== false && ai) { await store.setCustomerAI(customer.id, false); ai = false; }
+  if (store.clearNeedsHuman) await store.clearNeedsHuman(customer.id).catch(() => {});
+  res.json({ ok: true, ai });
+});
+
+// Messenger/Instagram কাস্টমারদের আসল নাম-ছবি-ইউজারনেম প্ল্যাটফর্ম থেকে আবার এনে ঠিক করে দেয়
+router.post('/customers-refresh-names', async (req, res) => {
+  const settings = await store.getSettings();
+  if (!settings.fbToken) return res.status(400).json({ error: 'Facebook টোকেন সংযুক্ত নেই' });
+  const { getFacebookProfile } = require('../services/facebook');
+  const { getInstagramProfile } = require('../services/instagram');
+  const list = (await store.getCustomers()).filter(c => c.platform === 'facebook' || c.platform === 'instagram').slice(0, 200);
+  let updated = 0, failed = 0;
+  for (let i = 0; i < list.length; i += 5) {
+    await Promise.all(list.slice(i, i + 5).map(async c => {
+      try {
+        const p = c.platform === 'facebook' ? await getFacebookProfile(c.platformId, settings.fbToken) : await getInstagramProfile(c.platformId, settings.fbToken);
+        const nm = p.name || p.username;
+        if (nm || p.photoUrl) { await store.updateCustomerContact(c.id, { name: nm, photoUrl: p.photoUrl, username: p.username, nameSource: nm ? 'platform' : undefined }); updated++; } else failed++;
+      } catch (e) { failed++; }
+    }));
+  }
+  res.json({ ok: true, total: list.length, updated, failed });
+});
+
 // আগ্রহ দেখিয়েছে কিন্তু কেনেনি — তালিকা
 router.get('/customers-interested', async (req, res) => {
   const list = await store.getInterestedCustomers();
