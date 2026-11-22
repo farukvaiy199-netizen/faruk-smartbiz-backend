@@ -107,7 +107,10 @@ function checkChatOrder(r, order, hasProof) {
   }
   if (payment !== 'cod' && !hasProof)
     return { ok: false, message: 'পেমেন্টের স্ক্রিনশটটা (বিকাশ/নগদের মেসেজ বা অ্যাপের ছবি) পাঠিয়ে দেবেন? স্ক্রিনশট পেলেই অর্ডারটা কনফার্ম করে ফেলব। 😊' };
-  return { ok: true, district, payment, transactionId, shipping: ship.final, total: subtotal + ship.final };
+  const totalDue = subtotal + ship.final;
+  const pl = (r.plans || []).map(Number).filter(n => n > 0 && n <= 100);
+  const minPay = payment === 'cod' ? 0 : (pl.length ? Math.round(totalDue * Math.min(...pl) / 100) : totalDue);
+  return { ok: true, district, payment, transactionId, shipping: ship.final, total: totalDue, minPay };
 }
 
 // বাংলাদেশি মোবাইল নম্বর: ১১ সংখ্যা, ০১৩–০১৯ দিয়ে শুরু। +৮৮/৮৮ থাকলে বাদ; ভুল হলে '' ফেরত
