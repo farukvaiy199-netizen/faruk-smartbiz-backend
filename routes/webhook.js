@@ -21,6 +21,7 @@ const { summarizeCustomerMemory } = require('../services/ai');
 const comments = require('../services/comments');
 const telegram = require('../services/telegram');
 const tiktok = require('../services/tiktok');
+const crm = require('../services/crm');
 
 // ডেলিভারি চার্জ/COD নিয়ম এখানে লেখা নেই — ওয়েবসাইটের সেটিংস থেকে লাইভ আসে (shop.getAiContext)
 const businessInfo = `কাজের সময়: সকাল ৯টা - রাত ১০টা। ডেলিভারি চার্জ ও পেমেন্টের নিয়ম শুধু ওয়েবসাইটের তথ্য অনুযায়ী বলবে।`;
@@ -216,7 +217,7 @@ router.post('/facebook', verifyMeta(config.fbAppSecret, 'Facebook'), async (req,
       if (senderId && event.postback && event.postback.payload) { handlePostback({ platform: 'facebook', senderId, payload: event.postback.payload, sigOk: !!req.sigOk }).catch(err => console.error('Facebook বাটন এরর:', err.message)); continue; }
       const msg = event.message;
       if (!senderId || !msg) continue;
-      if (msg.is_echo) continue; // পেজ নিজে যে মেসেজ পাঠিয়েছে তার প্রতিধ্বনি — কাস্টমার না
+      if (msg.is_echo) { handleOwnerEcho('facebook', event.recipient && event.recipient.id, msg.text); continue; } // পেজ নিজে যে মেসেজ পাঠিয়েছে তার প্রতিধ্বনি — কাস্টমার না (মালিকের কমা-কমান্ড থাকলে AI চালু/বন্ধ)
       try {
         const text = msg.text;
         const attachments = msg.attachments || [];
@@ -293,7 +294,7 @@ router.post('/whatsapp', verifyMeta(config.waAppSecret, 'WhatsApp'), async (req,
         continue;
       }
 
-      await handleIncomingMessage({ platform: 'whatsapp', platformId: from, text, name, phone: from, imageBuffer, imageMime, audioBuffer, sigOk: !!req.sigOk });
+      await handleIncomingMessage({ platform: 'whatsapp', platformId: from, msgId: msg.id, text, name, phone: from, imageBuffer, imageMime, audioBuffer, sigOk: !!req.sigOk });
     } catch (err) {
       console.error('WhatsApp webhook error (একটা মেসেজ প্রসেস করতে ব্যর্থ):', err.response?.data ? JSON.stringify(err.response.data) : err.message);
     }
@@ -329,7 +330,7 @@ router.post('/instagram', verifyMeta([config.fbAppSecret, config.igAppSecret], '
       const msg = event.message;
       if (!senderId || !msg) continue;
       // নিজের অ্যাকাউন্টের পাঠানো মেসেজের প্রতিধ্বনি বাদ
-      if (msg.is_echo || String(senderId) === String(entry.id)) continue;
+      if (msg.is_echo || String(senderId) === String(entry.id)) { handleOwnerEcho('instagram', event.recipient && event.recipient.id, msg.text); continue; }
       try {
         const text = msg.text;
         const attachments = msg.attachments || [];
@@ -544,11 +545,94 @@ function typingOn(platform, platformId, settings) {
   }
 }
 
-async function handleIncomingMessage({ platform, platformId, text, name, phone, username, email, imageBuffer, imageMime, audioBuffer, sigOk, direct, fromButton }) {
+
+/* ---------- মালিকের কমা (,) কমান্ড: পেজ-ইনবক্স থেকে কাস্টমারকে মেসেজ দিলে AI থামে/চালু হয় ---------- */
+async function handleOwnerEcho(platform, customerPlatformId, text) {
+  try {
+    const cmd = crm.ownerToggle(text);
+    if (!cmd || !customerPlatformId) return;
+    const customer = await store.findOrCreateCustomer({ platform, platformId: String(customerPlatformId) });
+    const next = cmd === 'pause' ? false : cmd === 'resume' ? true : !customer.ai;
+    if (next === !!customer.ai) return;
+    await store.setCustomerAI(customer.id, next);
+    console.log(`🔘 মালিকের কমা-কমান্ড: ${platform}/${customerPlatformId} → AI ${next ? 'চালু' : 'বন্ধ'}`);
+    if (next) await store.clearNeedsHuman(customer.id).catch(() => {});
+  } catch (err) { console.error('কমা-কমান্ড এরর:', err.message); }
+}
+
+// "সিন" (দেখেছি) চিহ্ন — Messenger/Instagram/WhatsApp। ব্যর্থ হলেও সমস্যা নেই
+function markSeen(platform, platformId, settings, extra) {
+  try {
+    if ((platform === 'facebook' || platform === 'instagram') && settings.fbToken) {
+      axios.post('https://graph.facebook.com/v21.0/me/messages', { recipient: { id: platformId }, sender_action: 'mark_seen' },
+        { params: { access_token: settings.fbToken }, timeout: 5000 }).catch(() => {});
+    } else if (platform === 'whatsapp' && settings.waToken && settings.waPhoneNumberId && extra && extra.msgId) {
+      axios.post(`https://graph.facebook.com/v21.0/${settings.waPhoneNumberId}/messages`, { messaging_product: 'whatsapp', status: 'read', message_id: extra.msgId },
+        { headers: { Authorization: 'Bearer ' + settings.waToken }, timeout: 5000 }).catch(() => {});
+    }
+  } catch (e) { /* গুরুত্বপূর্ণ নয় */ }
+}
+
+/* ---------- ঢোকা মেসেজের প্রবেশদ্বার: স্প্যাম ছাঁকনি → "সিন" → একসাথে আসা টেক্সট জমানো → একটানা (সিরিয়াল) প্রসেস ---------- */
+const BATCH_MS = process.env.MSG_BATCH_MS !== undefined ? Number(process.env.MSG_BATCH_MS) : 3500;
+const batches = new Map();  // key -> { texts, args, timer }
+const chains = new Map();   // key -> Promise (একই কাস্টমারের মেসেজ একটার পর একটা)
+function runSerial(key, fn) {
+  const prev = chains.get(key) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  chains.set(key, next);
+  next.catch(() => {}).then(() => { if (chains.get(key) === next) chains.delete(key); });
+  return next;
+}
+async function flushBatch(key) {
+  const b = batches.get(key);
+  if (!b) return;
+  batches.delete(key);
+  clearTimeout(b.timer);
+  const text = b.texts.length > 1 ? b.texts.join('\n') : b.texts[0];
+  if (b.texts.length > 1) console.log(`📚 ${b.texts.length}টি মেসেজ একসাথে পড়ে উত্তর দেওয়া হচ্ছে: ${key}`);
+  return runSerial(key, () => processIncoming(Object.assign({}, b.args, { text })));
+}
+
+async function handleIncomingMessage(args) {
+  const { platform, platformId, text, imageBuffer, audioBuffer, fromButton, direct } = args;
+  const key = platform + '|' + platformId;
+  const textOnly = !!text && !imageBuffer && !audioBuffer;
+  const system = !!(fromButton || direct);
+  if (textOnly && !system) {
+    // আবোলতাবোল/বারবার একই মেসেজ/শুধু ইমোজি — উত্তর দেওয়া হয় না (কাস্টমার তালিকায় থাকে)
+    const why = crm.junkReason(text) || crm.floodReason(key, text);
+    if (why) {
+      console.log(`🚫 উত্তর দেওয়া হয়নি (${why}): ${key}`);
+      await ensureCustomer({ platform, platformId, name: args.name, phone: args.phone, username: args.username, email: args.email }).catch(() => {});
+      return;
+    }
+  }
+  let settings = null;
+  const getSettingsOnce = async () => settings || (settings = await store.getSettings());
+  if (!system && platform !== 'email' && platform !== 'tiktok') { getSettingsOnce().then(st => markSeen(platform, platformId, st, args)).catch(() => {}); }
+  const batchable = BATCH_MS > 0 && textOnly && !system && platform !== 'email';
+  let b = batches.get(key);
+  if (batchable) {
+    if (!b) { b = { texts: [], args, timer: null }; batches.set(key, b); }
+    b.texts.push(text);
+    b.args = args;
+    clearTimeout(b.timer);
+    if (b.texts.length >= 8) return flushBatch(key);
+    b.timer = setTimeout(() => flushBatch(key).catch(err => console.error('মেসেজ-ব্যাচ এরর:', err.message)), BATCH_MS);
+    return;
+  }
+  if (b) await flushBatch(key); // ছবি/ভয়েস এলে আগে জমে থাকা টেক্সটের উত্তর যাক
+  return runSerial(key, () => processIncoming(args));
+}
+
+async function processIncoming({ platform, platformId, text, name, phone, username, email, imageBuffer, imageMime, audioBuffer, sigOk, direct, fromButton }) {
   if (await ownerChannel({ platform, platformId, text, imageBuffer, audioBuffer, sigOk })) return;
   const { settings, customer } = await ensureCustomer({ platform, platformId, name, phone, username, email });
   console.log(`💬 মেসেজ প্রসেস হচ্ছে: ${platform} / ${platformId} (AI ${customer.ai ? 'চালু' : 'বন্ধ'})`);
 
+  // কাস্টমার নিজে আবার মেসেজ দিয়েছে — আগের "পরে মেসেজ দিন" ফলো-আপ আর দরকার নেই
+  if (!direct && !fromButton) store.clearFollowUp(customer.id).catch(() => {});
   if (!customer.ai) return;
   if (!getSlots(settings).length) {
     console.warn('AI API key সেট করা নেই — Settings থেকে বসান।');
@@ -723,18 +807,23 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
   if (!placingOrder) {
     // কোনো নির্দিষ্ট পণ্যের কথা হলে ছবি-নাম-দামসহ কার্ড + বাটন পাঠাই (একই পণ্যের কার্ড ১০ মিনিটে একবার; বাটন চাপার পরের অর্ডার-ধাপে নয়)
     let textSent = false;
+    if (!resolvedIds.length) console.log(`🃏 কার্ড (${platform}): উত্তরে চেনা-যায় এমন পণ্য নেই`);
     if (resolvedIds.length && ['facebook', 'instagram', 'whatsapp', 'telegram'].includes(platform)) {
       // কাস্টমার নিজে ছবি/দেখতে চাইলে সবসময়, নইলে একই পণ্যের কার্ড ১০ মিনিটে একবার
       const fresh = resolvedIds.filter(id => wantsImage || !lastCardAt.has(customer.id + '|' + id) || Date.now() - lastCardAt.get(customer.id + '|' + id) > 10 * 60 * 1000);
       const cards = (await Promise.all(fresh.map(id => shop.getProductCard(id).catch(() => null)))).filter(Boolean);
+      console.log(`🃏 কার্ড (${platform}): চেনা-পণ্য=${resolvedIds.length}, নতুন=${fresh.length}, কার্ড-তৈরি=${cards.length}`);
       if (cards.length) {
         await send(outReply); textSent = true;
         try {
-          if (await sendProductCards(platform, platformId, settings, cards)) cards.forEach(c => lastCardAt.set(customer.id + '|' + c.id, Date.now()));
+          const okSend = await sendProductCards(platform, platformId, settings, cards);
+          console.log(`🃏 কার্ড (${platform}) পাঠানো: ${okSend ? 'সফল' : 'পাঠানো হয়নি (টোকেন/সেটিং নেই?)'}`);
+          if (okSend) cards.forEach(c => lastCardAt.set(customer.id + '|' + c.id, Date.now()));
         } catch (err) {
           console.error(`প্রোডাক্ট কার্ড পাঠানো যায়নি (${platform}):`, err.response && err.response.data ? JSON.stringify(err.response.data) : err.message);
           // কার্ড না গেলে অন্তত ছবি + লিংক
           try {
+            await send('🔗 ' + cards.map(c => c.name + ' (৳' + c.price + '): ' + c.url).join('\n'));
             const img = cards[0].image;
             if (img) await (platform === 'facebook' ? sendFacebookImage(platformId, img, settings.fbToken) : platform === 'instagram' ? sendInstagramImage(platformId, img, settings.fbToken) : platform === 'whatsapp' ? sendWhatsAppImage(platformId, img, settings.waPhoneNumberId, settings.waToken) : telegram.sendPhoto(settings.tgToken, platformId, img, cards[0].name + ' — ৳' + cards[0].price));
           } catch (e2) { console.error('ছবিও পাঠানো যায়নি:', e2.message); }
@@ -744,6 +833,36 @@ async function handleIncomingMessage({ platform, platformId, text, name, phone, 
     if (!textSent) await send(outReply, finalImageUrl); // আগে কাস্টমারকে পাঠাই, তারপর খাতায় লিখি
     await store.appendMessage(customer.id, 'assistant', outReply);
   }
+
+  // ---- কাস্টমার ম্যানেজমেন্ট: ফলো-আপ, আগ্রহ, "নিব না" হলে বিকল্প ও অফার ----
+  try {
+    // "এখন সময় নেই, পরে মেসেজ দিন" — সময় বুঝে AI নিজে ফলো-আপ করবে
+    const fu = (!placingOrder && !fromButton) ? crm.parseFollowUp(text) : null;
+    if (fu) {
+      await store.setFollowUp(customer.id, { at: fu.at, reason: String(text).slice(0, 120) });
+      console.log(`⏰ ফলো-আপ ঠিক হলো: ${platform}/${platformId} → ${new Date(fu.at).toISOString()} (${fu.label})`);
+    }
+    // কোন পণ্যে আগ্রহ — অর্ডার না করলে "আগ্রহী তালিকা"-য় দেখা যাবে
+    const interestId = resolvedIds[0] || (fromButton ? String(fromButton) : '');
+    if (interestId && !placingOrder) {
+      const c0 = await shop.getProductCard(interestId).catch(() => null);
+      if (c0) await store.setInterest(customer.id, { productId: c0.id, product: c0.name });
+    }
+    // কাস্টমার পণ্যটা নিতে চান না / দাম বেশি — চলমান অফার + আরও কিছু পণ্যের কার্ড
+    if (!placingOrder && !fromButton && !fu && crm.isDecline(text) && ['facebook', 'instagram', 'whatsapp', 'telegram'].includes(platform)) {
+      const exclude = [...resolvedIds, ...(customer.interest && customer.interest.productId ? [customer.interest.productId] : [])];
+      const alt = await shop.getAlternatives({ excludeIds: exclude, max: 3 });
+      const cards = (await Promise.all(alt.ids.map(id => shop.getProductCard(id).catch(() => null)))).filter(Boolean);
+      if (cards.length || alt.offers.length) {
+        let msg = alt.offers.length ? 'এখন আমাদের ওয়েবসাইটে চলছে 👇\n' + alt.offers.join('\n') : '';
+        if (cards.length) msg += (msg ? '\n\n' : '') + 'এগুলোও দেখতে পারেন 😊';
+        await send(msg);
+        await store.appendMessage(customer.id, 'assistant', msg);
+        if (cards.length) await sendProductCards(platform, platformId, settings, cards);
+        console.log(`🎁 বিকল্প/অফার দেখানো হলো: ${platform}/${platformId}`);
+      }
+    }
+  } catch (err) { console.error('কাস্টমার-ম্যানেজমেন্ট ধাপ এরর:', err.response && err.response.data ? JSON.stringify(err.response.data) : err.message); }
 
   // প্রতি ৫টা মেসেজে কাস্টমারের স্মৃতি নতুন করে লেখা (পেছনে — উত্তরের গতি কমায় না)
   const userCount = fullHistory.filter(h => h.role === 'user').length;
