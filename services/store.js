@@ -256,7 +256,7 @@ async function createOrder({ customerId, name, phone, address, product, qty, pri
     createdAt: new Date().toISOString()
   };
   await db.collection('orders').insertOne(order);
-  await db.collection('customers').updateOne({ id: customerId }, { $inc: { orders: 1 } });
+  await db.collection('customers').updateOne({ id: customerId }, { $inc: { orders: 1 }, $set: { lastOrderAt: order.createdAt } });
   return stripId(order);
 }
 
@@ -511,6 +511,72 @@ async function setOrderFields(id, fields) {
 async function getCustomerById(id) {
   const db = await getDb();
   return stripId(await db.collection('customers').findOne({ id }));
+}
+
+
+/* ---------- কাস্টমার ম্যানেজমেন্ট (CRM): পরিসংখ্যান, নোট, আগ্রহী তালিকা, ফলো-আপ ---------- */
+// প্রতিটা কাস্টমারের অর্ডারের হিসাব: মোট অর্ডার, ডেলিভারড, বাতিল/ফেরত, পেন্ডিং, মোট কেনা টাকা (ডেলিভারড)
+function statsFromOrders(list) {
+  const st = { total: 0, delivered: 0, cancelled: 0, pending: 0, spent: 0, placedValue: 0, lastOrderAt: '' };
+  (list || []).forEach(o => {
+    const val = (Number(o.price) || 0) * (Number(o.qty) || 1) + (Number(o.shipping) || 0);
+    st.total++;
+    if (o.status === 'Delivered') { st.delivered++; st.spent += val; }
+    else if (o.status === 'Cancelled' || o.status === 'Returned') st.cancelled++;
+    else st.pending++;
+    if (o.status !== 'Cancelled' && o.status !== 'Returned') st.placedValue += val;
+    if (!st.lastOrderAt || o.createdAt > st.lastOrderAt) st.lastOrderAt = o.createdAt;
+  });
+  return st;
+}
+async function getCustomerStatsMap() {
+  const db = await getDb();
+  const orders = await db.collection('orders').find({}, { projection: { customerId: 1, status: 1, price: 1, qty: 1, shipping: 1, createdAt: 1 } }).toArray();
+  const by = {};
+  orders.forEach(o => { (by[o.customerId] = by[o.customerId] || []).push(o); });
+  const map = {};
+  Object.keys(by).forEach(k => { map[k] = statsFromOrders(by[k]); });
+  return map;
+}
+async function setCustomerNote(id, note) {
+  const db = await getDb();
+  await db.collection('customers').updateOne({ id }, { $set: { note: String(note || '').slice(0, 1000), noteAt: new Date().toISOString() } });
+  return stripId(await db.collection('customers').findOne({ id }));
+}
+// কাস্টমার কোন পণ্যে আগ্রহ দেখিয়েছে (কার্ড/আলোচনা) — অর্ডার না করলে "আগ্রহী তালিকা"-য় থাকে
+async function setInterest(id, { productId, product }) {
+  const db = await getDb();
+  await db.collection('customers').updateOne({ id }, { $set: { interest: { productId: String(productId || ''), product: String(product || '').slice(0, 120), at: new Date().toISOString() } } });
+}
+async function getInterestedCustomers() {
+  const db = await getDb();
+  const list = await db.collection('customers').find({ 'interest.at': { $exists: true } }).toArray();
+  return list.filter(c => !c.lastOrderAt || c.interest.at > c.lastOrderAt).map(stripId)
+    .sort((a, b) => String(b.interest.at).localeCompare(String(a.interest.at)));
+}
+// "পরে মেসেজ দিন" — ঠিক সময়ে AI নিজে ফলো-আপ পাঠায়
+async function setFollowUp(id, { at, reason }) {
+  const db = await getDb();
+  await db.collection('customers').updateOne({ id }, { $set: { followUp: { at: new Date(at).toISOString(), reason: String(reason || '').slice(0, 160), done: false, createdAt: new Date().toISOString() } } });
+}
+async function clearFollowUp(id) {
+  const db = await getDb();
+  await db.collection('customers').updateOne({ id, 'followUp.done': false }, { $set: { 'followUp.done': true, 'followUp.doneAt': new Date().toISOString() } });
+}
+async function claimDueFollowUps(limit) {
+  const db = await getDb();
+  const out = [];
+  for (let i = 0; i < (limit || 5); i++) {
+    const r = await db.collection('customers').findOneAndUpdate(
+      { 'followUp.done': false, 'followUp.at': { $lte: new Date().toISOString() } },
+      { $set: { 'followUp.done': true, 'followUp.doneAt': new Date().toISOString(), 'followUp.sent': true } },
+      { returnDocument: 'after' }
+    );
+    const doc = (r && r.platformId !== undefined) ? r : (r && r.value) || null;
+    if (!doc) break;
+    out.push(stripId(doc));
+  }
+  return out;
 }
 
 /* ---------- "মানুষের অপেক্ষায়" ফ্ল্যাগ (নতুন) ---------- */
@@ -799,6 +865,7 @@ async function failStuckVideoPosts() {
 module.exports = { saveProof, getLatestProof, getProof,
   getDb, failStuckVideoPosts,
   getSettings, saveSettings,
+  statsFromOrders, getCustomerStatsMap, setCustomerNote, setInterest, getInterestedCustomers, setFollowUp, clearFollowUp, claimDueFollowUps,
   findOrCreateCustomer, getCustomers, setCustomerAI, updateCustomerContact,
   appendMessage, getConversation,
   createOrder, createWebsiteOrder, getOrders, getOrdersByCustomer, updateOrderStatus, attachEmailToLatestOrder,
