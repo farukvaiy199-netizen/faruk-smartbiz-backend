@@ -19,6 +19,8 @@ const num = (v, d) => { const n = Number(v); return isFinite(n) && n > 0 ? n : d
 
 let cardSender = null; // webhook.js থেকে বসানো হয় (sendProductCards)
 function setCardSender(fn) { cardSender = fn; }
+let orderCardSender = null; // অর্ডার-কার্ড (নজ-মেসেজে ব্যবহার হতে পারে)
+function setOrderCardSender(fn) { orderCardSender = fn; }
 
 const callName = (c) => {
   const real = c && c.name && c.name !== 'অজানা কাস্টমার' && !/^@/.test(c.name);
@@ -227,4 +229,4 @@ async function runAll() {
   } finally { running = false; }
 }
 
-module.exports = { setCardSender, wantsVideo, videoMessage, runNudges, runReviewAsks, flushPendingReview, reviewReply, runDailyReport, runAll };
+module.exports = { setOrderCardSender, setCardSender, wantsVideo, videoMessage, runNudges, runReviewAsks, flushPendingReview, reviewReply, runDailyReport, runAll };
