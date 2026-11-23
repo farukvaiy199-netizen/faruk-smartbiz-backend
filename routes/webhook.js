@@ -224,11 +224,13 @@ async function handlePostback({ platform, senderId, payload, sigOk, extra }) {
     const msg = `${card.name} — দাম ৳${card.price}${card.sku ? ' (কোড ' + card.sku + ')' : ''}\n\nছবি, অপশন ও রিভিউসহ পুরো বিস্তারিত দেখুন:\n${card.url}\n\nআপনি চাইলে এখানেই অর্ডার করতে পারেন — কার্ডের "এটি নিতে চাই" চাপুন বা লিখে জানান। 😊`;
     return handleIncomingMessage({ ...base, direct: msg });
   }
+  console.log(`🧾 ORDER বাটন: ${platform}/${senderId} → ${card.name}`);
   if (process.env.ORDER_CARD !== 'off') {
     try {
       const cust = await store.findOrCreateCustomer({ platform, platformId: String(senderId), name: (extra && extra.name) || undefined, phone: (extra && extra.phone) || undefined });
       const link = await chatOrder.orderLink(cust.id, card.id);
       const ok = await sendOrderCard(platform, String(senderId), await store.getSettings(), card, link);
+      console.log(`🧾 অর্ডার কার্ড পাঠানো (বাটন): ${platform}/${senderId} sent=${ok}`);
       if (ok) { await store.appendMessage(cust.id, 'assistant', `[অর্ডার কার্ড পাঠানো হয়েছে: ${card.name}]`); return; }
     } catch (e) { console.error('অর্ডার কার্ড পাঠানো যায়নি (আগের পদ্ধতিতে চলছে):', e.response && e.response.data ? JSON.stringify(e.response.data) : e.message); }
   }
@@ -943,7 +945,7 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
       if (vm) { await send(vm); await store.appendMessage(customer.id, 'assistant', vm); console.log(`🎬 ভিডিও গাইড পাঠানো: ${platform}/${platformId}`); }
     }
     // অর্ডারের ইচ্ছা জানালে (লিখে) — ভুল-তথ্য এড়াতে সুরক্ষিত অর্ডার-কার্ডও পাঠাই (বন্ধ: ORDER_CARD=off)
-    if (!placingOrder && !fromButton && process.env.ORDER_CARD !== 'off' && /অর্ডার\s*(করতে|করব|করবো|দিতে|দিব|দিবো)|কিনতে\s*চাই|নিতে\s*চাই|কিনব|কিনবো|order\s*(korbo|dibo|kora)|i want to (buy|order)/i.test(String(text || '')) && resolvedIds.length) {
+    if (!placingOrder && !fromButton && process.env.ORDER_CARD !== 'off' && /অর্ডার\s*(করতে|করব|করবো|দিতে|দিব|দিবো|কার্ড|কাড)|কিনতে\s*চাই|নিতে\s*চাই|নিব|নিবো|নেব|নেবো|কিনব|কিনবো|order\s*(korbo|dibo|kora)|i want to (buy|order)/i.test(String(text || '')) && resolvedIds.length) {
       try {
         const oc = await shop.getProductCard(resolvedIds[0]);
         if (oc) {
