@@ -139,16 +139,21 @@ async function fsBatchGet(cfg, ids) {
 
 /* ---------- চ্যাট-অর্ডার → অ্যাডমিন প্যানেলের অর্ডার ফরম্যাট ---------- */
 function buildFsOrder(o, extra = {}) {
-  const qty = Number(o.qty) || 1, price = Number(o.price) || 0, total = price * qty;
+  const qty = Number(o.qty) || 1, price = Number(o.price) || 0;
+  const hasItems = Array.isArray(o.items) && o.items.length;
+  const subtotal = hasItems ? (Number(o.subtotal) || 0) : price * qty;
+  const discount = Number(o.discount) || 0, ship = Number(o.shipping) || 0;
+  const total = Number(o.total) || (subtotal - discount + ship);
   const created = o.createdAt ? new Date(o.createdAt) : new Date();
+  const paid = o.paymentStatus === 'paid' ? total : (o.paymentStatus === 'partial' ? (Number(o.paidAmount) || 0) : 0);
   return {
     id: o.id, ownerUid: '', ownerEmail: o.email || '',
     customer: o.name || 'গ্রাহক', phone: String(o.phone || ''), address: o.address || '',
-    items: [{ pid: 'smartbiz-chat', name: o.product || 'পণ্য', qty, price }],
-    subtotal: total, discount: 0, tax: 0, shipping: Number(o.shipping) || 0, total: total + (Number(o.shipping) || 0),
-    district: o.district || '', upazila: '', shippingBase: Number(o.shipping) || 0, prepayDiscount: 0,
-    status: 'processing', payment: o.payment || 'cod', paymentStatus: 'unpaid', transactionId: o.transactionId || '',
-    advanceAmount: 0, dueAmount: total + (Number(o.shipping) || 0), courier: NO_COURIER, date: bdDate(created),
+    items: hasItems ? o.items.map(i => ({ pid: String(i.pid || 'smartbiz-chat'), name: i.name || 'পণ্য', qty: Number(i.qty) || 1, price: Number(i.price) || 0 })) : [{ pid: 'smartbiz-chat', name: o.product || 'পণ্য', qty, price }],
+    subtotal, discount, couponCode: o.couponCode || '', tax: 0, shipping: ship, total,
+    district: o.district || '', upazila: o.upazila || '', shippingBase: Number(o.shippingBase) || ship, prepayDiscount: Number(o.prepayDiscount) || 0,
+    status: 'processing', payment: o.payment || 'cod', paymentStatus: o.paymentStatus === 'paid' ? 'paid' : 'unpaid', transactionId: o.transactionId || '',
+    paidAmount: paid, advanceAmount: Number(o.advanceAmount) || 0, dueAmount: Math.max(total - paid, 0), courier: NO_COURIER, date: bdDate(created),
     createdAt: { __timestamp: created.toISOString() },
     source: 'smartbiz', sourceChannel: o.source || '', smartbizId: o.id,
     stockRestored: true, // চ্যাট-অর্ডারের স্টক SmartBiz-এ আলাদা, তাই অ্যাডমিন প্যানেল যেন স্টক না ছোঁয়
