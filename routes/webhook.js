@@ -24,6 +24,7 @@ const tiktok = require('../services/tiktok');
 const crm = require('../services/crm');
 const payments = require('../services/payments');
 const engage = require('../services/engage');
+const chatOrder = require('./chatOrder');
 
 // ডেলিভারি চার্জ/COD নিয়ম এখানে লেখা নেই — ওয়েবসাইটের সেটিংস থেকে লাইভ আসে (shop.getAiContext)
 const businessInfo = `কাজের সময়: সকাল ৯টা - রাত ১০টা। ডেলিভারি চার্জ ও পেমেন্টের নিয়ম শুধু ওয়েবসাইটের তথ্য অনুযায়ী বলবে।`;
@@ -168,7 +169,33 @@ async function sendProductCards(platform, platformId, settings, cards) {
   }
   return false;
 }
+
+// অর্ডার-কার্ড: কাস্টমারকে সুরক্ষিত অর্ডার-ফর্মের লিংকসহ কার্ড পাঠায় (কুপন, COD/বিকাশ/নগদ, অর্ডার আইডিসহ)
+async function sendOrderCard(platform, platformId, settings, card, link) {
+  const title = '🛒 ' + String(card.name).slice(0, 70);
+  const sub = ('দাম ৳' + card.price + ' · নাম-ঠিকানা-পেমেন্ট সব এক ফর্মে').slice(0, 80);
+  if (platform === 'facebook' || platform === 'instagram') {
+    if (!settings.fbToken) return false;
+    const el = { title, subtitle: sub, default_action: { type: 'web_url', url: link }, buttons: [{ type: 'web_url', url: link, title: '🛒 অর্ডার করুন', webview_height_ratio: 'full' }, { type: 'postback', title: 'বিস্তারিত', payload: 'INFO:' + card.id }] };
+    if (card.image) el.image_url = card.image;
+    const host = platform === 'instagram' && /^IG/.test(String(settings.fbToken)) ? 'https://graph.instagram.com/v21.0' : 'https://graph.facebook.com/v21.0';
+    await axios.post(host + '/me/messages', { recipient: { id: platformId }, messaging_type: 'RESPONSE', message: { attachment: { type: 'template', payload: { template_type: 'generic', elements: [el] } } } }, { params: { access_token: settings.fbToken }, timeout: 15000 });
+    return true;
+  }
+  if (platform === 'whatsapp') {
+    if (!settings.waToken || !settings.waPhoneNumberId) return false;
+    const interactive = { type: 'cta_url', body: { text: (card.name + '\nদাম ৳' + card.price + '\n\nনিচের বাটনে চেপে নাম-ঠিকানা দিয়ে অর্ডার নিশ্চিত করুন।').slice(0, 1000) }, action: { name: 'cta_url', parameters: { display_text: '🛒 অর্ডার করুন', url: link } } };
+    if (card.image) interactive.header = { type: 'image', image: { link: card.image } };
+    await axios.post(`https://graph.facebook.com/v21.0/${settings.waPhoneNumberId}/messages`, { messaging_product: 'whatsapp', to: platformId, type: 'interactive', interactive }, { headers: { Authorization: 'Bearer ' + settings.waToken }, timeout: 15000 });
+    return true;
+  }
+  // টেলিগ্রাম, টিকটক ও বাকি: লিংকসহ লেখা (এখানে কার্ড-বাটন নেই)
+  const txt = `🛒 ${card.name} — ৳${card.price}\n\nসুরক্ষিত অর্ডার ফর্ম (কুপন, ক্যাশ অন ডেলিভারি/বিকাশ/নগদ সবই আছে) 👇\n${link}`;
+  await require('../services/crm').sendPlain({ platform, platformId }, txt, settings);
+  return true;
+}
 engage.setCardSender(sendProductCards);
+engage.setOrderCardSender(sendOrderCard);
 // কাস্টমার কার্ডের বাটন চাপলে — extra: নাম/ফোন (WhatsApp)
 async function handlePostback({ platform, senderId, payload, sigOk, extra }) {
   // রিভিউ-কার্ডের বাটন: 👍 ভালো লেগেছে / 😕 সমস্যা আছে
@@ -196,6 +223,14 @@ async function handlePostback({ platform, senderId, payload, sigOk, extra }) {
   if (m[1] === 'INFO') {
     const msg = `${card.name} — দাম ৳${card.price}${card.sku ? ' (কোড ' + card.sku + ')' : ''}\n\nছবি, অপশন ও রিভিউসহ পুরো বিস্তারিত দেখুন:\n${card.url}\n\nআপনি চাইলে এখানেই অর্ডার করতে পারেন — কার্ডের "এটি নিতে চাই" চাপুন বা লিখে জানান। 😊`;
     return handleIncomingMessage({ ...base, direct: msg });
+  }
+  if (process.env.ORDER_CARD !== 'off') {
+    try {
+      const cust = await store.findOrCreateCustomer({ platform, platformId: String(senderId), name: (extra && extra.name) || undefined, phone: (extra && extra.phone) || undefined });
+      const link = await chatOrder.orderLink(cust.id, card.id);
+      const ok = await sendOrderCard(platform, String(senderId), await store.getSettings(), card, link);
+      if (ok) { await store.appendMessage(cust.id, 'assistant', `[অর্ডার কার্ড পাঠানো হয়েছে: ${card.name}]`); return; }
+    } catch (e) { console.error('অর্ডার কার্ড পাঠানো যায়নি (আগের পদ্ধতিতে চলছে):', e.response && e.response.data ? JSON.stringify(e.response.data) : e.message); }
   }
   const text = `এই পণ্যটি নিতে চাই: ${card.name}${card.sku ? ' (কোড ' + card.sku + ')' : ''} — দাম ৳${card.price}`;
   return handleIncomingMessage({ ...base, text, fromButton: card.id });
@@ -906,6 +941,19 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
     if (!placingOrder && !fromButton && engage.wantsVideo(text) && resolvedIds.length) {
       const vm = await engage.videoMessage(resolvedIds);
       if (vm) { await send(vm); await store.appendMessage(customer.id, 'assistant', vm); console.log(`🎬 ভিডিও গাইড পাঠানো: ${platform}/${platformId}`); }
+    }
+    // অর্ডারের ইচ্ছা জানালে (লিখে) — ভুল-তথ্য এড়াতে সুরক্ষিত অর্ডার-কার্ডও পাঠাই (বন্ধ: ORDER_CARD=off)
+    if (!placingOrder && !fromButton && process.env.ORDER_CARD !== 'off' && /অর্ডার\s*(করতে|করব|করবো|দিতে|দিব|দিবো)|কিনতে\s*চাই|নিতে\s*চাই|কিনব|কিনবো|order\s*(korbo|dibo|kora)|i want to (buy|order)/i.test(String(text || '')) && resolvedIds.length) {
+      try {
+        const oc = await shop.getProductCard(resolvedIds[0]);
+        if (oc) {
+          const link = await chatOrder.orderLink(customer.id, oc.id);
+          const m0 = 'ভুল ছাড়া সহজে অর্ডার করতে নিচের কার্ডের "🛒 অর্ডার করুন" চাপুন 👇';
+          await send(m0); await store.appendMessage(customer.id, 'assistant', m0);
+          await sendOrderCard(platform, platformId, settings, oc, link);
+          console.log(`🧾 অর্ডার কার্ড পাঠানো: ${platform}/${platformId}`);
+        }
+      } catch (e) { console.error('অর্ডার কার্ড (লেখা থেকে) এরর:', e.message); }
     }
     // ডেলিভারির পর অপেক্ষায় থাকা রিভিউ-কার্ড (২৪ ঘণ্টার সীমার ভেতরে এখন কাস্টমার আছেন)
     if (!placingOrder && customer.reviewPendingOrder) await engage.flushPendingReview(customer, settings);
