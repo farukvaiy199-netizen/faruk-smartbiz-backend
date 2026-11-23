@@ -66,6 +66,7 @@ async function runDueInstagramPosts() {
       await publishIgJob(job, settings, true);
     }
     await require('./crm').runFollowUps().catch(e => console.error('ফলো-আপ:', e.message)); // "পরে মেসেজ দিন" বলা কাস্টমারদের ফলো-আপ
+    await require('./engage').runAll().catch(e => console.error('এনগেজ:', e.message)); // আগ্রহী-নাজ, রিভিউ কার্ড, দৈনিক রিপোর্ট
     await require('./telegram').runDue(); // শিডিউল করা Telegram চ্যানেল-পোস্ট
     await require('./tiktok').runDue().catch(e => console.error('TikTok শিডিউলার:', e.message)); // TikTok ছবির পোস্ট ও অবস্থা যাচাই
   } catch (err) {
@@ -77,3 +78,4 @@ async function runDueInstagramPosts() {
 }
 
 module.exports = { runDueInstagramPosts, publishIgJob };
+ঔ
