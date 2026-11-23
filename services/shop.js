@@ -692,4 +692,9 @@ async function categoryNames() {
   return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
 }
 
-module.exports = { getProductVideos, offerLines, getAlternatives, resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+// অর্ডার-কার্ড পেজের জন্য: পণ্য + সেটিংস + ছবি
+async function getOrderData() {
+  const { cfg, snap: s } = await getSnapshot();
+  return s ? { cfg, products: s.products, settings: s.settings || {} } : null;
+}
+module.exports = { getOrderData, getProductVideos, offerLines, getAlternatives, resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
