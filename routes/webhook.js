@@ -23,6 +23,7 @@ const telegram = require('../services/telegram');
 const tiktok = require('../services/tiktok');
 const crm = require('../services/crm');
 const payments = require('../services/payments');
+const engage = require('../services/engage');
 
 // ডেলিভারি চার্জ/COD নিয়ম এখানে লেখা নেই — ওয়েবসাইটের সেটিংস থেকে লাইভ আসে (shop.getAiContext)
 const businessInfo = `কাজের সময়: সকাল ৯টা - রাত ১০টা। ডেলিভারি চার্জ ও পেমেন্টের নিয়ম শুধু ওয়েবসাইটের তথ্য অনুযায়ী বলবে।`;
@@ -167,8 +168,26 @@ async function sendProductCards(platform, platformId, settings, cards) {
   }
   return false;
 }
+engage.setCardSender(sendProductCards);
 // কাস্টমার কার্ডের বাটন চাপলে — extra: নাম/ফোন (WhatsApp)
 async function handlePostback({ platform, senderId, payload, sigOk, extra }) {
+  // রিভিউ-কার্ডের বাটন: 👍 ভালো লেগেছে / 😕 সমস্যা আছে
+  const rv = /^(RVG|RVB):([\w-]{1,40})$/.exec(String(payload || ''));
+  if (rv) {
+    const r = await engage.reviewReply(rv[1], rv[2]);
+    if (!r) return;
+    const baseRv = Object.assign({ platform, platformId: senderId, sigOk }, extra || {});
+    if (r.bad) {
+      try {
+        const cust = await (await store.getDb()).collection('customers').findOne({ platform, platformId: String(senderId) });
+        if (cust) {
+          await store.setNeedsHuman(cust.id, 'ডেলিভারির পর সমস্যা জানিয়েছেন — অর্ডার ' + r.order.id);
+          await notifyOwner({ type: 'handoff', title: `😕 ${cust.name || 'কাস্টমার'} পণ্য নিয়ে সমস্যা জানিয়েছেন`, body: `অর্ডার ${r.order.id} · ${r.order.product}` });
+        }
+      } catch (e) { console.error('রিভিউ-সমস্যা নোটিফিকেশন এরর:', e.message); }
+    }
+    return handleIncomingMessage({ ...baseRv, direct: r.text });
+  }
   const m = /^(ORDER|INFO):([\w-]{1,60})$/.exec(String(payload || ''));
   if (!m) return;
   const card = await shop.getProductCard(m[2]);
@@ -883,6 +902,13 @@ async function processIncoming({ platform, platformId, text, name, phone, userna
         console.log(`🎁 বিকল্প/অফার দেখানো হলো: ${platform}/${platformId}`);
       }
     }
+    // ভিডিও গাইড: "কীভাবে খাব/ব্যবহার করব/ভিডিও" জিজ্ঞেস করলে পণ্যের ভিডিও লিংক
+    if (!placingOrder && !fromButton && engage.wantsVideo(text) && resolvedIds.length) {
+      const vm = await engage.videoMessage(resolvedIds);
+      if (vm) { await send(vm); await store.appendMessage(customer.id, 'assistant', vm); console.log(`🎬 ভিডিও গাইড পাঠানো: ${platform}/${platformId}`); }
+    }
+    // ডেলিভারির পর অপেক্ষায় থাকা রিভিউ-কার্ড (২৪ ঘণ্টার সীমার ভেতরে এখন কাস্টমার আছেন)
+    if (!placingOrder && customer.reviewPendingOrder) await engage.flushPendingReview(customer, settings);
   } catch (err) { console.error('কাস্টমার-ম্যানেজমেন্ট ধাপ এরর:', err.response && err.response.data ? JSON.stringify(err.response.data) : err.message); }
 
   // প্রতি ৫টা মেসেজে কাস্টমারের স্মৃতি নতুন করে লেখা (পেছনে — উত্তরের গতি কমায় না)
