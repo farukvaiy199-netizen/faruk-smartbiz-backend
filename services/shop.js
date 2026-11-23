@@ -150,6 +150,7 @@ function normProduct(p) {
     sku: String(p.sku || ''),
     desc: String(p.desc || '').replace(/\s+/g, ' ').trim().slice(0, 160),
     status: String(p.status || 'active'),
+    videos: (Array.isArray(p.videos) ? p.videos : []).filter(v => v && /^https?:\/\//i.test(String(v.url || ''))).slice(0, 8).map(v => ({ title: String(v.title || '').trim().slice(0, 90), url: String(v.url).trim().slice(0, 500) })),
     variantLabel: String(p.variantLabel || 'অপশন'),
     variants: (Array.isArray(p.variants) ? p.variants : []).filter(v => v && v.id).map(v => ({
       id: String(v.id), name: String(v.name || '').trim(), price: toNum(v.price), oldPrice: toNum(v.oldPrice), stock: toNum(v.stock)
@@ -301,6 +302,7 @@ async function getAiContext(message) {
             const st = stockText(p, cfg); if (st) parts.push(st);
             if (p.desc) parts.push(p.desc);
             parts.push('লিংক: ' + productUrl(cfg, p));
+            if (Array.isArray(p.videos) && p.videos.length) parts.push('[ভিডিও গাইড আছে — কাস্টমার চাইলে সিস্টেম নিজে লিংক পাঠাবে, তুমি ভিডিওর লিংক বানাবে না]');
             return '- ' + parts.join(' | ');
           }).join('\n') + '\n'
         : '(ওয়েবসাইটে এখন কোনো সক্রিয় প্রোডাক্ট নেই)\n';
@@ -585,6 +587,15 @@ async function getAlternatives({ excludeIds = [], max = 3 }) {
   } catch (e) { return { ids: [], offers: [] }; }
 }
 
+// পণ্যের ভিডিও গাইড লিংক (অ্যাডমিন প্যানেল থেকে দেওয়া) — [{title,url}]
+async function getProductVideos(id) {
+  try {
+    const { snap: s } = await getSnapshot();
+    if (!s || !id) return [];
+    const p = activeProducts(s.products).find(x => String(x.id) === String(id));
+    return p && Array.isArray(p.videos) ? p.videos : [];
+  } catch (e) { return []; }
+}
 async function getProductCard(id) {
   try {
     const { cfg, snap: s } = await getSnapshot();
@@ -681,4 +692,4 @@ async function categoryNames() {
   return s ? Array.from(new Set(s.products.map(p => p.category).filter(Boolean))).slice(0, 20) : [];
 }
 
-module.exports = { offerLines, getAlternatives, resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
+module.exports = { getProductVideos, offerLines, getAlternatives, resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
