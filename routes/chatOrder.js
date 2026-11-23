@@ -220,5 +220,6 @@ router.get('/co/:token', async (req, res) => {
   res.type('html').send(require('../services/orderPage')(req.params.token, !!t));
 });
 
+console.log('🧾 অর্ডার কার্ড মডিউল লোড হয়েছে (/co)');
 module.exports = router;
 module.exports.orderLink = orderLink;
