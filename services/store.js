@@ -236,13 +236,13 @@ async function nextOrderId() {
   return nextOrderIdFrom(await getDb());
 }
 
-async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping, paymentProof, paymentVerified, paidAmount }) {
+async function createOrder({ customerId, name, phone, address, product, qty, price, email, source, stockItem, district, payment, transactionId, shipping, paymentProof, paymentVerified, paidAmount, extra }) {
   const db = await getDb();
   // আইডি আসে মালিকের অর্ডার-শিট থেকে (প্রথম ফাঁকা ঘর); শিট চালু না থাকলে আগের নিয়মে
   let id = null;
   if (orderSheet.enabled()) {
     const q = Number(qty) || 1, pr = Number(price) || 0, sh = Number(shipping) || 0;
-    id = await orderSheet.claim({ name, phone, address, district, product, qty: q, price: pr, shipping: sh, total: pr * q + sh, payment, transactionId, source: source || 'Chat', status: 'Pending' });
+    id = await orderSheet.claim({ name, phone, address, district, product, qty: q, price: pr, shipping: sh, total: (extra && Number(extra.total)) || (pr * q + sh), payment, transactionId, source: source || 'Chat', status: 'Pending' });
     if (!id) id = 'ORD-E' + (1000 + (await nextSeq(db))); // শিট না পেলে আলাদা চিহ্নের আইডি — যাতে শিটের আইডির সাথে না মেশে
   } else id = await nextOrderId();
   const order = {
@@ -258,6 +258,7 @@ async function createOrder({ customerId, name, phone, address, product, qty, pri
     paymentVerified: paymentVerified === undefined ? null : !!paymentVerified, paidAmount: Number(paidAmount) || 0,
     createdAt: new Date().toISOString()
   };
+  if (extra && typeof extra === 'object') Object.assign(order, extra); // অর্ডার-কার্ড: items, subtotal, discount, couponCode, total, paymentStatus ইত্যাদি
   await db.collection('orders').insertOne(order);
   await db.collection('customers').updateOne({ id: customerId }, { $inc: { orders: 1 }, $set: { lastOrderAt: order.createdAt } });
   return stripId(order);
@@ -346,6 +347,9 @@ async function createWebsiteOrder(payload = {}) {
     status: 'Pending', source: 'Bazaar Admin',
     address: payload.address || '', email: payload.email || '',
     payment: payload.payment || '', transactionId: payload.transactionId || '',
+    district: payload.district || '', shipping: Number(payload.shipping) || 0, discount: Number(payload.discount) || 0, subtotal: Number(payload.subtotal) || 0, total: Number(payload.total) || 0,
+    couponCode: payload.couponCode || '', paymentStatus: payload.paymentStatus || '', paidAmount: Number(payload.paidAmount) || 0,
+    paymentVerified: payload.paymentVerified === undefined ? null : payload.paymentVerified,
     callStatus: '', callNote: '', callAt: '', remindAt: '', callAttempts: 0,
     fsSynced: true, // ওয়েবসাইটের অর্ডার আগে থেকেই অ্যাডমিন প্যানেলে (Firestore-এ) থাকে
     createdAt: payload.date ? new Date(payload.date).toISOString() : new Date().toISOString()
