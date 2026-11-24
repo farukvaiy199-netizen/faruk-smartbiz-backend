@@ -73,6 +73,28 @@ async function pubProduct(p) {
 }
 const prodMap = list => { const m = {}; list.forEach(p => { m[p.id] = p; }); return m; };
 
+
+// ফুটারের লিংক: শুধু http(s) — নাম/নম্বর হলে সঠিক লিংক বানাই
+function safeUrl(v, kind) {
+  let x = String(v || '').trim(); if (!x) return '';
+  if (kind === 'wa') { let n = x.replace(/[^0-9]/g, ''); if (/^01\d{9}$/.test(n)) n = '88' + n; return n.length >= 10 ? 'https://wa.me/' + n : ''; } // বাংলাদেশি নম্বরে 880 বসে
+  if (kind === 'tg' && /^@?[A-Za-z0-9_]{4,}$/.test(x)) return 'https://t.me/' + x.replace(/^@/, '');
+  if (kind === 'tt' && /^@[A-Za-z0-9_.]+$/.test(x)) return 'https://www.tiktok.com/' + x;
+  if (!/^https?:\/\//i.test(x)) x = 'https://' + x.replace(/^\/+/, '');
+  try { const u = new URL(x); return /^https?:$/.test(u.protocol) && u.hostname.includes('.') ? u.href : ''; } catch (e) { return ''; }
+}
+
+// ফুটার: ওয়েবসাইটের সেটিংস থেকেই (ঠিকানা, ফোন, সোশ্যাল আইডি) + ওয়েবসাইটের লিংক
+function footerOf(st, site) {
+  return {
+    site: safeUrl(site) || safeUrl(st.siteUrl) || safeUrl(process.env.SHOP_URL) || 'https://khanglobalshop.pages.dev',
+    tagline: String(st.tagline || '').slice(0, 160), address: String(st.address || '').slice(0, 200),
+    phone: String(st.phone || '').replace(/[^0-9+\-\s]/g, '').slice(0, 20),
+    email: /^[^\s@<>"']+@[^\s@<>"']+\.[^\s@<>"']+$/.test(String(st.email || '')) ? String(st.email) : '', copyright: String(st.footerCopyright || '').slice(0, 160),
+    socials: { facebook: safeUrl(st.facebook), instagram: safeUrl(st.instagram), youtube: safeUrl(st.youtube), tiktok: safeUrl(st.tiktok, 'tt'), telegram: safeUrl(st.telegram, 'tg'), whatsapp: safeUrl(st.whatsapp, 'wa') }
+  };
+}
+
 router.get('/co/:token/data', async (req, res) => {
   try {
     if (!limit('cod:' + req.ip, 60, 60e3)) return res.status(429).json({ error: 'একটু ধীরে চেষ্টা করুন' });
@@ -97,7 +119,9 @@ router.get('/co/:token/data', async (req, res) => {
       districts: DISTRICTS, cod: Array.isArray(st.codDistricts) ? st.codDistricts : ['ঢাকা'],
       pay: { bkash: String(st.bkashNumber || '').trim(), nagad: String(st.nagadNumber || '').trim(), plans: (Array.isArray(st.paymentPlans) ? st.paymentPlans : []).map(Number).filter(n => n > 0 && n <= 100), verify: payments.enabled() },
       ship: { inside: num(st.shipInsideDhaka, 60), outside: num(st.shipOutsideDhaka, 120), prepay: num(st.prepayDiscount, 30), free: num(st.freeShip, 0) },
-      flash: fo ? { pct: num(st.flash.pct, 0), endAt: num(st.flash.endAt, 0) } : null
+      flash: fo ? { pct: num(st.flash.pct, 0), endAt: num(st.flash.endAt, 0) } : null,
+      bundle: st.bundle && st.bundle.on && num(st.bundle.pct, 0) > 0 ? { pct: num(st.bundle.pct, 0), minQty: Math.max(num(st.bundle.minQty, 2), 2) } : null,
+      footer: footerOf(st, c.data.site)
     });
   } catch (e) { console.error('[chatOrder] data:', e.message); res.status(500).json({ error: 'পেজ লোড হয়নি — আবার চেষ্টা করুন' }); }
 });
