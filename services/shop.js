@@ -695,6 +695,6 @@ async function categoryNames() {
 // অর্ডার-কার্ড পেজের জন্য: পণ্য + সেটিংস + ছবি
 async function getOrderData() {
   const { cfg, snap: s } = await getSnapshot();
-  return s ? { cfg, products: s.products, settings: s.settings || {} } : null;
+  return s ? { cfg, site: siteUrl(cfg), products: s.products, settings: s.settings || {} } : null;
 }
 module.exports = { getOrderData, getProductVideos, offerLines, getAlternatives, resolveProducts, getProductCard, resolveOrderItem, getDeliveryRules, addProduct, categoryNames, findProduct, connect, status, sync, disconnect, getAiContext, getProductImage, serveProductImage, usesWebsiteProducts, summarize, normProduct, fromFields, docOut };
